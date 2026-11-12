@@ -1,0 +1,162 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oca-spec.org/schemas/v1/oca.schema.json",
+  "title": "Open Conversation Archive (OCA) v1 Specification",
+  "description": "Canonical intermediate representation for web AI chat exports and local AI agent trajectories.",
+  "type": "object",
+  "$defs": {
+    "ProviderId": {
+      "type": "string",
+      "enum": [
+        "openai-web",
+        "anthropic-web",
+        "deepseek-web",
+        "codex-local",
+        "claude-code-local",
+        "dsh-local",
+        "generic-json",
+        "generic-md"
+      ]
+    },
+    "Role": {
+      "type": "string",
+      "enum": ["user", "assistant", "system", "tool", "developer"]
+    },
+    "ItemKind": {
+      "type": "string",
+      "enum": [
+        "message",
+        "reasoning",
+        "tool_call",
+        "tool_result",
+        "file_change",
+        "web_search",
+        "image",
+        "notice",
+        "turn_context",
+        "compaction",
+        "todo",
+        "system_note"
+      ]
+    },
+    "BlockType": {
+      "type": "string",
+      "enum": [
+        "text",
+        "thinking",
+        "tool_use",
+        "tool_result",
+        "code",
+        "citation",
+        "image",
+        "audio",
+        "video",
+        "file",
+        "canvas"
+      ]
+    },
+    "AssetAvailability": {
+      "type": "string",
+      "enum": ["full", "extracted_only", "missing_ref"]
+    },
+    "BlobOriginKind": {
+      "type": "string",
+      "enum": ["export_dat", "attachment", "inline_base64", "generated", "thumbnail", "oversized_payload"]
+    },
+    "OcaBlob": {
+      "type": "object",
+      "required": ["sha256", "mime", "bytes", "rel_path", "origin_kind", "created_at"],
+      "properties": {
+        "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "mime": { "type": "string" },
+        "bytes": { "type": "integer", "minimum": 0 },
+        "ext": { "type": ["string", "null"] },
+        "width": { "type": ["integer", "null"] },
+        "height": { "type": ["integer", "null"] },
+        "duration_ms": { "type": ["integer", "null"] },
+        "rel_path": { "type": "string" },
+        "origin_kind": { "$ref": "#/$defs/BlobOriginKind" },
+        "created_at": { "type": "integer" }
+      }
+    },
+    "OcaBlock": {
+      "type": "object",
+      "required": ["idx", "type"],
+      "properties": {
+        "idx": { "type": "integer", "minimum": 0 },
+        "type": { "$ref": "#/$defs/BlockType" },
+        "text": { "type": ["string", "null"] },
+        "lang": { "type": ["string", "null"] },
+        "tool_name": { "type": ["string", "null"] },
+        "tool_call_id": { "type": ["string", "null"] },
+        "tool_input": { "type": ["string", "null"] },
+        "status": { "type": ["string", "null"], "enum": ["ok", "error", "pending", "interrupted", null] },
+        "blob_sha256": { "type": ["string", "null"] },
+        "availability": { "$ref": "#/$defs/AssetAvailability" },
+        "meta": { "type": "object", "additionalProperties": true }
+      }
+    },
+    "OcaItem": {
+      "type": "object",
+      "required": ["external_id", "ordinal", "role", "kind", "content_hash", "blocks"],
+      "properties": {
+        "external_id": { "type": "string" },
+        "parent_external_id": { "type": ["string", "null"] },
+        "ordinal": { "type": "integer", "minimum": 0 },
+        "depth": { "type": "integer", "minimum": 0 },
+        "role": { "$ref": "#/$defs/Role" },
+        "kind": { "$ref": "#/$defs/ItemKind" },
+        "created_at": { "type": ["integer", "null"] },
+        "model": { "type": ["string", "null"] },
+        "text": { "type": ["string", "null"] },
+        "text_len": { "type": "integer", "minimum": 0 },
+        "content_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "is_active_branch": { "type": "boolean", "default": true },
+        "is_hidden": { "type": "boolean", "default": false },
+        "is_synthetic": { "type": "boolean", "default": false },
+        "status": { "type": ["string", "null"], "enum": ["ok", "error", "pending", "interrupted", null] },
+        "payload_ref": { "type": ["string", "null"] },
+        "blocks": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/OcaBlock" }
+        },
+        "ext": {
+          "type": "object",
+          "description": "Level-2 namespaced vendor extensions and Level-3 _unmapped fallback",
+          "additionalProperties": true
+        }
+      }
+    },
+    "OcaConversation": {
+      "type": "object",
+      "required": ["provider", "items"],
+      "properties": {
+        "provider": { "$ref": "#/$defs/ProviderId" },
+        "external_id": { "type": ["string", "null"] },
+        "title": { "type": ["string", "null"] },
+        "title_source": { "type": ["string", "null"], "enum": ["provider", "generated", "first_user", "filename", null] },
+        "summary": { "type": ["string", "null"] },
+        "created_at": { "type": ["integer", "null"] },
+        "updated_at": { "type": ["integer", "null"] },
+        "exported_at": { "type": ["integer", "null"] },
+        "default_model": { "type": ["string", "null"] },
+        "cwd": { "type": ["string", "null"] },
+        "head_hash": { "type": ["string", "null"] },
+        "content_hash": { "type": ["string", "null"] },
+        "fingerprint": { "type": ["string", "null"] },
+        "items": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/OcaItem" }
+        },
+        "blobs": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/OcaBlob" }
+        },
+        "ext": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      }
+    }
+  }
+}

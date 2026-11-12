@@ -1,0 +1,16 @@
+{
+  "name": "session-manager-tools",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "只读格式探针：扫描本地 AI 会话数据源与导出包，校验适配器假设",
+  "bin": { "probe-formats": "./probe-formats.mjs" },
+  "scripts": {
+    "probe:codex": "node probe-formats.mjs --kind codex --root %USERPROFILE%/.codex",
+    "probe:dsh": "node probe-formats.mjs --kind dsh --root %USERPROFILE%/.dsh",
+    "probe:claude": "node probe-formats.mjs --kind claude --root %USERPROFILE%/.claude"
+  },
+  "dependencies": {
+    "fzstd": "^0.1.1"
+  }
+}

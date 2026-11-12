@@ -1,0 +1,13 @@
+{
+  "files": [],
+  "references": [
+    { "path": "packages/oca" },
+    { "path": "packages/shared" },
+    { "path": "packages/store" },
+    { "path": "packages/adapters" },
+    { "path": "packages/core" },
+    { "path": "packages/fixtures" },
+    { "path": "apps/cli" },
+    { "path": "apps/server" }
+  ]
+}

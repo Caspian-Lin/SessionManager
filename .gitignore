@@ -1,0 +1,30 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Build outputs
+dist/
+build/
+*.tsbuildinfo
+
+# Local archive / runtime data
+.sm-data/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.db
+*.db-shm
+*.db-wal
+
+# Flutter / Dart
+apps/ui-win/.dart_tool/
+apps/ui-win/.packages
+apps/ui-win/build/
+apps/ui-win/windows/flutter/ephemeral/
+
+# Logs & OS
+*.log
+.DS_Store
+Thumbs.db
+.env
+.env.*

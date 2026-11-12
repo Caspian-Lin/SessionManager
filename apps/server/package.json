@@ -1,0 +1,18 @@
+{
+  "name": "@sm/server",
+  "version": "0.1.0",
+  "description": "Session Manager local HTTP server on 127.0.0.1 with ephemeral token authentication",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -b",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@sm/oca": "workspace:*",
+    "@sm/shared": "workspace:*",
+    "@sm/store": "workspace:*",
+    "@sm/core": "workspace:*"
+  }
+}
