@@ -335,6 +335,144 @@ function runGh(args, dryRun = false) {
   return execFileSync('gh', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 }
 
+function canUseGh() {
+  try {
+    execFileSync('gh', ['auth', 'status'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function resolveGitHubToken() {
+  const envToken = process.env.GITHUB_TOKEN || process.env.GH_TOKEN;
+  if (envToken && envToken.trim()) {
+    return envToken.trim();
+  }
+  try {
+    const out = execFileSync('git', ['credential', 'fill'], {
+      input: 'protocol=https\nhost=github.com\n\n',
+      encoding: 'utf8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    for (const line of out.split(/\r?\n/)) {
+      if (line.startsWith('password=')) {
+        const token = line.slice('password='.length).trim();
+        if (token) return token;
+      }
+    }
+  } catch {
+    // ignore credential helper errors
+  }
+  throw new Error(
+    'Unable to authenticate with GitHub: `gh auth status` failed and no token found via GITHUB_TOKEN/GH_TOKEN or `git credential fill`.'
+  );
+}
+
+async function githubRest(token, method, apiPath, body) {
+  const res = await fetch(`https://api.github.com${apiPath}`, {
+    method,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: 'application/vnd.github+json',
+      'X-GitHub-Api-Version': '2022-11-28',
+      'User-Agent': 'SessionManager-SyncScript',
+      ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
+    },
+    ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+  });
+  const text = await res.text();
+  let json = null;
+  if (text) {
+    try {
+      json = JSON.parse(text);
+    } catch {
+      json = text;
+    }
+  }
+  if (!res.ok) {
+    const err = new Error(`GitHub API ${method} ${apiPath} failed (${res.status}): ${text}`);
+    err.status = res.status;
+    err.body = json;
+    throw err;
+  }
+  return json;
+}
+
+async function syncViaRest(repo, token) {
+  // 1. Sync Labels
+  const existingLabels = (await githubRest(token, 'GET', `/repos/${repo}/labels?per_page=100`)) ?? [];
+  const labelNames = new Set(existingLabels.map((l) => l.name));
+
+  for (const label of LABELS) {
+    if (labelNames.has(label.name)) {
+      await githubRest(token, 'PATCH', `/repos/${repo}/labels/${encodeURIComponent(label.name)}`, {
+        new_name: label.name,
+        color: label.color,
+        description: label.description,
+      });
+      console.log(`  ✓ Label updated: ${label.name}`);
+    } else {
+      try {
+        await githubRest(token, 'POST', `/repos/${repo}/labels`, {
+          name: label.name,
+          color: label.color,
+          description: label.description,
+        });
+        console.log(`  ✓ Label: ${label.name}`);
+      } catch (e) {
+        if (e.status === 422) {
+          await githubRest(token, 'PATCH', `/repos/${repo}/labels/${encodeURIComponent(label.name)}`, {
+            new_name: label.name,
+            color: label.color,
+            description: label.description,
+          });
+          console.log(`  ✓ Label updated: ${label.name}`);
+        } else {
+          throw e;
+        }
+      }
+    }
+  }
+
+  // 2. Sync Milestones
+  const existingMilestones = (await githubRest(token, 'GET', `/repos/${repo}/milestones?state=all&per_page=100`)) ?? [];
+  const milestoneNumbers = new Map();
+
+  for (const m of MILESTONES) {
+    const found = existingMilestones.find((em) => em.title === m.title);
+    if (found) {
+      milestoneNumbers.set(m.key, found.number);
+      console.log(`  ✓ Milestone exists: ${m.title} (#${found.number})`);
+      continue;
+    }
+    const created = await githubRest(token, 'POST', `/repos/${repo}/milestones`, {
+      title: m.title,
+      description: m.description,
+      state: 'open',
+    });
+    milestoneNumbers.set(m.key, created.number);
+    console.log(`  ✓ Created milestone: ${m.title} (#${created.number})`);
+  }
+
+  // 3. Sync Issues
+  const existingIssues = (await githubRest(token, 'GET', `/repos/${repo}/issues?state=all&per_page=100`)) ?? [];
+  for (const issue of ISSUES) {
+    const found = existingIssues.find((ei) => !ei.pull_request && ei.title === issue.title);
+    if (found) {
+      console.log(`  ✓ Issue exists: ${issue.title} (#${found.number})`);
+      continue;
+    }
+    const created = await githubRest(token, 'POST', `/repos/${repo}/issues`, {
+      title: issue.title,
+      body: issue.body,
+      milestone: milestoneNumbers.get(issue.milestone),
+      labels: issue.labels,
+    });
+    console.log(`  ✓ Created issue: ${issue.title} (#${created.number} - ${created.html_url})`);
+  }
+}
+
 async function main() {
   const { repo, dryRun } = parseArgs(process.argv.slice(2));
   if (!repo) {
@@ -343,6 +481,14 @@ async function main() {
   }
 
   console.log(`Syncing ${LABELS.length} labels, ${MILESTONES.length} milestones, and ${ISSUES.length} issues to ${repo}...`);
+
+  if (!dryRun && !canUseGh()) {
+    console.log('gh CLI not authenticated; falling back to GitHub REST API via git credential fill / env token...');
+    const token = resolveGitHubToken();
+    await syncViaRest(repo, token);
+    console.log('Done!');
+    return;
+  }
 
   // 1. Sync Labels
   for (const label of LABELS) {
