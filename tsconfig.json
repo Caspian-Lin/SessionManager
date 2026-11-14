@@ -6,7 +6,6 @@
     { "path": "packages/adapters" },
     { "path": "packages/core" },
     { "path": "packages/fixtures" },
-    { "path": "apps/cli" },
-    { "path": "apps/server" }
+    { "path": "apps/cli" }
   ]
 }

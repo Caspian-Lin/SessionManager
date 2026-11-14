@@ -19,6 +19,8 @@ build/
 # Flutter / Dart
 apps/ui-win/.dart_tool/
 apps/ui-win/.packages
+apps/ui-win/.flutter-plugins
+apps/ui-win/.flutter-plugins-dependencies
 apps/ui-win/build/
 apps/ui-win/windows/flutter/ephemeral/
 

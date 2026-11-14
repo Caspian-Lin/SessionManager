@@ -1,68 +1,67 @@
 # `ui-win` · Session Manager Windows Reader
 
-`sm_ui_win` is a lightweight, high-performance Flutter desktop reader application tailored for Windows (`flutter build windows`). It shares its visual identity, window frame aesthetics, and conversational message components with **Chatea**, providing instant browsing and branch inspection across archived AI dialogues.
+`sm_ui_win` is a lightweight, high-performance Flutter desktop reader application tailored for Windows (`flutter build windows`). Built with **Flutter native Material 3 + Windows 11 platform-adapted desktop styling** (Win11 Fluent neutral palette, `Segoe UI Variable` / `Segoe UI` typography, `Cascadia Mono` code typography, compact desktop density, adaptive Light/Dark/System themes, and keyboard shortcuts), it provides instant browsing and branch inspection across archived AI dialogues.
 
 ---
 
-## 1. Architectural Role & Synergy
+## 1. Architectural Role: CQRS Hybrid Direct-Connection (混合直连)
 
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
 │ Flutter Windows Desktop UI (sm_ui_win.exe)                             │
 │   · Mica / Acrylic frosted title bar and navigation rail               │
-│   · Virtualized Session List (super_sliver_list)                       │
-│   · Branch Tree Reader (active branch switcher + synthetic folding)    │
-│   · Full-Text Search with matched snippet highlights                   │
-│   · Batch Dedupe & Integrity Diff Report (shrunk_conversations alerts) │
-└───────────────────────────────────▲────────────────────────────────────┘
-                                    │ HTTP JSON / SSE (127.0.0.1)
-                                    │ X-SM-Token: <ephemeral-hex>
-┌───────────────────────────────────▼────────────────────────────────────┐
-│ Node 24 Core Backend (sm serve)                                        │
-│   · Synchronous SQLite FTS5 (archive.db)                               │
-│   · Content-Addressed Blob Storage (blobs/:sha256)                     │
-│   · Raw Layer Immutability & Deduplication Pipeline                   │
-└────────────────────────────────────────────────────────────────────────┘
+│   · Virtualized Session List, Branch Tree Reader, Search & Integrity   │
+└───────────┬─────────────────────────────────────────┬──────────────────┘
+            │ Read Path (Zero Daemon / Zero IPC)       │ Write / Heavy IO Path
+            │ Dart sqlite3 FFI (OpenMode.readOnly)     │ On-Demand Process.run
+            │ + Direct File / Image.file() reads       │ sm <cmd> --db ... --json
+┌───────────▼───────────────────────────┐   ┌─────────▼──────────────────┐
+│ Local Archive Storage                 │   │ Node 24 CLI (@sm/cli)      │
+│   · archive.db (SQLite WAL mode)      │◄──┤   · sm import / verify     │
+│   · blobs/<2-char>/<sha256><ext>      │   │   · sm dedupe / reindex    │
+│   · raw/<batch_id>/...                │   │   · sm export              │
+└───────────────────────────────────────┘   └────────────────────────────┘
 ```
 
-1. **Zero WebView2 / Electron Overhead**:
-   By using Flutter's native Windows renderer (DirectX 12 / Skia / Impeller), `ui-win` maintains 60–120 FPS scrolling over 50,000+ sessions without host runtime version dependencies or memory bloat (~25 MB runtime memory).
-2. **Lightweight ViewModel DTO over `sm serve`**:
-   Consumes the unified `ConversationViewModel` JSON DTO (`ConversationSummary`, `ConversationDetail`, `MessageItem`, `SearchHit`, `BatchReport`) exposed by `sm serve`, decoupled from upstream provider raw formats.
-3. **Chatea Visual Shell Alignment**:
-   Adheres to Chatea's design tokens: semi-transparent navigation sidebar, distinct role bubbles (`user`, `assistant`, `tool_call`, `reasoning`), subtle monospace code blocks, and collapsible synthetic logs.
+1. **Zero WebView2 / Zero Resident Daemon**:
+   - By using Flutter's native Windows renderer (DirectX 12 / Skia / Impeller) paired with **CQRS Hybrid Direct-Connection**, `ui-win` reads `archive.db` directly via Dart `sqlite3` FFI (`OpenMode.readOnly`, WAL concurrent reads) without spawning or managing any background HTTP server (`sm serve` has been removed).
+   - No `127.0.0.1` port binding, no Windows Firewall prompts, no ephemeral token handshakes, and no orphan daemon processes.
+2. **Zero-Copy Local Media (`blobs/`)**:
+   - `ArchiveDirectStore.resolveBlobFile(sha256, ext: ..., relPath: ...)` resolves local paths under `<archiveRoot>/blobs/<2-char>/<sha256><ext>` directly for Flutter `Image.file()` rendering without HTTP Range proxy overhead.
+3. **On-Demand CLI Runner (`SmCliRunner`)**:
+   - Heavy write/compute pipelines (`sm import`, `sm verify`, `sm dedupe`, `sm reindex`, `sm export`) are invoked on demand as single-shot `Process.run(smExecutable, [..., '--json'])` subprocesses; upon exit, the read-only Flutter views immediately reload fresh WAL data.
+4. **Windows 11 Platform-Adapted Material 3 Styling**:
+   - Uses `WinAdaptiveTheme` (`useMaterial3: true`, `ThemeMode.system` with Light/Dark/System toggle), Win11 Fluent neutral palette (`#0067C0` light / `#60CDFF` dark accents), `Segoe UI Variable` / `Segoe UI` UI typography, `Cascadia Mono` / `Consolas` monospace code blocks, compact desktop density, desktop scrollbars, responsive wide-screen split layout (`>= 1100px`), and keyboard shortcuts (`Ctrl+F`, `Ctrl+O`, `Ctrl+R` / `F5`).
 
 ---
 
-## 2. IPC & Local Server Connection Flow
+## 2. Configuration (`--dart-define`)
 
-When `ui-win` launches:
+When running or building `ui-win`:
 
-1. **Auto-Spawn or Connect**:
-   - `ui-win` inspects command-line arguments: `--port <port> --token <token>` or `--db <path>`.
-   - If no running server is detected, it spawns `sm serve --port 0 --db <path>` as a background child process.
-   - It captures stdout line: `SM_SERVER_READY port=<port> token=<token> db=<dbPath>`.
-2. **Token-Guarded Security**:
-   - Every outbound HTTP request to `http://127.0.0.1:<port>` includes the header:
-     `X-SM-Token: <token>`
-   - The Node server binds **strictly** to `127.0.0.1`, rejecting any foreign or browser-forged requests.
-3. **Blob Streaming**:
-   - Images and media attachments are loaded on demand via `GET /blobs/:sha256` with HTTP Range caching.
+- **`SM_ARCHIVE_DIR`**: Path to the archive root directory containing `archive.db` and `blobs/` (or direct path to `archive.db`). Defaults to `./archive.db` or `./archive/archive.db`.
+- **`SM_CLI_BIN`**: Path to the `sm` executable or `apps/cli/dist/index.js` entrypoint for `SmCliRunner`. Defaults to `apps/cli/dist/index.js` (via `node`) or `sm` on `PATH`.
+
+Example:
+```powershell
+flutter run -d windows `
+  --dart-define=SM_ARCHIVE_DIR=C:\Users\me\SessionArchive `
+  --dart-define=SM_CLI_BIN=C:\path\to\SessionManager\apps\cli\dist\index.js
+```
 
 ---
 
 ## 3. Core Navigation Views
 
 1. **Session List**:
-   - Fast, virtualized list displaying conversation provider badges (`openai-web`, `codex-local`, `dsh-local`, `claude-code-local`), message counts, character volume, and last updated timestamps.
+   - Fast, virtualized list displaying conversation provider badges (`openai-web`, `codex-local`, `dsh-local`, `claude-code-local`), message counts, timestamps, and quick **Reindex FTS5** button via `SmCliRunner`.
 2. **Branch Tree Reader**:
    - **`is_active_branch` Switcher**: Enables users to switch between regenerated response variants or alternative tool paths.
    - **`is_synthetic` Folding**: Smoothly collapses synthetic events, turn markers, and internal orchestration logs to focus on human-AI dialogue.
 3. **Full-Text Search**:
-   - Instant search with matched excerpt snippets, role indicators, and direct deep-linking into the conversation tree.
+   - Direct SQLite FTS5 dual-index search (`item_fts_uni`, `item_fts_tri`, `conv_fts_tri`, and bounded `LIKE` fallback for 1–2 char CJK) with BM25 ranking and deep-linking into the conversation tree.
 4. **Batch Dedupe & Integrity Report**:
-   - Visual dashboard summarizing import batches, exact duplicates, and candidate clusters.
-   - **`shrunk_conversations` High-Priority Alert**: Highlights conversations that lost items in subsequent export dumps (indicating upstream message deletions or model deletions).
+   - Reads `import_batch.report_json` directly, exposes one-click **Run Verify** / **Reindex FTS5** actions via `SmCliRunner`, and highlights **`shrunk_conversations`** alerts.
 
 ---
 
@@ -71,7 +70,7 @@ When `ui-win` launches:
 ### Prerequisites
 - Flutter SDK `>=3.4.0 <4.0.0`
 - Visual Studio 2022 with "Desktop development with C++"
-- Node.js `>=24.0.0` with `pnpm`
+- Node.js `>=24.0.0` (for `sm` CLI invocations)
 
 ### Commands
 
@@ -79,7 +78,7 @@ When `ui-win` launches:
 # In apps/ui-win
 cd apps/ui-win
 
-# Get dependencies
+# Get dependencies (sqlite3 + sqlite3_flutter_libs + path + intl)
 flutter pub get
 
 # Run in Windows desktop debug mode

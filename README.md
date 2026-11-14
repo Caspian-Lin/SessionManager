@@ -12,7 +12,7 @@
 |---|---|
 | 是否已有同类项目 | 有大量「单一 provider 导出查看器」和几个「记忆中枢」，但**没有**同时做到：官方导出包 + 本地 Agent 日志 + 分支保真 + 重复导出查重/校验 + 多媒体。详见 [01-既有方案调研](docs/01-既有方案调研.md) |
 | 产品形态与平台 | **CLI 核心优先（`sm` CLI）+ 简短轻量的桌面阅读器 UI（v1 仅限 Windows 端，macOS 后续再议）** |
-| 技术栈 | **多态原生会话接口（`SessionDocument<TRaw>`：保留各 provider 原生结构，各自实现校验/哈希/投影方法）** + TypeScript 核心引擎（`shared` + `store` + `adapters` + `core` + `cli` + 本地 `server`）+ **Flutter (Dart) Windows 桌面 UI（与 `Chatea` 共用同一套设计风格与消息树组件）**；存储 SQLite（FTS5）+ 内容寻址 blob 仓库 |
+| 技术栈 | **多态原生会话接口（`SessionDocument<TRaw>`：保留各 provider 原生结构，各自实现校验/哈希/投影方法）** + TypeScript 核心引擎（`shared` + `store` + `adapters` + `core` + `cli`）+ **CQRS 混合直连（Flutter Dart `sqlite3` FFI 只读直连 `archive.db` + `blobs/` 本地直读 + 按需单次调用 `sm` CLI `--json`）**；存储 SQLite（WAL + FTS5）+ 内容寻址 blob 仓库 |
 | 为什么不是纯浏览器应用 | 需要读 `~/.codex`、`~/.claude`、`~/.dsh` 目录、处理 GB 级 zstd/JSON、做增量同步与后台任务，浏览器沙箱做不到 |
 | 最大技术风险 | 各 provider 格式漂移（尤其 DeepSeek 与 Codex）；已用「探针 + 原生类型版本化适配器 + 原始层不动」把风险关进笼子 |
 | MVP 工期 | **约 300 人时**（聚焦多态适配器、CLI 核心与轻量 Windows UI，去掉独立的跨格式重编码 OCA 规范包与多语言 codegen 负担），覆盖 OpenAI / Anthropic / DeepSeek 导出 + Codex / Claude Code / DSH 本地会话 + 同源查重校验 + 轻量阅读器 |
@@ -99,5 +99,5 @@ SessionManager/
 ├─ tools/probe-formats.mjs  # 格式探针（只读扫描，不上传任何数据）
 ├─ scripts/                 # GitHub 计划同步等辅助脚本
 ├─ packages/                # shared, store, adapters, core, fixtures
-└─ apps/                    # cli (`sm`), server (`sm serve`), ui-win (Flutter)
+└─ apps/                    # cli (`sm`), ui-win (Flutter + Dart sqlite3 FFI)
 ```

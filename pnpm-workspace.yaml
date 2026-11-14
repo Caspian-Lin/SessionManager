@@ -1,7 +1,6 @@
 packages:
   - "packages/*"
   - "apps/cli"
-  - "apps/server"
   - "tools"
 allowBuilds:
   esbuild: false
