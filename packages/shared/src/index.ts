@@ -7,3 +7,5 @@ export * from './logger.js';
 export * from './zstd.js';
 export * from './cjk.js';
 export * from './stream-json.js';
+export * from './mime.js';
+export * from './zip.js';
