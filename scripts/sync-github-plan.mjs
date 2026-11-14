@@ -20,7 +20,7 @@ export const LABELS = [
   { name: 'pkg:adapters', color: '1D76DB', description: 'Provider export and local agent polymorphic adapters (@sm/adapters)' },
   { name: 'pkg:core', color: '0E8A16', description: 'Validation, deduplication, merge, and diff pipeline (@sm/core)' },
   { name: 'app:cli', color: 'FBCA04', description: 'sm CLI commands and terminal reporting (@sm/cli)' },
-  { name: 'app:server', color: 'D93F0B', description: 'Local 127.0.0.1 HTTP API and media streaming (@sm/server)' },
+  { name: 'arch:cqrs-direct', color: '006B75', description: 'CQRS Hybrid Direct-Connection (Dart SQLite FFI read-only + on-demand CLI runner)' },
   { name: 'app:ui-win', color: 'C2E0C6', description: 'Flutter Windows lightweight desktop reader (apps/ui-win)' },
   { name: 'testing', color: 'BFD4F2', description: 'Synthetic fixtures and golden ViewModel snapshot tests' },
   { name: 'P0-blocker', color: 'B60205', description: 'Critical path blocker for milestone completion' },
@@ -61,9 +61,9 @@ export const MILESTONES = [
   },
   {
     key: 'M5',
-    title: 'M5 · 本地 HTTP Server 与 Flutter Windows 轻量桌面阅读器',
+    title: 'M5 · 混合直连数据层（Dart SQLite FFI + CLI 按需调度）与 Flutter Windows 轻量桌面阅读器',
     description:
-      '提供绑定 127.0.0.1 的本地安全 HTTP API（直接输出 ConversationViewModel JSON DTO）与 Flutter (Dart) 原生编译 Windows 桌面端（与 Chatea 共用视觉外壳与消息分支树组件）。',
+      '采用 CQRS 混合直连架构（移除常驻 sm serve 本地 HTTP Server）：Flutter Windows 桌面端通过 sqlite3 FFI 只读直连 archive.db（WAL 并发读）并直接读取本地 blobs/ 媒体文件，仅在导入/校验/查重/重建索引/导出等重写入操作时按需调用 sm CLI 子进程（--json）。',
   },
 ];
 
@@ -138,8 +138,8 @@ export const ISSUES = [
 将 \`tools/probe-formats.mjs\` 的探测能力整合进核心 CLI \`sm probe\`，搭建完整子命令路由。
 
 ### 任务拆解
-- [x] 搭建 \`apps/cli\` 入口，支持 \`sm probe|import|ls|show|search|verify|dedupe|export|reindex|serve\`
-- [ ] 对接完整 \`AdapterRegistry.probeSource\` 与 \`ImportPipeline\`，支持多源目录与 ZIP 包端到端导入`,
+- [x] 搭建 \`apps/cli\` 入口，支持 \`sm probe|import|ls|show|search|verify|dedupe|export|reindex\` 与 \`--json\` 结构化输出协议（供桌面端按需单次调用）
+- [x] 对接完整 \`AdapterRegistry.probeSource\` 与 \`ImportPipeline\`，支持多源目录与 ZIP 包端到端导入`,
   },
 
   // M1
@@ -285,30 +285,32 @@ export const ISSUES = [
   // M5
   {
     milestone: 'M5',
-    title: '[M5][app:server] 实现本地 HTTP Server（127.0.0.1 绑定、一次性 Token 鉴权、Range 媒体流协议）',
-    labels: ['app:server', 'P1-core'],
+    title: '[M5][app:ui-win] 实现混合直连数据访问层（Dart sqlite3 FFI 只读仓储 + blobs/ 磁盘直读 + sm CLI 按需进程桥接）',
+    labels: ['app:ui-win', 'pkg:store', 'arch:cqrs-direct', 'P1-core'],
     body: `### 任务拆解
-- [x] 严格绑定 \`127.0.0.1\` 随机或指定端口，启动生成一次性随机 Token，校验 \`X-SM-Token\` 与 \`Origin\`
-- [x] 提供 \`/api/conversations\`（keyset 分页）、\`/api/conversations/:id\`（从 \`item.blocks_json\` 直接返回视图树）、\`/api/search\`、\`/api/batches/:id/report\` 与 \`/blobs/:sha256\`（Range 流）`,
+- [x] 移除常驻 \`apps/server\`（\`@sm/server\`）与 \`sm serve\` 子命令，消除本地端口监听、防火墙弹窗、一次性 Token 鉴权与孤儿进程问题
+- [x] 在 \`apps/ui-win\` 实现基于 Dart \`sqlite3\` FFI 的只读仓储层（\`OpenMode.readOnly\`，复用 SQLite WAL 并发读）：直接查询 \`conversation\`、\`item.blocks_json\`、\`import_batch.report_json\` 及 FTS5 双索引（\`item_fts_uni\` / \`item_fts_tri\` / \`conv_fts_tri\`）
+- [x] 实现 \`blobs/<2位前缀>/<sha256><ext>\` 本地文件路径解析，供 Flutter \`Image.file()\` / 原生控件零拷贝直读媒体资产
+- [x] 实现写操作按需 CLI 桥接器（\`SmCliRunner\`）：通过 \`Process.run('sm', [..., '--json'])\` 按需单次执行 \`import\` / \`verify\` / \`dedupe\` / \`reindex\` / \`export\` 并在完成后刷新只读视图`,
   },
   {
     milestone: 'M5',
-    title: '[M5][app:ui-win] 搭建 Flutter Windows 桌面端骨架、进程托管（自动拉起 sm serve）与虚拟化会话列表',
-    labels: ['app:ui-win', 'P1-core'],
+    title: '[M5][app:ui-win] 搭建 Flutter Windows 桌面端骨架、本地库直连管理与虚拟化会话列表',
+    labels: ['app:ui-win', 'arch:cqrs-direct', 'P1-core'],
     body: `### 任务拆解
-- [ ] 基于 Flutter Windows 端消费 \`sm serve\` 提供的轻量化 \`ConversationViewModel\` JSON DTO，并与 \`Chatea\` 复用视觉风格
-- [ ] 启动时自动拉起 \`sm serve\` 子进程并读取一次性 Token
-- [ ] 实现虚拟化高帧率会话列表（支持按来源徽标、项目、时间、星标过滤）`,
+- [x] 基于 Flutter Windows 端对接 Dart \`sqlite3\` FFI 只读仓储层与 \`SmCliRunner\`，采用 Flutter 原生 Material 3 + Windows 平台适配桌面样式（Win11 Fluent 中性色板、Segoe UI Variable / Segoe UI 字体、Cascadia Mono 代码字体、紧凑桌面密度、亮/暗主题自适应与桌面快捷键）
+- [x] 启动时自动定位或选择本地 \`archive.db\` 与 \`blobs/\` 归档目录（零常驻后台进程），提供触发 \`sm import\` / \`verify\` / \`dedupe\` / \`reindex\` / \`export\` 的操作入口与状态展示
+- [x] 实现虚拟化高帧率会话列表（支持按来源徽标、项目、时间、星标过滤与宽屏主从分栏布局）`,
   },
   {
     milestone: 'M5',
     title: '[M5][app:ui-win] 实现会话分支树阅读器、Agent 轨迹折叠视图与查重差异报告面板，完成 Windows 便携版打包',
-    labels: ['app:ui-win', 'P1-core'],
+    labels: ['app:ui-win', 'arch:cqrs-direct', 'P1-core'],
     body: `### 任务拆解
-- [ ] 实现会话树分支切换器（可视化切换 regenerate 旁支）与 \`is_synthetic\` 注入节点默认折叠
-- [ ] 实现 Agent 工具调用、代码高亮、LaTeX 与本地媒体预览渲染
-- [ ] 实现「查重与批次差异报告」视图（一键高亮展示「内容缩短」会话与疑似重复双栏对比）
-- [ ] 编写 Windows 便携版打包脚本`,
+- [x] 实现会话树分支切换器（可视化切换 regenerate 旁支）与 \`is_synthetic\` 注入节点默认折叠
+- [x] 实现 Agent 工具调用、代码高亮、LaTeX 与基于 \`blobs/\` 本地文件直读（\`Image.file\`）的媒体预览渲染
+- [x] 实现「查重与批次差异报告」视图（一键高亮展示「内容缩短」会话与疑似重复双栏对比）
+- [x] 编写 Windows 便携版打包脚本（\`scripts/build-win-portable.mjs\`，打包 CLI 运行时与 \`apps/ui-win\`，无需后台守护进程）`,
   },
 ];
 
@@ -410,6 +412,19 @@ async function syncViaRest(repo, token) {
       labelNames.delete('pkg:oca');
       labelNames.add('arch:polymorphic');
       console.log('  ✓ Label renamed: pkg:oca -> arch:polymorphic');
+    }
+  }
+  if (labelNames.has('app:server') && !labelNames.has('arch:cqrs-direct')) {
+    const target = LABELS.find((l) => l.name === 'arch:cqrs-direct');
+    if (target) {
+      await githubRest(token, 'PATCH', `/repos/${repo}/labels/${encodeURIComponent('app:server')}`, {
+        new_name: target.name,
+        color: target.color,
+        description: target.description,
+      });
+      labelNames.delete('app:server');
+      labelNames.add('arch:cqrs-direct');
+      console.log('  ✓ Label renamed: app:server -> arch:cqrs-direct');
     }
   }
 
@@ -528,6 +543,12 @@ async function main() {
       console.log('  ✓ Label renamed: pkg:oca -> arch:polymorphic');
     } catch {
       // ignore if pkg:oca does not exist or arch:polymorphic already exists
+    }
+    try {
+      runGh(['api', '--method', 'PATCH', `repos/${repo}/labels/app%3Aserver`, '-f', 'new_name=arch:cqrs-direct']);
+      console.log('  ✓ Label renamed: app:server -> arch:cqrs-direct');
+    } catch {
+      // ignore if app:server does not exist or arch:cqrs-direct already exists
     }
   }
   for (const label of LABELS) {

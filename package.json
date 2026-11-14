@@ -13,7 +13,8 @@
     "typecheck": "pnpm -r --filter './packages/*' --filter './apps/*' run typecheck",
     "test": "vitest run",
     "probe": "node tools/probe-formats.mjs",
-    "sm": "node apps/cli/dist/index.js"
+    "sm": "node apps/cli/dist/index.js",
+    "package:win": "node scripts/build-win-portable.mjs"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

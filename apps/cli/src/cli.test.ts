@@ -286,6 +286,15 @@ describe('@sm/cli E2E closed-loop integration (Issues #6, #19)', () => {
     const reindexOut = runSm(['reindex', '--db', dbPath]);
     expect(reindexOut).toContain('Successfully reindexed 5 conversation(s)');
 
+    const reindexJson = JSON.parse(runSm(['reindex', '--db', dbPath, '--json'])) as {
+      ok: boolean;
+      conversationCount: number;
+      ftsRebuilt: boolean;
+    };
+    expect(reindexJson.ok).toBe(true);
+    expect(reindexJson.conversationCount).toBe(5);
+    expect(reindexJson.ftsRebuilt).toBe(true);
+
     const dbAfterReindex = ArchiveDatabase.openArchiveDb(dbPath);
     try {
       const row = dbAfterReindex
@@ -360,6 +369,39 @@ describe('@sm/cli E2E closed-loop integration (Issues #6, #19)', () => {
       .split('\n');
     expect(jsonlLines).toHaveLength(5);
     expect(() => JSON.parse(jsonlLines[0]!)).not.toThrow();
+
+    // Native export with --json (for SmCliRunner)
+    const nativeJsonExportDir = path.join(workDir, 'export-native-json');
+    const nativeJsonOut = JSON.parse(
+      runSm(['export', '--format', 'native', '--out', nativeJsonExportDir, '--db', dbPath, '--json'])
+    ) as {
+      ok: boolean;
+      format: string;
+      conversationCount: number;
+      copiedBlobs: number;
+    };
+    expect(nativeJsonOut.ok).toBe(true);
+    expect(nativeJsonOut.format).toBe('native');
+    expect(nativeJsonOut.conversationCount).toBe(5);
+    expect(nativeJsonOut.copiedBlobs).toBeGreaterThanOrEqual(5);
+
+    // Portable Windows packager script (--skip-build)
+    const portableOutDir = path.join(workDir, 'win-portable');
+    const packagerScript = path.resolve(REPO_ROOT, 'scripts', 'build-win-portable.mjs');
+    const packRes = execFileSync(
+      process.execPath,
+      [packagerScript, '--out', portableOutDir, '--skip-build'],
+      { encoding: 'utf8' }
+    );
+    expect(packRes).toContain('Portable bundle staged');
+    expect(fs.existsSync(path.join(portableOutDir, 'sm.cmd'))).toBe(true);
+    expect(fs.existsSync(path.join(portableOutDir, 'sm-ui.cmd'))).toBe(true);
+    expect(fs.existsSync(path.join(portableOutDir, 'runtime', 'apps', 'cli', 'dist', 'index.js'))).toBe(true);
+    const portableManifest = JSON.parse(
+      fs.readFileSync(path.join(portableOutDir, 'portable-manifest.json'), 'utf8')
+    ) as { architecture: string; resident_daemon: boolean };
+    expect(portableManifest.architecture).toBe('cqrs-hybrid-direct');
+    expect(portableManifest.resident_daemon).toBe(false);
   });
 
   it('reports exact duplicate clusters, dedupe_candidate pairs in sm dedupe, and missing blobs in sm verify', () => {

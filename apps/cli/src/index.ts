@@ -10,9 +10,8 @@
  *   sm search <query> [--limit <n>] [--provider <id>] [--role <role>] [--db <archive.db>] [--json]
  *   sm verify [--batch <id>] [--out <path>] [--db <archive.db>] [--json]
  *   sm dedupe [--db <archive.db>] [--json]
- *   sm export --format native|md|jsonl --out <dir> [--provider <id>] [--db <archive.db>]
- *   sm reindex [--db <archive.db>]
- *   sm serve [--port <port>] [--db <archive.db>]
+ *   sm export --format native|md|jsonl --out <dir> [--provider <id>] [--db <archive.db>] [--json]
+ *   sm reindex [--db <archive.db>] [--json]
  *   sm --help / sm --version
  */
 
@@ -191,9 +190,6 @@ export async function runCli(argv: readonly string[]): Promise<void> {
     case 'reindex':
       await runReindex(args);
       break;
-    case 'serve':
-      await runServe(args);
-      break;
     default:
       throw new CliError(
         `Unknown subcommand "${args.subcommand}". Run "sm --help" for available commands.`
@@ -231,11 +227,9 @@ Commands:
   dedupe                       List exact duplicate clusters and similarity candidate pairs
                                Options: --db <archive.db>, --json
   export                       Export archive conversations to folder
-                               Options: --format native|md|jsonl, --out <dir>, --provider <id>, --db <archive.db>
+                               Options: --format native|md|jsonl, --out <dir>, --provider <id>, --db <archive.db>, --json
   reindex                      Rebuild FTS5 search indexes and recalculate conversation counts
-                               Options: --db <archive.db>
-  serve                        Start local HTTP API server on 127.0.0.1 with ephemeral token
-                               Options: --port <port>, --db <archive.db>
+                               Options: --db <archive.db>, --json
 
 Global Flags:
   -h, --help                   Display this help message
@@ -1286,6 +1280,7 @@ async function runExport(args: ParsedArgs): Promise<void> {
   const format = (typeof args.flags['format'] === 'string' ? args.flags['format'] : 'native').toLowerCase();
   const outDir = typeof args.flags['out'] === 'string' ? args.flags['out'] : undefined;
   const provider = typeof args.flags['provider'] === 'string' ? args.flags['provider'] : undefined;
+  const isJson = Boolean(args.flags['json']);
 
   if (!outDir) {
     throw new CliError('"sm export" requires --out <dir> parameter.');
@@ -1297,10 +1292,12 @@ async function runExport(args: ParsedArgs): Promise<void> {
   const resolvedOut = path.resolve(outDir);
   fs.mkdirSync(resolvedOut, { recursive: true });
 
-  const { service } = openCliArchive(args.flags);
+  const { service, dbPath } = openCliArchive(args.flags);
   try {
     const convs = service.listConversations({ provider, limit: 100_000 });
-    console.log(`Exporting ${convs.length} conversation(s) to "${resolvedOut}" in format "${format}"...`);
+    if (!isJson) {
+      console.log(`Exporting ${convs.length} conversation(s) to "${resolvedOut}" in format "${format}"...`);
+    }
 
     const entries: {
       conv: ConversationRow;
@@ -1321,6 +1318,7 @@ async function runExport(args: ParsedArgs): Promise<void> {
     }
 
     if (format === 'md') {
+      const files: string[] = [];
       for (const { conv, view } of entries) {
         const safeTitle = (conv.title ?? `conv_${conv.id}`).replace(
           /[^a-zA-Z0-9_\u4e00-\u9fa5-]/g,
@@ -1329,8 +1327,26 @@ async function runExport(args: ParsedArgs): Promise<void> {
         const mdFile = path.join(resolvedOut, `${conv.id}_${safeTitle}.md`);
         const md = formatConversationMarkdown(view);
         fs.writeFileSync(mdFile, md, 'utf8');
+        files.push(mdFile);
       }
-      console.log(`✔ Exported ${entries.length} Markdown file(s) to ${resolvedOut}`);
+      if (isJson) {
+        console.log(
+          JSON.stringify(
+            {
+              ok: true,
+              dbPath,
+              format,
+              outDir: resolvedOut,
+              conversationCount: entries.length,
+              files,
+            },
+            null,
+            2
+          )
+        );
+      } else {
+        console.log(`✔ Exported ${entries.length} Markdown file(s) to ${resolvedOut}`);
+      }
       return;
     }
 
@@ -1345,7 +1361,24 @@ async function runExport(args: ParsedArgs): Promise<void> {
         })
       );
       fs.writeFileSync(jsonlPath, lines.length > 0 ? lines.join('\n') + '\n' : '', 'utf8');
-      console.log(`✔ Written JSONL file: ${jsonlPath}`);
+      if (isJson) {
+        console.log(
+          JSON.stringify(
+            {
+              ok: true,
+              dbPath,
+              format,
+              outDir: resolvedOut,
+              conversationCount: entries.length,
+              jsonlPath,
+            },
+            null,
+            2
+          )
+        );
+      } else {
+        console.log(`✔ Written JSONL file: ${jsonlPath}`);
+      }
       return;
     }
 
@@ -1389,17 +1422,11 @@ async function runExport(args: ParsedArgs): Promise<void> {
         blobs: view.blobs,
       };
     });
-    fs.writeFileSync(
-      path.join(resolvedOut, 'sessions.json'),
-      JSON.stringify(sessionsPayload, null, 2),
-      'utf8'
-    );
+    const sessionsPath = path.join(resolvedOut, 'sessions.json');
+    fs.writeFileSync(sessionsPath, JSON.stringify(sessionsPayload, null, 2), 'utf8');
 
-    fs.writeFileSync(
-      path.join(resolvedOut, 'native-manifest.json'),
-      JSON.stringify(manifest, null, 2),
-      'utf8'
-    );
+    const manifestPath = path.join(resolvedOut, 'native-manifest.json');
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2), 'utf8');
 
     // Copy all referenced blobs (including raw_blob_sha256 native session JSON blobs) into <out>/blobs/
     let copiedBlobs = 0;
@@ -1417,22 +1444,46 @@ async function runExport(args: ParsedArgs): Promise<void> {
       copiedBlobs++;
     }
 
-    console.log(
-      `✔ Exported native archive to ${resolvedOut} (${entries.length} conversations, ${copiedBlobs} blobs copied${missingBlobs > 0 ? `, ${missingBlobs} missing` : ''})`
-    );
+    if (isJson) {
+      console.log(
+        JSON.stringify(
+          {
+            ok: true,
+            dbPath,
+            format,
+            outDir: resolvedOut,
+            conversationCount: entries.length,
+            copiedBlobs,
+            missingBlobs,
+            manifestPath,
+            sessionsPath,
+            jsonlPath,
+          },
+          null,
+          2
+        )
+      );
+    } else {
+      console.log(
+        `✔ Exported native archive to ${resolvedOut} (${entries.length} conversations, ${copiedBlobs} blobs copied${missingBlobs > 0 ? `, ${missingBlobs} missing` : ''})`
+      );
+    }
   } finally {
     service.close();
   }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 9. Subcommand: sm reindex [--db <archive.db>]
+// 9. Subcommand: sm reindex [--db <archive.db>] [--json]
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function runReindex(args: ParsedArgs): Promise<void> {
-  const { service } = openCliArchive(args.flags);
+  const isJson = Boolean(args.flags['json']);
+  const { service, dbPath } = openCliArchive(args.flags);
   try {
-    console.log('Rebuilding FTS5 indexes and recalculating conversation statistics...');
+    if (!isJson) {
+      console.log('Rebuilding FTS5 indexes and recalculating conversation statistics...');
+    }
 
     const convCount = service.db.transaction(() => {
       const convs = service.db
@@ -1456,30 +1507,25 @@ async function runReindex(args: ParsedArgs): Promise<void> {
     });
 
     service.rebuildFts();
-    console.log(`✔ Successfully reindexed ${convCount} conversation(s) and rebuilt FTS5 indexes.`);
+    if (isJson) {
+      console.log(
+        JSON.stringify(
+          {
+            ok: true,
+            dbPath,
+            conversationCount: convCount,
+            ftsRebuilt: true,
+          },
+          null,
+          2
+        )
+      );
+    } else {
+      console.log(`✔ Successfully reindexed ${convCount} conversation(s) and rebuilt FTS5 indexes.`);
+    }
   } finally {
     service.close();
   }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 10. Subcommand: sm serve [--port <port>] [--db <archive.db>]
-// ─────────────────────────────────────────────────────────────────────────────
-
-async function runServe(args: ParsedArgs): Promise<void> {
-  const portParam = typeof args.flags['port'] === 'string' ? args.flags['port'] : undefined;
-  const port = portParam ? parseInt(portParam, 10) : 0;
-  const dbPath = path.resolve(typeof args.flags['db'] === 'string' ? args.flags['db'] : './archive.db');
-
-  console.log(`Launching local server for database: ${dbPath}`);
-  const serverModule = await import('@sm/server');
-  const running = await serverModule.startLocalServer({ port, dbPath });
-  console.log(`\n======================================================`);
-  console.log(`  Session Manager Server running on 127.0.0.1:${running.port}`);
-  console.log(`  Ephemeral Token: ${running.token}`);
-  console.log(`  Database Path:   ${running.dbPath}`);
-  console.log(`======================================================\n`);
-  console.log('Press Ctrl+C to terminate.');
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
