@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import type { OcaBlob, OcaBlobOriginKind } from '@sm/oca';
+import type { BlobAsset, BlobOriginKind } from '@sm/shared';
 
 export interface SniffedMime {
   mime: string;
@@ -100,7 +100,7 @@ export function sniffMimeAndExt(buf: Buffer): SniffedMime {
     const firstByte = buf[startIdx];
     if (firstByte === 0x7b || firstByte === 0x5b) { // '{' or '['
       try {
-        const text = buf.toString('utf8');
+        const text = buf.subarray(startIdx).toString('utf8');
         JSON.parse(text);
         return { mime: 'application/json', ext: '.json' };
       } catch {
@@ -158,10 +158,10 @@ export class BlobStore {
    */
   async putBlob(
     buf: Buffer,
-    originKind: OcaBlobOriginKind,
+    originKind: BlobOriginKind,
     overrideMime?: string,
     overrideExt?: string
-  ): Promise<OcaBlob> {
+  ): Promise<BlobAsset> {
     const sha256 = createHash('sha256').update(buf).digest('hex');
     const sniffed = sniffMimeAndExt(buf);
     const mime = overrideMime ?? sniffed.mime;
@@ -198,10 +198,10 @@ export class BlobStore {
    */
   putBlobSync(
     buf: Buffer,
-    originKind: OcaBlobOriginKind,
+    originKind: BlobOriginKind,
     overrideMime?: string,
     overrideExt?: string
-  ): OcaBlob {
+  ): BlobAsset {
     const sha256 = createHash('sha256').update(buf).digest('hex');
     const sniffed = sniffMimeAndExt(buf);
     const mime = overrideMime ?? sniffed.mime;
@@ -239,8 +239,8 @@ export class BlobStore {
    */
   async spillPayload(
     payload: unknown | Buffer,
-    originKind: OcaBlobOriginKind = 'oversized_payload'
-  ): Promise<OcaBlob> {
+    originKind: BlobOriginKind = 'oversized_payload'
+  ): Promise<BlobAsset> {
     let buf: Buffer;
     let overrideMime: string | undefined;
     let overrideExt: string | undefined;
@@ -265,8 +265,8 @@ export class BlobStore {
    */
   spillPayloadSync(
     payload: unknown | Buffer,
-    originKind: OcaBlobOriginKind = 'oversized_payload'
-  ): OcaBlob {
+    originKind: BlobOriginKind = 'oversized_payload'
+  ): BlobAsset {
     let buf: Buffer;
     let overrideMime: string | undefined;
     let overrideExt: string | undefined;

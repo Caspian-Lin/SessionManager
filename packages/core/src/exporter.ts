@@ -1,4 +1,5 @@
-import type { OcaArchiveManifest, OcaBlob, OcaConversation } from '@sm/oca';
+import type { SessionDocument } from '@sm/adapters';
+import type { BlobAsset, ConversationViewModel, NativeArchiveManifest } from '@sm/shared';
 
 export interface ExportManifestOptions {
   generator?: string;
@@ -7,29 +8,35 @@ export interface ExportManifestOptions {
   blobsDir?: string;
 }
 
+export type ExportableSession = SessionDocument | ConversationViewModel;
+
+function asView(input: ExportableSession): ConversationViewModel {
+  return 'toViewModel' in input ? input.toViewModel() : input;
+}
+
 /**
- * Builds an OCA v1 archive manifest adhering to the Open Conversation Archive specification.
+ * Builds a native-slice archive manifest describing exported per-session slices and blobs.
  */
-export function exportToOcaManifest(
-  convs: readonly OcaConversation[],
-  blobs?: readonly OcaBlob[],
+export function exportNativeManifest(
+  sessions: readonly ExportableSession[],
+  blobs?: readonly BlobAsset[],
   options?: ExportManifestOptions
-): OcaArchiveManifest {
-  const convCount = convs.length;
+): NativeArchiveManifest {
+  const convCount = sessions.length;
   let itemCount = 0;
   let embeddedBlobCount = 0;
 
-  for (const c of convs) {
-    itemCount += c.items.length;
-    if (c.blobs) {
-      embeddedBlobCount += c.blobs.length;
-    }
+  for (const s of sessions) {
+    const view = asView(s);
+    itemCount += view.nodes.length;
+    embeddedBlobCount += view.blobs.length;
   }
 
   const blobCount = blobs !== undefined ? blobs.length : embeddedBlobCount;
 
   return {
-    oca_version: '1.0.0',
+    archive_version: '1.0.0',
+    format: 'native-slice',
     exported_at: options?.exportedAt ?? Date.now(),
     generator: options?.generator ?? 'sm-core/0.1.0',
     conversation_count: convCount,
@@ -41,40 +48,43 @@ export function exportToOcaManifest(
 }
 
 /**
- * Formats an OcaConversation into a human-readable Markdown vault document
- * with complete YAML frontmatter and structured blocks (thinking, code, tool calls).
+ * Formats a SessionDocument or ConversationViewModel into a human-readable Markdown document.
  */
-export function formatConversationMarkdown(conv: OcaConversation): string {
+export function formatConversationMarkdown(input: ExportableSession): string {
+  const view = asView(input);
+  const { meta, nodes } = view;
+
   const frontmatterLines = [
     '---',
-    `title: ${JSON.stringify(conv.title ?? 'Untitled Conversation')}`,
-    `provider: ${conv.provider}`,
-    `external_id: ${JSON.stringify(conv.external_id ?? '')}`,
-    `created_at: ${conv.created_at ? new Date(conv.created_at).toISOString() : ''}`,
-    `updated_at: ${conv.updated_at ? new Date(conv.updated_at).toISOString() : ''}`,
-    `default_model: ${JSON.stringify(conv.default_model ?? '')}`,
-    `cwd: ${JSON.stringify(conv.cwd ?? '')}`,
-    `content_hash: ${conv.content_hash}`,
-    `item_count: ${conv.items.length}`,
+    `title: ${JSON.stringify(meta.title ?? 'Untitled Conversation')}`,
+    `provider: ${meta.provider}`,
+    `raw_format: ${meta.raw_format}`,
+    `external_id: ${JSON.stringify(meta.external_id ?? '')}`,
+    `created_at: ${meta.created_at ? new Date(meta.created_at).toISOString() : ''}`,
+    `updated_at: ${meta.updated_at ? new Date(meta.updated_at).toISOString() : ''}`,
+    `default_model: ${JSON.stringify(meta.default_model ?? '')}`,
+    `cwd: ${JSON.stringify(meta.cwd ?? '')}`,
+    `content_hash: ${meta.content_hash}`,
+    `item_count: ${nodes.length}`,
     '---',
     '',
   ];
 
   const contentLines: string[] = [];
-  contentLines.push(`# ${conv.title ?? 'Untitled Conversation'}`);
+  contentLines.push(`# ${meta.title ?? 'Untitled Conversation'}`);
   contentLines.push('');
 
-  const sortedItems = [...conv.items].sort((a, b) => a.ordinal - b.ordinal);
+  const sortedNodes = [...nodes].sort((a, b) => a.ordinal - b.ordinal);
 
-  for (const item of sortedItems) {
-    const roleCapitalized = item.role.charAt(0).toUpperCase() + item.role.slice(1);
-    const modelBadge = item.model ? ` (${item.model})` : '';
-    const kindBadge = item.kind !== 'message' ? ` [${item.kind}]` : '';
+  for (const node of sortedNodes) {
+    const roleCapitalized = node.role.charAt(0).toUpperCase() + node.role.slice(1);
+    const modelBadge = node.model ? ` (${node.model})` : '';
+    const kindBadge = node.kind !== 'message' ? ` [${node.kind}]` : '';
 
     contentLines.push(`### ${roleCapitalized}${modelBadge}${kindBadge}`);
     contentLines.push('');
 
-    for (const block of item.blocks) {
+    for (const block of node.blocks) {
       if (block.type === 'thinking') {
         contentLines.push('> [!NOTE] Thinking');
         const lines = (block.text ?? '').split('\n');
@@ -113,7 +123,6 @@ export function formatConversationMarkdown(conv: OcaConversation): string {
         contentLines.push(`![Image](${ref})`);
         contentLines.push('');
       } else {
-        // Text or file
         if (block.text) {
           contentLines.push(block.text);
           contentLines.push('');

@@ -1,5 +1,5 @@
 /**
- * Synthetic Sample Builders for OCA Adapters & Pipeline Verification.
+ * Synthetic Sample Builders for Polymorphic Session Adapters & Pipeline Verification.
  * Dual-licensed under CC0-1.0 and MIT.
  */
 
@@ -50,7 +50,7 @@ export function createSyntheticOpenAiExport(): SyntheticOpenAiExport {
             create_time: 1712345679.0,
             content: {
               content_type: 'text',
-              parts: ['How do I normalize conversation archives with OCA?'],
+              parts: ['How do I validate and deduplicate conversation archives?'],
             },
             metadata: {
               is_visually_hidden_from_conversation: false,
@@ -69,7 +69,7 @@ export function createSyntheticOpenAiExport(): SyntheticOpenAiExport {
             content: {
               content_type: 'text',
               parts: [
-                'You normalize them by mapping provider formats into the four core entities: Conversation, Item, Block, and Blob.',
+                'Keep each provider format intact and implement the unified SessionDocument interface for validation, same-provider diffing, FTS indexing, and UI ViewModels.',
               ],
             },
             metadata: {
@@ -139,7 +139,7 @@ export function createSyntheticAnthropicExport(): SyntheticAnthropicExport {
             {
               file_name: 'spec.txt',
               file_type: 'text/plain',
-              extracted_content: 'OCA Intermediate Representation Specification v1',
+              extracted_content: 'Polymorphic SessionDocument Specification v1',
             },
           ],
           files: [],

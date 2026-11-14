@@ -1,43 +1,201 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import zlib from 'node:zlib';
 import {
+  decompressZstd,
+  isZstdBuffer,
+  iterJsonLines,
   sha256Hex,
-  type OcaBlock,
-  type OcaConversationDraft,
-  type OcaItemDraft,
-  type OcaItemKind,
-  type OcaProviderId,
-  type OcaRole,
-} from '@sm/oca';
+  type IntegrityIssue,
+  type ProviderId,
+} from '@sm/shared';
 import {
+  BaseSessionDocument,
   partitionVendorFields,
   type Adapter,
   type ImportTask,
   type ParseCtx,
   type ProbeResult,
+  type RawTurnProjection,
+  type SessionDocument,
   type SourceRef,
 } from '../contract.js';
 
-const ZSTD_MAGIC = 0xfd2fb528;
+export interface DshNativeEvent {
+  type?: string;
+  seq?: number;
+  time?: number;
+  data?: unknown;
+  [key: string]: unknown;
+}
+
+export interface DshNativeSession {
+  session_id: string;
+  source_file: string;
+  title?: string | null;
+  cwd?: string | null;
+  agent_preset?: string | null;
+  delegation_depth?: number | null;
+  permission_preset?: string | null;
+  sandbox_mode?: string | null;
+  events: DshNativeEvent[];
+}
 
 function readBufferMaybeZstd(filePath: string): Buffer {
   const buf = fs.readFileSync(filePath);
-  if (buf.length >= 4 && buf.readUInt32LE(0) === ZSTD_MAGIC) {
-    try {
-      return zlib.zstdDecompressSync(buf);
-    } catch {
-      // In case of multi-frame zstd where native zlib fails, return raw buf for fallback or outer reader
-      return buf;
-    }
+  if (isZstdBuffer(buf)) {
+    return decompressZstd(buf);
   }
   return buf;
 }
 
 const KNOWN_EVENT_KEYS = ['type', 'seq', 'time', 'data'] as const;
 
-export class DshLocalAdapter implements Adapter {
-  readonly id: OcaProviderId = 'dsh-local';
+export class DshSessionDocument extends BaseSessionDocument<DshNativeSession> {
+  constructor(
+    nativeData: DshNativeSession,
+    createdAt: number | null,
+    updatedAt: number | null,
+    parseIssues: IntegrityIssue[] = []
+  ) {
+    super({
+      provider: 'dsh-local',
+      rawFormat: 'dsh-session/v4',
+      nativeData,
+      external_id: nativeData.session_id,
+      title: nativeData.title ?? null,
+      title_source: nativeData.title ? 'provider' : null,
+      created_at: createdAt,
+      updated_at: updatedAt,
+      cwd: nativeData.cwd ?? null,
+      parseIssues,
+    });
+  }
+
+  protected projectTurns(): RawTurnProjection[] {
+    const turns: RawTurnProjection[] = [];
+    let ordinal = 0;
+    let prevId: string | null = null;
+    let latestTime: number | null = this.init.created_at ?? null;
+
+    for (const record of this.nativeData.events) {
+      const evtType = typeof record.type === 'string' ? record.type : '';
+      const seq = typeof record.seq === 'number' ? record.seq : ordinal;
+      if (typeof record.time === 'number') {
+        latestTime = record.time < 10000000000 ? record.time * 1000 : record.time;
+      }
+      const data = record.data;
+
+      if (evtType === 'user/message') {
+        const text = typeof data === 'string' ? data : JSON.stringify(data ?? '');
+        const id = `dsh-${seq}`;
+        turns.push({
+          external_id: id,
+          parent_external_id: prevId,
+          ordinal: ordinal++,
+          role: 'user',
+          kind: 'message',
+          created_at: latestTime,
+          text,
+          is_active_branch: true,
+          is_hidden: false,
+          is_synthetic: false,
+          blocks: [{ idx: 0, type: 'text', text }],
+        });
+        prevId = id;
+      } else if (evtType === 'agent/inbox/spliced') {
+        const text = typeof data === 'string' ? data : JSON.stringify(data ?? '');
+        const id = `dsh-${seq}`;
+        turns.push({
+          external_id: id,
+          parent_external_id: prevId,
+          ordinal: ordinal++,
+          role: 'system',
+          kind: 'system_note',
+          created_at: latestTime,
+          text,
+          is_active_branch: true,
+          is_hidden: false,
+          is_synthetic: true,
+          blocks: [{ idx: 0, type: 'text', text }],
+        });
+        prevId = id;
+      } else if (evtType === 'assistant/message') {
+        const text = typeof data === 'string' ? data : JSON.stringify(data ?? '');
+        const id = `dsh-${seq}`;
+        turns.push({
+          external_id: id,
+          parent_external_id: prevId,
+          ordinal: ordinal++,
+          role: 'assistant',
+          kind: 'message',
+          created_at: latestTime,
+          text,
+          is_active_branch: true,
+          is_hidden: false,
+          is_synthetic: false,
+          blocks: [{ idx: 0, type: 'text', text }],
+        });
+        prevId = id;
+      } else if (evtType === 'tool/call') {
+        const id = `dsh-${seq}`;
+        const inputStr = typeof data === 'string' ? data : JSON.stringify(data ?? {});
+        turns.push({
+          external_id: id,
+          parent_external_id: prevId,
+          ordinal: ordinal++,
+          role: 'assistant',
+          kind: 'tool_call',
+          created_at: latestTime,
+          text: inputStr,
+          is_active_branch: true,
+          is_hidden: false,
+          is_synthetic: false,
+          blocks: [{ idx: 0, type: 'tool_use', tool_input: inputStr }],
+        });
+        prevId = id;
+      } else if (evtType === 'tool/result') {
+        const id = `dsh-${seq}`;
+        const resStr = typeof data === 'string' ? data : JSON.stringify(data ?? {});
+        turns.push({
+          external_id: id,
+          parent_external_id: prevId,
+          ordinal: ordinal++,
+          role: 'tool',
+          kind: 'tool_result',
+          created_at: latestTime,
+          text: resStr,
+          is_active_branch: true,
+          is_hidden: false,
+          is_synthetic: false,
+          blocks: [{ idx: 0, type: 'tool_result', text: resStr }],
+        });
+        prevId = id;
+      } else if (evtType.startsWith('compaction/')) {
+        const id = `dsh-${seq}`;
+        const summary = typeof data === 'string' ? data : JSON.stringify(data ?? '');
+        turns.push({
+          external_id: id,
+          parent_external_id: prevId,
+          ordinal: ordinal++,
+          role: 'system',
+          kind: 'compaction',
+          created_at: latestTime,
+          text: summary,
+          is_active_branch: true,
+          is_hidden: false,
+          is_synthetic: true,
+          blocks: [{ idx: 0, type: 'text', text: summary }],
+        });
+        prevId = id;
+      }
+    }
+
+    return turns;
+  }
+}
+
+export class DshLocalAdapter implements Adapter<DshNativeSession> {
+  readonly id: ProviderId = 'dsh-local';
 
   async probe(src: SourceRef): Promise<ProbeResult | null> {
     const evidence: string[] = [];
@@ -108,7 +266,7 @@ export class DshLocalAdapter implements Adapter {
     }
   }
 
-  async parse(task: ImportTask, ctx: ParseCtx): Promise<OcaConversationDraft[]> {
+  async parse(task: ImportTask, ctx: ParseCtx): Promise<SessionDocument<DshNativeSession>[]> {
     const filePath = task.entry ?? task.src.path;
     ctx.log('info', `DshLocalAdapter parsing: ${filePath}`);
 
@@ -120,8 +278,6 @@ export class DshLocalAdapter implements Adapter {
       return [];
     }
 
-    const lines = buf.toString('utf8').split('\n');
-
     let sessionId: string | null = null;
     let title: string | null = null;
     let cwd: string | null = null;
@@ -132,206 +288,74 @@ export class DshLocalAdapter implements Adapter {
     let permissionPreset: string | null = null;
     let sandboxMode: string | null = null;
 
-    const items: OcaItemDraft[] = [];
-    let ordinal = 0;
-    let prevId: string | null = null;
+    const events: DshNativeEvent[] = [];
+    const parseIssues: IntegrityIssue[] = [];
 
-    for (const line of lines) {
-      if (!line.trim()) continue;
-      let record: Record<string, unknown>;
+    for (const line of iterJsonLines(buf)) {
+      let record: DshNativeEvent;
       try {
-        record = JSON.parse(line);
+        record = JSON.parse(line) as DshNativeEvent;
       } catch {
+        parseIssues.push({
+          code: 'truncated_stream',
+          severity: 'warn',
+          message: `Malformed or truncated DSH event line skipped in ${path.basename(filePath)}`,
+        });
         continue;
       }
 
-      const evtType = typeof record['type'] === 'string' ? record['type'] : '';
-      const seq = typeof record['seq'] === 'number' ? record['seq'] : ordinal;
-      const timeVal = typeof record['time'] === 'number' ? record['time'] : null;
-      if (timeVal) {
-        const ms = timeVal < 10000000000 ? timeVal * 1000 : timeVal;
+      const evtType = typeof record.type === 'string' ? record.type : '';
+      // Skip raw streaming delta chunks when storing native slice if final message exists,
+      // keeping structural events intact
+      if (evtType === 'assistant/chunk' || evtType.endsWith('-chunks')) {
+        continue;
+      }
+
+      if (typeof record.time === 'number') {
+        const ms = record.time < 10000000000 ? record.time * 1000 : record.time;
         if (!createdAt) createdAt = ms;
         updatedAt = ms;
       }
 
-      const data = record['data'] as Record<string, unknown> | string | undefined;
-      const unmapped = partitionVendorFields(record, KNOWN_EVENT_KEYS, ctx);
+      const data = record.data as Record<string, unknown> | string | undefined;
+      partitionVendorFields(record, KNOWN_EVENT_KEYS, ctx);
 
-      if (evtType === 'session') {
-        if (data && typeof data === 'object') {
-          const dObj = data as Record<string, unknown>;
-          sessionId = typeof dObj['id'] === 'string' ? dObj['id'] : sessionId;
-          cwd = typeof dObj['cwd'] === 'string' ? dObj['cwd'] : cwd;
-          agentPreset = typeof dObj['agentPreset'] === 'string' ? dObj['agentPreset'] : null;
-          delegationDepth = typeof dObj['delegationDepth'] === 'number' ? dObj['delegationDepth'] : null;
-        }
+      if (evtType === 'session' && data && typeof data === 'object') {
+        const dObj = data as Record<string, unknown>;
+        sessionId = typeof dObj['id'] === 'string' ? dObj['id'] : sessionId;
+        cwd = typeof dObj['cwd'] === 'string' ? dObj['cwd'] : cwd;
+        agentPreset = typeof dObj['agentPreset'] === 'string' ? dObj['agentPreset'] : null;
+        delegationDepth = typeof dObj['delegationDepth'] === 'number' ? dObj['delegationDepth'] : null;
       } else if (evtType === 'session/title') {
         if (typeof data === 'string') {
           title = data;
-        } else if (data && typeof data === 'object' && typeof (data as Record<string, unknown>)['title'] === 'string') {
-          title = (data as Record<string, unknown>)['title'] as string;
+        } else if (data && typeof data === 'object' && typeof data['title'] === 'string') {
+          title = data['title'];
         }
-      } else if (evtType === 'permission/preset') {
-        if (typeof data === 'string') permissionPreset = data;
-      } else if (evtType === 'sandbox/mode') {
-        if (typeof data === 'string') sandboxMode = data;
-      } else if (evtType === 'user/message') {
-        const text = typeof data === 'string' ? data : JSON.stringify(data ?? '');
-        const id = `dsh-${seq}`;
-        items.push({
-          external_id: id,
-          parent_external_id: prevId,
-          ordinal: ordinal++,
-          role: 'user',
-          kind: 'message',
-          created_at: updatedAt,
-          text,
-          text_len: text.length,
-          is_active_branch: true,
-          is_hidden: false,
-          is_synthetic: false,
-          blocks: [{ idx: 0, type: 'text', text }],
-          ext: {
-            dsh: { seq, agent_preset: agentPreset },
-            ...(unmapped ? { _unmapped: unmapped } : {}),
-          },
-        });
-        prevId = id;
-      } else if (evtType === 'agent/inbox/spliced') {
-        // Spliced context injection (e.g. policy change) -> synthetic system item
-        const text = typeof data === 'string' ? data : JSON.stringify(data ?? '');
-        const id = `dsh-${seq}`;
-        items.push({
-          external_id: id,
-          parent_external_id: prevId,
-          ordinal: ordinal++,
-          role: 'system',
-          kind: 'system_note',
-          created_at: updatedAt,
-          text,
-          text_len: text.length,
-          is_active_branch: true,
-          is_hidden: false,
-          is_synthetic: true,
-          blocks: [{ idx: 0, type: 'text', text }],
-          ext: {
-            dsh: { seq, sandbox_mode: sandboxMode },
-            ...(unmapped ? { _unmapped: unmapped } : {}),
-          },
-        });
-        prevId = id;
-      } else if (evtType === 'assistant/message') {
-        const text = typeof data === 'string' ? data : JSON.stringify(data ?? '');
-        const id = `dsh-${seq}`;
-        items.push({
-          external_id: id,
-          parent_external_id: prevId,
-          ordinal: ordinal++,
-          role: 'assistant',
-          kind: 'message',
-          created_at: updatedAt,
-          text,
-          text_len: text.length,
-          is_active_branch: true,
-          is_hidden: false,
-          is_synthetic: false,
-          blocks: [{ idx: 0, type: 'text', text }],
-          ext: {
-            dsh: { seq },
-            ...(unmapped ? { _unmapped: unmapped } : {}),
-          },
-        });
-        prevId = id;
-      } else if (evtType === 'tool/call') {
-        const id = `dsh-${seq}`;
-        const inputStr = typeof data === 'string' ? data : JSON.stringify(data ?? {});
-        items.push({
-          external_id: id,
-          parent_external_id: prevId,
-          ordinal: ordinal++,
-          role: 'assistant',
-          kind: 'tool_call',
-          created_at: updatedAt,
-          text: inputStr,
-          text_len: inputStr.length,
-          is_active_branch: true,
-          is_hidden: false,
-          is_synthetic: false,
-          blocks: [{ idx: 0, type: 'tool_use', tool_input: inputStr }],
-          ext: {
-            dsh: { seq },
-            ...(unmapped ? { _unmapped: unmapped } : {}),
-          },
-        });
-        prevId = id;
-      } else if (evtType === 'tool/result') {
-        const id = `dsh-${seq}`;
-        const resStr = typeof data === 'string' ? data : JSON.stringify(data ?? {});
-        items.push({
-          external_id: id,
-          parent_external_id: prevId,
-          ordinal: ordinal++,
-          role: 'tool',
-          kind: 'tool_result',
-          created_at: updatedAt,
-          text: resStr,
-          text_len: resStr.length,
-          is_active_branch: true,
-          is_hidden: false,
-          is_synthetic: false,
-          blocks: [{ idx: 0, type: 'tool_result', text: resStr }],
-          ext: {
-            dsh: { seq },
-            ...(unmapped ? { _unmapped: unmapped } : {}),
-          },
-        });
-        prevId = id;
-      } else if (evtType.startsWith('compaction/')) {
-        const id = `dsh-${seq}`;
-        const summary = typeof data === 'string' ? data : JSON.stringify(data ?? '');
-        items.push({
-          external_id: id,
-          parent_external_id: prevId,
-          ordinal: ordinal++,
-          role: 'system',
-          kind: 'compaction',
-          created_at: updatedAt,
-          text: summary,
-          text_len: summary.length,
-          is_active_branch: true,
-          is_hidden: false,
-          is_synthetic: true,
-          blocks: [{ idx: 0, type: 'text', text: summary }],
-          ext: {
-            dsh: { seq },
-          },
-        });
-        prevId = id;
+      } else if (evtType === 'permission/preset' && typeof data === 'string') {
+        permissionPreset = data;
+      } else if (evtType === 'sandbox/mode' && typeof data === 'string') {
+        sandboxMode = data;
       }
+
+      events.push(record);
     }
 
-    if (!sessionId && items.length === 0) return [];
+    if (!sessionId && events.length === 0) return [];
 
-    return [
-      {
-        provider: this.id,
-        external_id: sessionId ?? path.basename(filePath),
-        title,
-        title_source: title ? 'provider' : null,
-        cwd,
-        created_at: createdAt,
-        updated_at: updatedAt,
-        items,
-        ext: {
-          dsh: {
-            agent_preset: agentPreset,
-            delegation_depth: delegationDepth,
-            permission_preset: permissionPreset,
-            sandbox_mode: sandboxMode,
-          },
-        },
-      },
-    ];
+    const nativeSession: DshNativeSession = {
+      session_id: sessionId ?? path.basename(filePath),
+      source_file: filePath,
+      title,
+      cwd,
+      agent_preset: agentPreset,
+      delegation_depth: delegationDepth,
+      permission_preset: permissionPreset,
+      sandbox_mode: sandboxMode,
+      events,
+    };
+
+    return [new DshSessionDocument(nativeSession, createdAt, updatedAt, parseIssues)];
   }
 }
 

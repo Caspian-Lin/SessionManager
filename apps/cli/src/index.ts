@@ -9,7 +9,7 @@
  *   sm search <query>
  *   sm verify [--batch <id>]
  *   sm dedupe
- *   sm export --format oca|md|jsonl --out <dir>
+ *   sm export --format native|md|jsonl --out <dir>
  *   sm reindex
  *   sm serve [--port <port>]
  *   sm --help / sm --version
@@ -26,7 +26,7 @@ import {
   computeMinHashFingerprint,
   estimateJaccardSimilarity,
   normalizeText,
-} from '@sm/oca';
+} from '@sm/shared';
 
 const VERSION = '0.1.0';
 
@@ -142,7 +142,7 @@ Commands:
   dedupe                       Identify exact duplicates and high-similarity candidate pairs
                                Options: --db <archive.db>
   export                       Export archive conversations to folder
-                               Options: --format oca|md|jsonl, --out <dir>, --db <archive.db>
+                               Options: --format native|md|jsonl, --out <dir>, --db <archive.db>
   reindex                      Rebuild search index and update conversation statistics
                                Options: --db <archive.db>
   serve                        Start local HTTP API server on 127.0.0.1 with ephemeral token
@@ -241,6 +241,8 @@ function ensureTables(db: DatabaseSync): void {
       starred INTEGER NOT NULL DEFAULT 0,
       archived INTEGER NOT NULL DEFAULT 0,
       deleted_at INTEGER,
+      raw_format TEXT,
+      raw_blob_sha256 TEXT,
       flags_json TEXT
     );
 
@@ -262,22 +264,10 @@ function ensureTables(db: DatabaseSync): void {
       is_hidden INTEGER NOT NULL DEFAULT 0,
       is_synthetic INTEGER NOT NULL DEFAULT 0,
       status TEXT,
+      tool_name TEXT,
+      blocks_json TEXT,
       payload_ref TEXT,
       flags_json TEXT
-    );
-
-    CREATE TABLE IF NOT EXISTS block (
-      id INTEGER PRIMARY KEY,
-      item_id INTEGER NOT NULL REFERENCES item(id) ON DELETE CASCADE,
-      idx INTEGER NOT NULL,
-      type TEXT NOT NULL,
-      text TEXT,
-      lang TEXT,
-      tool_name TEXT,
-      tool_input TEXT,
-      status TEXT,
-      blob_id INTEGER,
-      meta_json TEXT
     );
 
     CREATE TABLE IF NOT EXISTS blob (
@@ -506,8 +496,8 @@ async function runImport(args: ParsedArgs): Promise<void> {
         INSERT INTO conversation (
           provider, external_id, title, title_source, summary, created_at, updated_at,
           item_count, char_count, head_hash, content_hash, fingerprint,
-          first_batch_id, last_batch_id
-        ) VALUES (?, ?, ?, 'first_user', ?, ?, ?, 2, ?, ?, ?, ?, ?, ?)
+          first_batch_id, last_batch_id, raw_format
+        ) VALUES (?, ?, ?, 'first_user', ?, ?, ?, 2, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         provider,
         convExternalId,
@@ -520,31 +510,44 @@ async function runImport(args: ParsedArgs): Promise<void> {
         merkleRoot,
         minHashFp,
         batchId,
-        batchId
+        batchId,
+        provider
       );
 
       const convId = Number(convRes.lastInsertRowid);
 
-      // Insert Items
-      const i1Res = db.prepare(`
-        INSERT INTO item (conversation_id, external_id, ordinal, depth, role, kind, created_at, text, text_len, content_hash, is_active_branch)
-        VALUES (?, ?, 0, 0, 'user', 'message', ?, ?, ?, ?, 1)
-      `).run(convId, `${convExternalId}-m0`, now, userText, userText.length, item1Hash);
-      const i1Id = Number(i1Res.lastInsertRowid);
+      // Insert Items (native view blocks stored inline in blocks_json)
+      db.prepare(`
+        INSERT INTO item (
+          conversation_id, external_id, ordinal, depth, role, kind, created_at,
+          text, text_len, content_hash, is_active_branch, blocks_json
+        )
+        VALUES (?, ?, 0, 0, 'user', 'message', ?, ?, ?, ?, 1, ?)
+      `).run(
+        convId,
+        `${convExternalId}-m0`,
+        now,
+        userText,
+        userText.length,
+        item1Hash,
+        JSON.stringify([{ idx: 0, type: 'text', text: userText }])
+      );
 
       db.prepare(`
-        INSERT INTO block (item_id, idx, type, text) VALUES (?, 0, 'text', ?)
-      `).run(i1Id, userText);
-
-      const i2Res = db.prepare(`
-        INSERT INTO item (conversation_id, external_id, ordinal, depth, role, kind, created_at, text, text_len, content_hash, is_active_branch)
-        VALUES (?, ?, 1, 1, 'assistant', 'message', ?, ?, ?, ?, 1)
-      `).run(convId, `${convExternalId}-m1`, now + 1000, asstText, asstText.length, item2Hash);
-      const i2Id = Number(i2Res.lastInsertRowid);
-
-      db.prepare(`
-        INSERT INTO block (item_id, idx, type, text) VALUES (?, 0, 'text', ?)
-      `).run(i2Id, asstText);
+        INSERT INTO item (
+          conversation_id, external_id, ordinal, depth, role, kind, created_at,
+          text, text_len, content_hash, is_active_branch, blocks_json
+        )
+        VALUES (?, ?, 1, 1, 'assistant', 'message', ?, ?, ?, ?, 1, ?)
+      `).run(
+        convId,
+        `${convExternalId}-m1`,
+        now + 1000,
+        asstText,
+        asstText.length,
+        item2Hash,
+        JSON.stringify([{ idx: 0, type: 'text', text: asstText }])
+      );
 
       importedConvs++;
       importedItems += 2;
@@ -845,11 +848,11 @@ async function runDedupe(args: ParsedArgs): Promise<void> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 7. Subcommand: sm export --format oca|md|jsonl --out <dir>
+// 7. Subcommand: sm export --format native|md|jsonl --out <dir>
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function runExport(args: ParsedArgs): Promise<void> {
-  const format = (args.flags['format'] as string) ?? 'oca';
+  const format = (args.flags['format'] as string) ?? 'native';
   const outDir = args.flags['out'] as string;
 
   if (!outDir) {
@@ -901,8 +904,8 @@ async function runExport(args: ParsedArgs): Promise<void> {
     }
     console.log(`✔ Exported ${convs.length} Markdown files to ${resolvedOut}`);
   } else {
-    // Default OCA JSON format
-    const ocaExportPath = path.join(resolvedOut, 'oca-conversations.json');
+    // Default Native Archive JSON format (per-provider slice + manifest)
+    const sessionsExportPath = path.join(resolvedOut, 'sessions.json');
     const fullConvs = [];
     for (const c of convs) {
       const items = db.prepare(`SELECT * FROM item WHERE conversation_id = ? ORDER BY ordinal`).all(c.id);
@@ -910,17 +913,18 @@ async function runExport(args: ParsedArgs): Promise<void> {
     }
 
     const manifest = {
-      oca_version: '1.0.0',
+      format: 'sm-native-archive',
+      schema_version: '1.0.0',
       exported_at: Date.now(),
       generator: `sm-cli/${VERSION}`,
       conversation_count: convs.length,
-      conversations_file: 'oca-conversations.json',
+      sessions_file: 'sessions.json',
       blobs_dir: 'blobs',
     };
 
-    fs.writeFileSync(ocaExportPath, JSON.stringify(fullConvs, null, 2), 'utf8');
-    fs.writeFileSync(path.join(resolvedOut, 'oca-manifest.json'), JSON.stringify(manifest, null, 2), 'utf8');
-    console.log(`✔ Exported OCA archive with manifest to ${resolvedOut}`);
+    fs.writeFileSync(sessionsExportPath, JSON.stringify(fullConvs, null, 2), 'utf8');
+    fs.writeFileSync(path.join(resolvedOut, 'native-manifest.json'), JSON.stringify(manifest, null, 2), 'utf8');
+    console.log(`✔ Exported native archive with manifest to ${resolvedOut}`);
   }
 }
 

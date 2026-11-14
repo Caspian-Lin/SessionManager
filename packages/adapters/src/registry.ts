@@ -1,4 +1,4 @@
-import type { OcaProviderId } from '@sm/oca';
+import type { ProviderId } from '@sm/shared';
 import { anthropicWebAdapter } from './anthropic-web/index.js';
 import { claudeCodeLocalAdapter } from './claude-code-local/index.js';
 import { codexLocalAdapter } from './codex-local/index.js';
@@ -9,7 +9,7 @@ import { genericJsonAdapter, genericMdAdapter } from './generic/index.js';
 import { openaiWebAdapter } from './openai-web/index.js';
 
 export class AdapterRegistry {
-  private readonly adapters = new Map<OcaProviderId, Adapter>();
+  private readonly adapters = new Map<ProviderId, Adapter>();
 
   constructor(registerDefaults = true) {
     if (registerDefaults) {
@@ -28,7 +28,7 @@ export class AdapterRegistry {
     this.adapters.set(adapter.id, adapter);
   }
 
-  get(id: OcaProviderId): Adapter | undefined {
+  get(id: ProviderId): Adapter | undefined {
     return this.adapters.get(id);
   }
 

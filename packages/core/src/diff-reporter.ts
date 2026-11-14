@@ -1,16 +1,23 @@
-import type { OcaBatchDiffStats, OcaConversation } from '@sm/oca';
+import type { SessionDocument } from '@sm/adapters';
+import type { BatchDiffStats, ConversationViewModel } from '@sm/shared';
 import { estimateConversationSimilarity } from './deduper.js';
 
+export type DiffableSession = SessionDocument | ConversationViewModel;
+
+function asView(input: DiffableSession): ConversationViewModel {
+  return 'toViewModel' in input ? input.toViewModel() : input;
+}
+
 /**
- * Computes delta metrics between an earlier conversation snapshot (`prevConvs`)
- * and a newly ingested snapshot (`nextConvs`). Accurately flags shrunk conversations
- * (messages deleted upstream), additions, disappearances, and ambiguous candidates.
+ * Computes delta metrics between an earlier same-provider snapshot (`prevSessions`)
+ * and a newly ingested snapshot (`nextSessions`). Flags shrunk sessions (messages deleted upstream),
+ * additions, disappearances, and ambiguous candidates.
  */
 export function buildBatchDiffStats(
-  prevConvs: readonly OcaConversation[],
-  nextConvs: readonly OcaConversation[],
+  prevSessions: readonly DiffableSession[],
+  nextSessions: readonly DiffableSession[],
   previousBatchId?: number | null
-): OcaBatchDiffStats {
+): BatchDiffStats {
   let added = 0;
   let grown = 0;
   let shrunk = 0;
@@ -19,32 +26,34 @@ export function buildBatchDiffStats(
   let identical = 0;
   let ambiguous = 0;
 
-  // Build indexes for fast alignment
-  const prevByExtId = new Map<string, OcaConversation>();
-  const prevByContentHash = new Map<string, OcaConversation>();
-  const prevByHeadHash = new Map<string, OcaConversation[]>();
+  const prevViews = prevSessions.map(asView);
+  const nextViews = nextSessions.map(asView);
 
-  for (const prev of prevConvs) {
-    if (prev.external_id) {
-      prevByExtId.set(`${prev.provider}:${prev.external_id}`, prev);
+  const prevByExtId = new Map<string, ConversationViewModel>();
+  const prevByContentHash = new Map<string, ConversationViewModel>();
+  const prevByHeadHash = new Map<string, ConversationViewModel[]>();
+
+  for (const prev of prevViews) {
+    if (prev.meta.external_id) {
+      prevByExtId.set(`${prev.meta.provider}:${prev.meta.external_id}`, prev);
     }
-    prevByContentHash.set(prev.content_hash, prev);
-    if (prev.head_hash) {
-      const list = prevByHeadHash.get(prev.head_hash) ?? [];
+    prevByContentHash.set(`${prev.meta.provider}:${prev.meta.content_hash}`, prev);
+    if (prev.meta.head_hash) {
+      const key = `${prev.meta.provider}:${prev.meta.head_hash}`;
+      const list = prevByHeadHash.get(key) ?? [];
       list.push(prev);
-      prevByHeadHash.set(prev.head_hash, list);
+      prevByHeadHash.set(key, list);
     }
   }
 
   const matchedPrevKeys = new Set<string>();
 
-  for (const next of nextConvs) {
-    let matchedPrev: OcaConversation | null = null;
+  for (const next of nextViews) {
+    let matchedPrev: ConversationViewModel | null = null;
     let matchKey: string | null = null;
 
-    // 1. Try external_id alignment
-    if (next.external_id) {
-      const key = `${next.provider}:${next.external_id}`;
+    if (next.meta.external_id) {
+      const key = `${next.meta.provider}:${next.meta.external_id}`;
       const found = prevByExtId.get(key);
       if (found) {
         matchedPrev = found;
@@ -52,28 +61,26 @@ export function buildBatchDiffStats(
       }
     }
 
-    // 2. Try exact content_hash alignment
     if (!matchedPrev) {
-      const found = prevByContentHash.get(next.content_hash);
+      const found = prevByContentHash.get(`${next.meta.provider}:${next.meta.content_hash}`);
       if (found) {
         matchedPrev = found;
-        matchKey = found.external_id
-          ? `${found.provider}:${found.external_id}`
-          : found.content_hash;
+        matchKey = found.meta.external_id
+          ? `${found.meta.provider}:${found.meta.external_id}`
+          : `${found.meta.provider}:${found.meta.content_hash}`;
       }
     }
 
-    // 3. Try head_hash match + MinHash similarity
-    if (!matchedPrev && next.head_hash) {
-      const candidates = prevByHeadHash.get(next.head_hash);
+    if (!matchedPrev && next.meta.head_hash) {
+      const candidates = prevByHeadHash.get(`${next.meta.provider}:${next.meta.head_hash}`);
       if (candidates && candidates.length > 0) {
         for (const cand of candidates) {
           const sim = estimateConversationSimilarity(next, cand);
           if (sim >= 0.75) {
             matchedPrev = cand;
-            matchKey = cand.external_id
-              ? `${cand.provider}:${cand.external_id}`
-              : cand.content_hash;
+            matchKey = cand.meta.external_id
+              ? `${cand.meta.provider}:${cand.meta.external_id}`
+              : `${cand.meta.provider}:${cand.meta.content_hash}`;
             break;
           }
         }
@@ -85,24 +92,24 @@ export function buildBatchDiffStats(
     } else {
       if (matchKey) matchedPrevKeys.add(matchKey);
 
-      if (next.content_hash === matchedPrev.content_hash) {
+      if (next.meta.content_hash === matchedPrev.meta.content_hash) {
         identical++;
-      } else if (next.items.length > matchedPrev.items.length) {
+      } else if (next.nodes.length > matchedPrev.nodes.length) {
         grown++;
-      } else if (next.items.length < matchedPrev.items.length) {
+      } else if (next.nodes.length < matchedPrev.nodes.length) {
         shrunk++;
-        const reportedId = matchedPrev.external_id ?? matchedPrev.content_hash;
+        const reportedId = matchedPrev.meta.external_id ?? matchedPrev.meta.content_hash;
         shrunkIds.push(reportedId);
       } else {
-        // Equal item count but differing content hash
         ambiguous++;
       }
     }
   }
 
-  // Count disappeared conversations
-  for (const prev of prevConvs) {
-    const key = prev.external_id ? `${prev.provider}:${prev.external_id}` : prev.content_hash;
+  for (const prev of prevViews) {
+    const key = prev.meta.external_id
+      ? `${prev.meta.provider}:${prev.meta.external_id}`
+      : `${prev.meta.provider}:${prev.meta.content_hash}`;
     if (!matchedPrevKeys.has(key)) {
       disappeared++;
     }
