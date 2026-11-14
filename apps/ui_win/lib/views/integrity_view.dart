@@ -3,6 +3,7 @@ import 'package:intl/intl.dart';
 
 import '../data/archive_direct_store.dart';
 import '../data/sm_cli_runner.dart';
+import '../l10n/app_strings.dart';
 import '../models.dart';
 import '../theme.dart';
 
@@ -114,11 +115,13 @@ class _IntegrityReportViewState extends State<IntegrityReportView> {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      const Text('Archive Integrity, Diff & Dedupe Report',
-                          style: TextStyle(fontSize: 18, fontWeight: FontWeight.w600)),
+                      Text(
+                        AppStringsScope.of(context).integrityTitle,
+                        style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w600),
+                      ),
                       const SizedBox(height: 2),
                       Text(
-                        'SQLite WAL Read-Only (${widget.store.dbPath}) · On-demand CLI runner',
+                        '${AppStringsScope.of(context).integritySubtitle} (${widget.store.dbPath})',
                         style: TextStyle(color: cs.onSurfaceVariant, fontSize: 12),
                       ),
                     ],
@@ -126,34 +129,34 @@ class _IntegrityReportViewState extends State<IntegrityReportView> {
                 ),
                 OutlinedButton.icon(
                   onPressed: _runningCli ? null : () => _runCliAction('sm verify', widget.cliRunner.verify),
-                  icon: const Icon(Icons.verified_outlined, size: 15),
-                  label: const Text('Verify'),
+                  icon: const Icon(Icons.verified_outlined, size: 16),
+                  label: Text(AppStringsScope.of(context).runVerify),
                 ),
-                const SizedBox(width: 6),
+                const SizedBox(width: 8),
                 OutlinedButton.icon(
                   onPressed: _runningCli ? null : () => _runCliAction('sm dedupe', widget.cliRunner.dedupe),
-                  icon: const Icon(Icons.compare_arrows, size: 15),
-                  label: const Text('Dedupe'),
+                  icon: const Icon(Icons.compare_arrows, size: 16),
+                  label: Text(AppStringsScope.of(context).isZh ? '执行查重' : 'Dedupe'),
                 ),
-                const SizedBox(width: 6),
-                OutlinedButton.icon(
+                const SizedBox(width: 8),
+                FilledButton.tonalIcon(
                   onPressed: _runningCli ? null : () => _runCliAction('sm reindex', widget.cliRunner.reindex),
-                  icon: const Icon(Icons.manage_search, size: 15),
-                  label: const Text('Reindex'),
+                  icon: const Icon(Icons.manage_search, size: 16),
+                  label: Text(AppStringsScope.of(context).runReindex),
                 ),
               ],
             ),
             if (_cliStatusMessage != null) ...[
-              const SizedBox(height: 10),
+              const SizedBox(height: 12),
               Container(
                 width: double.infinity,
-                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
                 decoration: BoxDecoration(
-                  color: cs.surface,
-                  borderRadius: BorderRadius.circular(6),
-                  border: Border.all(color: theme.dividerColor),
+                  color: cs.surfaceContainerLow,
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: cs.outlineVariant.withOpacity(0.45)),
                 ),
-                child: Text(_cliStatusMessage!, style: WinAdaptiveTheme.monoTextStyle(fontSize: 11.5)),
+                child: Text(_cliStatusMessage!, style: GoogleMaterialTheme.monoTextStyle(fontSize: 11.5)),
               ),
             ],
             const SizedBox(height: 16),
@@ -178,16 +181,16 @@ class _IntegrityReportViewState extends State<IntegrityReportView> {
                         const SizedBox(width: 10),
                         Expanded(
                           child: Text(
-                            'SHRINK ALERT: $totalShrunk Conversation(s) Lost Items Upstream',
+                            AppStringsScope.of(context).shrunkAlertTitle(totalShrunk),
                             style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13.5),
                           ),
                         ),
                       ],
                     ),
                     const SizedBox(height: 6),
-                    const Text(
-                      'Later snapshots had fewer items than earlier imports. Click an ID below to inspect:',
-                      style: TextStyle(fontSize: 12),
+                    Text(
+                      AppStringsScope.of(context).shrunkAlertDesc,
+                      style: const TextStyle(fontSize: 12),
                     ),
                     if (allShrunkIds.isNotEmpty) ...[
                       const SizedBox(height: 8),
@@ -197,7 +200,7 @@ class _IntegrityReportViewState extends State<IntegrityReportView> {
                         children: allShrunkIds
                             .map((id) => ActionChip(
                                   avatar: const Icon(Icons.open_in_new, size: 13),
-                                  label: Text(id, style: WinAdaptiveTheme.monoTextStyle(fontSize: 11)),
+                                  label: Text(id, style: GoogleMaterialTheme.monoTextStyle(fontSize: 11)),
                                   onPressed: () => _jumpToShrunkId(id),
                                 ))
                             .toList(),
@@ -210,19 +213,24 @@ class _IntegrityReportViewState extends State<IntegrityReportView> {
             // Overview metrics
             Row(
               children: [
-                _MetricCard(label: 'Import Batches', value: '${_batches.length}', icon: Icons.layers, color: cs.primary),
-                const SizedBox(width: 12),
                 _MetricCard(
-                  label: 'Shrunk Sessions',
-                  value: '$totalShrunk',
-                  icon: Icons.compress,
-                  color: totalShrunk > 0 ? const Color(0xFFD97706) : const Color(0xFF10B981),
+                  label: AppStringsScope.of(context).metricBatches,
+                  value: '${_batches.length}',
+                  icon: Icons.layers_outlined,
+                  color: cs.primary,
                 ),
                 const SizedBox(width: 12),
                 _MetricCard(
-                  label: 'Dedupe Candidates',
+                  label: AppStringsScope.of(context).metricShrunk,
+                  value: '$totalShrunk',
+                  icon: Icons.compress,
+                  color: totalShrunk > 0 ? const Color(0xFFD97706) : const Color(0xFF1E8E3E),
+                ),
+                const SizedBox(width: 12),
+                _MetricCard(
+                  label: AppStringsScope.of(context).metricCandidates,
                   value: '${_candidates.length}',
-                  icon: Icons.compare,
+                  icon: Icons.compare_arrows,
                   color: const Color(0xFF7C3AED),
                 ),
               ],
@@ -230,13 +238,15 @@ class _IntegrityReportViewState extends State<IntegrityReportView> {
             const SizedBox(height: 20),
 
             // Side-by-Side Dedupe Candidate Comparison
-            const Text('Candidate Dedupe Double-Column Comparison',
-                style: TextStyle(fontSize: 15, fontWeight: FontWeight.w600)),
+            Text(
+              AppStringsScope.of(context).dedupePairsTitle,
+              style: const TextStyle(fontSize: 15.5, fontWeight: FontWeight.w600),
+            ),
             const SizedBox(height: 8),
             if (_candidates.isEmpty)
               Padding(
                 padding: const EdgeInsets.only(bottom: 16),
-                child: Text('No candidate duplicate pairs found.', style: TextStyle(color: cs.onSurfaceVariant)),
+                child: Text(AppStringsScope.of(context).noDedupePairs, style: TextStyle(color: cs.onSurfaceVariant)),
               )
             else
               for (final pair in _candidates)
@@ -246,7 +256,10 @@ class _IntegrityReportViewState extends State<IntegrityReportView> {
                 ),
 
             const SizedBox(height: 16),
-            const Text('Import Batch Ledger', style: TextStyle(fontSize: 15, fontWeight: FontWeight.w600)),
+            Text(
+              AppStringsScope.of(context).batchLedgerTitle,
+              style: const TextStyle(fontSize: 15.5, fontWeight: FontWeight.w600),
+            ),
             const SizedBox(height: 8),
             for (final b in _batches)
               Card(
@@ -329,7 +342,7 @@ class DedupeDoubleColumnComparison extends StatelessWidget {
                   ),
                 ),
                 const SizedBox(width: 8),
-                Text(pair.reason, style: WinAdaptiveTheme.monoTextStyle(fontSize: 11, color: cs.onSurfaceVariant)),
+                Text(pair.reason, style: GoogleMaterialTheme.monoTextStyle(fontSize: 11, color: cs.onSurfaceVariant)),
                 const Spacer(),
                 Text('status: ${pair.status}', style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant)),
               ],
@@ -398,22 +411,22 @@ class _CandidateColumn extends StatelessWidget {
         : (headHash!.length > 10 ? headHash!.substring(0, 10) : headHash!);
 
     return Container(
-      padding: const EdgeInsets.all(10),
+      padding: const EdgeInsets.all(12),
       decoration: BoxDecoration(
-        color: cs.surface,
-        borderRadius: BorderRadius.circular(5),
-        border: Border.all(color: theme.dividerColor),
+        color: cs.surfaceContainerLowest,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: cs.outlineVariant.withOpacity(0.45)),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Row(
             children: [
-              Text(sideLabel, style: TextStyle(fontSize: 11, fontWeight: FontWeight.w600, color: cs.primary)),
+              Text(sideLabel, style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w600, color: cs.primary)),
               const Spacer(),
               TextButton(
                 onPressed: onOpen,
-                child: const Text('Inspect', style: TextStyle(fontSize: 11)),
+                child: Text(AppStringsScope.of(context).openInReader, style: const TextStyle(fontSize: 11.5)),
               ),
             ],
           ),
@@ -421,7 +434,7 @@ class _CandidateColumn extends StatelessWidget {
           const SizedBox(height: 3),
           Text(
             '$provider · $itemCount items · hash:$hashPrefix',
-            style: WinAdaptiveTheme.monoTextStyle(fontSize: 10.5, color: cs.onSurfaceVariant),
+            style: GoogleMaterialTheme.monoTextStyle(fontSize: 10.5, color: cs.onSurfaceVariant),
           ),
           if (previewTurns.isNotEmpty) ...[
             const SizedBox(height: 6),

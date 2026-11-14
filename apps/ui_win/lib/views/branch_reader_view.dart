@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../data/archive_direct_store.dart';
+import '../l10n/app_strings.dart';
 import '../models.dart';
 import '../theme.dart';
 
@@ -171,18 +172,19 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final cs = theme.colorScheme;
+    final s = AppStringsScope.of(context);
 
     if (widget.conversationId == null) {
       return Center(
         child: Text(
-          'Select a conversation from the Session List to inspect branches.',
+          s.selectSessionHint,
           style: TextStyle(color: cs.onSurfaceVariant),
         ),
       );
     }
 
     if (_loading) return const Center(child: CircularProgressIndicator());
-    if (_detail == null) return const Center(child: Text('Conversation not found.'));
+    if (_detail == null) return Center(child: Text(s.conversationNotFound));
 
     final detail = _detail!;
     final hh = detail.headHash;
@@ -222,14 +224,17 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
                     ),
                   ),
                   FilterChip(
-                    label: Text(_activeBranchOnly ? 'Active Branch' : 'All Branches', style: const TextStyle(fontSize: 11)),
+                    label: Text(
+                      _activeBranchOnly ? s.activeBranchOnly : (s.isZh ? '全部分支' : 'All Branches'),
+                      style: const TextStyle(fontSize: 11.5),
+                    ),
                     selected: _activeBranchOnly,
                     visualDensity: VisualDensity.compact,
                     onSelected: (val) => setState(() => _activeBranchOnly = val),
                   ),
                   const SizedBox(width: 6),
                   FilterChip(
-                    label: const Text('Fold Synthetic', style: TextStyle(fontSize: 11)),
+                    label: Text(s.foldSyntheticLogs, style: const TextStyle(fontSize: 11.5)),
                     selected: _foldSynthetic,
                     visualDensity: VisualDensity.compact,
                     onSelected: (val) => setState(() => _foldSynthetic = val),
@@ -335,7 +340,7 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
                   Icon(expanded ? Icons.expand_less : Icons.expand_more, size: 16, color: cs.onSurfaceVariant),
                   const SizedBox(width: 6),
                   Text(
-                    '${run.length} synthetic orchestration item(s) collapsed',
+                    AppStringsScope.of(context).syntheticCollapsedBanner(run.length),
                     style: TextStyle(fontSize: 11.5, color: cs.onSurfaceVariant, fontWeight: FontWeight.w500),
                   ),
                 ],
@@ -423,39 +428,39 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
                       if (item.toolName != null) ...[
                         const SizedBox(width: 8),
                         Container(
-                          padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+                          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
                           decoration: BoxDecoration(
-                            color: cs.secondary.withOpacity(0.14),
-                            borderRadius: BorderRadius.circular(4),
+                            color: cs.secondaryContainer,
+                            borderRadius: BorderRadius.circular(6),
                           ),
                           child: Text(
                             item.toolName!,
-                            style: WinAdaptiveTheme.monoTextStyle(fontSize: 10.5, color: cs.secondary),
+                            style: GoogleMaterialTheme.monoTextStyle(fontSize: 10.5, color: cs.onSecondaryContainer),
                           ),
                         ),
                       ],
                       if (item.isSynthetic) ...[
                         const SizedBox(width: 8),
                         Container(
-                          padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+                          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
                           decoration: BoxDecoration(
-                            color: Colors.grey.withOpacity(0.18),
-                            borderRadius: BorderRadius.circular(4),
+                            color: cs.surfaceContainerHighest,
+                            borderRadius: BorderRadius.circular(6),
                           ),
-                          child: const Text('synthetic', style: TextStyle(fontSize: 10)),
+                          child: Text(AppStringsScope.of(context).syntheticBadge, style: const TextStyle(fontSize: 10)),
                         ),
                       ],
                       if (item.supersededBy != null) ...[
                         const SizedBox(width: 8),
                         Container(
-                          padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+                          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
                           decoration: BoxDecoration(
                             color: Colors.amber.withOpacity(0.18),
-                            borderRadius: BorderRadius.circular(4),
+                            borderRadius: BorderRadius.circular(6),
                           ),
                           child: Text(
-                            'superseded (${item.supersededBy})',
-                            style: const TextStyle(fontSize: 10, color: Color(0xFFD97706)),
+                            '${AppStringsScope.of(context).supersededBadge} (${item.supersededBy})',
+                            style: const TextStyle(fontSize: 10, color: Color(0xFFB45309)),
                           ),
                         ),
                       ],
@@ -473,12 +478,15 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
                         )
                       else if (!item.isActiveBranch)
                         Container(
-                          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+                          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
                           decoration: BoxDecoration(
                             color: Colors.amber.withOpacity(0.18),
-                            borderRadius: BorderRadius.circular(4),
+                            borderRadius: BorderRadius.circular(6),
                           ),
-                          child: const Text('alt branch', style: TextStyle(fontSize: 10, color: Color(0xFFD97706))),
+                          child: Text(
+                            AppStringsScope.of(context).altBranchBadge,
+                            style: const TextStyle(fontSize: 10, color: Color(0xFFB45309)),
+                          ),
                         ),
                     ],
                   ),
@@ -520,14 +528,14 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
           ),
           child: ExpansionTile(
             dense: true,
-            tilePadding: const EdgeInsets.symmetric(horizontal: 10),
+            tilePadding: const EdgeInsets.symmetric(horizontal: 12),
             title: Text(
-              'Reasoning / Thinking',
+              AppStringsScope.of(context).thinkingProcess,
               style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: cs.onSurfaceVariant),
             ),
             children: [
               Padding(
-                padding: const EdgeInsets.fromLTRB(10, 0, 10, 10),
+                padding: const EdgeInsets.fromLTRB(12, 0, 12, 10),
                 child: SelectableText(
                   block.text ?? '',
                   style: TextStyle(fontSize: 12.5, color: cs.onSurfaceVariant),
@@ -553,24 +561,24 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
         return Container(
           margin: const EdgeInsets.only(bottom: 8),
           decoration: BoxDecoration(
-            color: cs.surface,
-            borderRadius: BorderRadius.circular(4),
-            border: Border.all(color: theme.dividerColor),
+            color: cs.surfaceContainerLowest,
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(color: cs.outlineVariant.withOpacity(0.45)),
           ),
           child: ExpansionTile(
             dense: true,
-            tilePadding: const EdgeInsets.symmetric(horizontal: 10),
+            tilePadding: const EdgeInsets.symmetric(horizontal: 12),
             title: Text(
               title,
-              style: WinAdaptiveTheme.monoTextStyle(fontSize: 11.5, fontWeight: FontWeight.w600, color: cs.primary),
+              style: GoogleMaterialTheme.monoTextStyle(fontSize: 11.5, fontWeight: FontWeight.w600, color: cs.primary),
             ),
             children: [
               if (bodyText.isNotEmpty)
                 Padding(
-                  padding: const EdgeInsets.fromLTRB(10, 0, 10, 10),
+                  padding: const EdgeInsets.fromLTRB(12, 0, 12, 10),
                   child: SelectableText(
                     bodyText,
-                    style: WinAdaptiveTheme.monoTextStyle(fontSize: 11.5, color: cs.onSurface),
+                    style: GoogleMaterialTheme.monoTextStyle(fontSize: 11.5, color: cs.onSurface),
                   ),
                 ),
             ],
@@ -582,11 +590,11 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
         final File? imgFile = sha != null ? widget.store.resolveBlobFile(sha) : null;
         return Container(
           margin: const EdgeInsets.only(bottom: 8),
-          padding: const EdgeInsets.all(8),
+          padding: const EdgeInsets.all(10),
           decoration: BoxDecoration(
-            color: cs.surface,
-            borderRadius: BorderRadius.circular(4),
-            border: Border.all(color: theme.dividerColor),
+            color: cs.surfaceContainerLowest,
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(color: cs.outlineVariant.withOpacity(0.45)),
           ),
           child: imgFile != null && imgFile.existsSync()
               ? Column(
@@ -596,10 +604,10 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
                       constraints: const BoxConstraints(maxHeight: 280),
                       child: Image.file(imgFile, fit: BoxFit.contain),
                     ),
-                    const SizedBox(height: 4),
+                    const SizedBox(height: 6),
                     Text(
                       imgFile.path,
-                      style: WinAdaptiveTheme.monoTextStyle(fontSize: 10, color: cs.onSurfaceVariant),
+                      style: GoogleMaterialTheme.monoTextStyle(fontSize: 10, color: cs.onSurfaceVariant),
                     ),
                   ],
                 )
@@ -609,7 +617,7 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
                     const SizedBox(width: 8),
                     Expanded(
                       child: Text(
-                        'Image asset (${sha ?? 'missing sha256'}, ${block.availability ?? 'missing_ref'})',
+                        '${AppStringsScope.of(context).mediaFileMissing} (${sha ?? 'missing sha256'}, ${block.availability ?? 'missing_ref'})',
                         style: TextStyle(fontSize: 11.5, color: cs.onSurfaceVariant),
                       ),
                     ),
@@ -624,11 +632,11 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
       case 'raw_ref':
         return Container(
           margin: const EdgeInsets.only(bottom: 8),
-          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
           decoration: BoxDecoration(
-            color: cs.surface,
-            borderRadius: BorderRadius.circular(4),
-            border: Border.all(color: theme.dividerColor),
+            color: cs.surfaceContainerLowest,
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(color: cs.outlineVariant.withOpacity(0.45)),
           ),
           child: Row(
             children: [
@@ -637,7 +645,7 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
               Expanded(
                 child: Text(
                   '${block.type.toUpperCase()}: ${block.text ?? block.blobSha256 ?? 'attachment'}',
-                  style: WinAdaptiveTheme.monoTextStyle(fontSize: 11, color: cs.onSurfaceVariant),
+                  style: GoogleMaterialTheme.monoTextStyle(fontSize: 11, color: cs.onSurfaceVariant),
                 ),
               ),
             ],
@@ -658,7 +666,7 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
       return OutlinedButton.icon(
         onPressed: () => _loadPayload(payloadRef),
         icon: const Icon(Icons.download_outlined, size: 14),
-        label: Text('Load full payload from blob ($payloadRef)', style: const TextStyle(fontSize: 11)),
+        label: Text('${AppStringsScope.of(context).loadFullPayload} ($payloadRef)', style: const TextStyle(fontSize: 11.5)),
       );
     }
     return _CodeBlockWidget(code: loaded, lang: 'spilled payload ($payloadRef)');
@@ -711,13 +719,13 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
           margin: const EdgeInsets.symmetric(vertical: 6),
           padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
           decoration: BoxDecoration(
-            color: cs.surface,
-            borderRadius: BorderRadius.circular(4),
-            border: Border.all(color: Theme.of(context).dividerColor),
+            color: cs.surfaceContainerLowest,
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(color: cs.outlineVariant.withOpacity(0.45)),
           ),
           child: SelectableText(
             m.group(1)!.trim(),
-            style: WinAdaptiveTheme.monoTextStyle(fontSize: 12.5, color: cs.primary),
+            style: GoogleMaterialTheme.monoTextStyle(fontSize: 12.5, color: cs.primary),
           ),
         ),
       );
@@ -760,8 +768,8 @@ class _BranchSelectorPill extends StatelessWidget {
             child: Icon(Icons.chevron_left, size: 15, color: onPrev != null ? cs.primary : cs.onSurfaceVariant),
           ),
           Text(
-            'Branch ${branchIndex + 1} / $branchCount',
-            style: TextStyle(fontSize: 10.5, fontWeight: FontWeight.w600, color: cs.primary),
+            AppStringsScope.of(context).branchLabel(branchIndex + 1, branchCount),
+            style: TextStyle(fontSize: 11, fontWeight: FontWeight.w600, color: cs.primary),
           ),
           InkWell(
             onTap: onNext,
@@ -787,38 +795,46 @@ class _CodeBlockWidget extends StatelessWidget {
       width: double.infinity,
       margin: const EdgeInsets.only(bottom: 8),
       decoration: BoxDecoration(
-        color: cs.surface,
-        borderRadius: BorderRadius.circular(5),
-        border: Border.all(color: theme.dividerColor),
+        color: cs.surfaceContainerLowest,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: cs.outlineVariant.withOpacity(0.45)),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Container(
-            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
             decoration: BoxDecoration(
-              border: Border(bottom: BorderSide(color: theme.dividerColor)),
+              color: cs.surfaceContainerLow,
+              borderRadius: const BorderRadius.vertical(top: Radius.circular(12)),
+              border: Border(bottom: BorderSide(color: cs.outlineVariant.withOpacity(0.35))),
             ),
             child: Row(
               children: [
                 Text(
                   (lang == null || lang!.isEmpty) ? 'code' : lang!,
-                  style: WinAdaptiveTheme.monoTextStyle(fontSize: 10.5, color: cs.onSurfaceVariant),
+                  style: GoogleMaterialTheme.monoTextStyle(fontSize: 11, color: cs.onSurfaceVariant),
                 ),
                 const Spacer(),
                 InkWell(
                   onTap: () {
                     Clipboard.setData(ClipboardData(text: code));
                     ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(content: Text('Code copied to clipboard'), duration: Duration(seconds: 1)),
+                      SnackBar(
+                        content: Text(AppStringsScope.of(context).codeCopied),
+                        duration: const Duration(seconds: 1),
+                      ),
                     );
                   },
                   child: Row(
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      Icon(Icons.copy, size: 12, color: cs.onSurfaceVariant),
+                      Icon(Icons.copy, size: 13, color: cs.onSurfaceVariant),
                       const SizedBox(width: 4),
-                      Text('Copy', style: TextStyle(fontSize: 10.5, color: cs.onSurfaceVariant)),
+                      Text(
+                        AppStringsScope.of(context).copyCode,
+                        style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
+                      ),
                     ],
                   ),
                 ),
@@ -826,10 +842,10 @@ class _CodeBlockWidget extends StatelessWidget {
             ),
           ),
           Padding(
-            padding: const EdgeInsets.all(10),
+            padding: const EdgeInsets.all(12),
             child: SelectableText(
               code,
-              style: WinAdaptiveTheme.monoTextStyle(fontSize: 12, color: cs.onSurface),
+              style: GoogleMaterialTheme.monoTextStyle(fontSize: 12, color: cs.onSurface),
             ),
           ),
         ],

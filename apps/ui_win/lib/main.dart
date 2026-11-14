@@ -2,10 +2,13 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import 'data/archive_direct_store.dart';
+import 'data/local_agent_discovery.dart';
 import 'data/sm_cli_runner.dart';
+import 'l10n/app_strings.dart';
 import 'models.dart';
 import 'theme.dart';
 import 'views/branch_reader_view.dart';
+import 'views/import_view.dart';
 import 'views/integrity_view.dart';
 import 'views/search_view.dart';
 import 'views/session_list_view.dart';
@@ -17,11 +20,19 @@ void main() {
 class SessionManagerApp extends StatefulWidget {
   final ArchiveDirectStore? storeOverride;
   final SmCliRunner? cliRunnerOverride;
+  final LocalAgentDiscoveryService? discoveryOverride;
+  final AppLocale initialLocale;
+  final ThemeMode initialThemeMode;
+  final int initialTabIndex;
 
   const SessionManagerApp({
     super.key,
     this.storeOverride,
     this.cliRunnerOverride,
+    this.discoveryOverride,
+    this.initialLocale = AppLocale.zh,
+    this.initialThemeMode = ThemeMode.light,
+    this.initialTabIndex = 0,
   });
 
   @override
@@ -29,46 +40,67 @@ class SessionManagerApp extends StatefulWidget {
 }
 
 class _SessionManagerAppState extends State<SessionManagerApp> {
-  final ValueNotifier<ThemeMode> _themeMode = ValueNotifier<ThemeMode>(ThemeMode.system);
+  late final ValueNotifier<ThemeMode> _themeMode;
+  late final ValueNotifier<AppLocale> _locale;
+
+  @override
+  void initState() {
+    super.initState();
+    _themeMode = ValueNotifier<ThemeMode>(widget.initialThemeMode);
+    _locale = ValueNotifier<AppLocale>(widget.initialLocale);
+  }
 
   @override
   void dispose() {
     _themeMode.dispose();
+    _locale.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    return ValueListenableBuilder<ThemeMode>(
-      valueListenable: _themeMode,
-      builder: (context, mode, _) {
-        return MaterialApp(
-          title: 'Session Manager · Windows Reader',
-          debugShowCheckedModeBanner: false,
-          themeMode: mode,
-          theme: WinAdaptiveTheme.light(),
-          darkTheme: WinAdaptiveTheme.dark(),
-          home: MainShell(
-            themeModeNotifier: _themeMode,
-            storeOverride: widget.storeOverride,
-            cliRunnerOverride: widget.cliRunnerOverride,
-          ),
-        );
-      },
+    return AppStringsScope(
+      notifier: _locale,
+      child: ValueListenableBuilder<ThemeMode>(
+        valueListenable: _themeMode,
+        builder: (context, mode, _) {
+          return MaterialApp(
+            title: 'Session Manager',
+            debugShowCheckedModeBanner: false,
+            themeMode: mode,
+            theme: GoogleMaterialTheme.light(),
+            darkTheme: GoogleMaterialTheme.dark(),
+            home: MainShell(
+              themeModeNotifier: _themeMode,
+              localeNotifier: _locale,
+              storeOverride: widget.storeOverride,
+              cliRunnerOverride: widget.cliRunnerOverride,
+              discoveryOverride: widget.discoveryOverride,
+              initialTabIndex: widget.initialTabIndex,
+            ),
+          );
+        },
+      ),
     );
   }
 }
 
 class MainShell extends StatefulWidget {
   final ValueNotifier<ThemeMode> themeModeNotifier;
+  final ValueNotifier<AppLocale> localeNotifier;
   final ArchiveDirectStore? storeOverride;
   final SmCliRunner? cliRunnerOverride;
+  final LocalAgentDiscoveryService? discoveryOverride;
+  final int initialTabIndex;
 
   const MainShell({
     super.key,
     required this.themeModeNotifier,
+    required this.localeNotifier,
     this.storeOverride,
     this.cliRunnerOverride,
+    this.discoveryOverride,
+    this.initialTabIndex = 0,
   });
 
   @override
@@ -76,9 +108,10 @@ class MainShell extends StatefulWidget {
 }
 
 class _MainShellState extends State<MainShell> {
-  int _selectedIndex = 0;
+  late int _selectedIndex;
   late final ArchiveDirectStore _store;
   late final SmCliRunner _cliRunner;
+  late final LocalAgentDiscoveryService _discovery;
   late final bool _ownsStore;
   final ValueNotifier<int> _refreshTick = ValueNotifier<int>(0);
   final FocusNode _searchFocusNode = FocusNode();
@@ -87,9 +120,11 @@ class _MainShellState extends State<MainShell> {
   @override
   void initState() {
     super.initState();
+    _selectedIndex = widget.initialTabIndex;
     _ownsStore = widget.storeOverride == null;
     _store = widget.storeOverride ?? ArchiveDirectStore();
     _cliRunner = widget.cliRunnerOverride ?? SmCliRunner(store: _store);
+    _discovery = widget.discoveryOverride ?? const LocalAgentDiscoveryService();
   }
 
   @override
@@ -113,7 +148,7 @@ class _MainShellState extends State<MainShell> {
       _selectedConversationId = id;
       final wide = MediaQuery.sizeOf(context).width >= 1100;
       if (!wide || _selectedIndex != 0) {
-        _selectedIndex = 1; // Reader tab on narrow screens or from Search/Integrity
+        _selectedIndex = 2; // Reader tab on narrow screens or when jumping from Search/Integrity
       }
     });
   }
@@ -121,157 +156,15 @@ class _MainShellState extends State<MainShell> {
   void _cycleThemeMode() {
     final current = widget.themeModeNotifier.value;
     widget.themeModeNotifier.value = switch (current) {
-      ThemeMode.system => ThemeMode.light,
       ThemeMode.light => ThemeMode.dark,
       ThemeMode.dark => ThemeMode.system,
+      ThemeMode.system => ThemeMode.light,
     };
-  }
-
-  Future<void> _showArchiveAndImportDialog() async {
-    final dbCtrl = TextEditingController(text: _store.dbPath);
-    final importCtrl = TextEditingController();
-    final exportCtrl = TextEditingController();
-    var kind = 'auto';
-    var exportFormat = 'native';
-
-    await showDialog<void>(
-      context: context,
-      builder: (ctx) {
-        return StatefulBuilder(
-          builder: (ctx, setDialogState) {
-            return AlertDialog(
-              title: const Text('Archive Location & On-Demand CLI Operations'),
-              content: SizedBox(
-                width: 520,
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Text('Archive Database Path (archive.db or folder)', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600)),
-                    const SizedBox(height: 6),
-                    Row(
-                      children: [
-                        Expanded(
-                          child: TextField(
-                            controller: dbCtrl,
-                            decoration: const InputDecoration(hintText: r'C:\Path\To\archive.db'),
-                          ),
-                        ),
-                        const SizedBox(width: 8),
-                        FilledButton(
-                          onPressed: () {
-                            _store.setArchiveLocation(dbCtrl.text);
-                            _triggerReload();
-                            Navigator.of(ctx).pop();
-                          },
-                          child: const Text('Connect'),
-                        ),
-                      ],
-                    ),
-                    const Divider(height: 24),
-                    const Text('Import Conversation Source (sm import --json)', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600)),
-                    const SizedBox(height: 6),
-                    Row(
-                      children: [
-                        Expanded(
-                          child: TextField(
-                            controller: importCtrl,
-                            decoration: const InputDecoration(hintText: r'Path to ZIP export or ~/.codex / ~/.dsh'),
-                          ),
-                        ),
-                        const SizedBox(width: 8),
-                        DropdownButton<String>(
-                          value: kind,
-                          items: const [
-                            DropdownMenuItem(value: 'auto', child: Text('auto')),
-                            DropdownMenuItem(value: 'openai-web', child: Text('openai-web')),
-                            DropdownMenuItem(value: 'codex-local', child: Text('codex-local')),
-                            DropdownMenuItem(value: 'dsh-local', child: Text('dsh-local')),
-                          ],
-                          onChanged: (v) {
-                            if (v != null) setDialogState(() => kind = v);
-                          },
-                        ),
-                        const SizedBox(width: 8),
-                        OutlinedButton(
-                          onPressed: () async {
-                            final src = importCtrl.text.trim();
-                            if (src.isEmpty) return;
-                            Navigator.of(ctx).pop();
-                            final res = await _cliRunner.importSource(src, kind: kind);
-                            _triggerReload();
-                            if (mounted) {
-                              ScaffoldMessenger.of(context).showSnackBar(
-                                SnackBar(content: Text(res.ok ? 'Import finished (${res.summary})' : 'Import failed: ${res.errorMessage}')),
-                              );
-                            }
-                          },
-                          child: const Text('Import'),
-                        ),
-                      ],
-                    ),
-                    const Divider(height: 24),
-                    const Text('Export Archive (sm export --json)', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600)),
-                    const SizedBox(height: 6),
-                    Row(
-                      children: [
-                        Expanded(
-                          child: TextField(
-                            controller: exportCtrl,
-                            decoration: const InputDecoration(hintText: r'Output directory path'),
-                          ),
-                        ),
-                        const SizedBox(width: 8),
-                        DropdownButton<String>(
-                          value: exportFormat,
-                          items: const [
-                            DropdownMenuItem(value: 'native', child: Text('native')),
-                            DropdownMenuItem(value: 'md', child: Text('md')),
-                            DropdownMenuItem(value: 'jsonl', child: Text('jsonl')),
-                          ],
-                          onChanged: (v) {
-                            if (v != null) setDialogState(() => exportFormat = v);
-                          },
-                        ),
-                        const SizedBox(width: 8),
-                        OutlinedButton(
-                          onPressed: () async {
-                            final out = exportCtrl.text.trim();
-                            if (out.isEmpty) return;
-                            Navigator.of(ctx).pop();
-                            final res = await _cliRunner.exportArchive(out, format: exportFormat);
-                            if (mounted) {
-                              ScaffoldMessenger.of(context).showSnackBar(
-                                SnackBar(content: Text(res.ok ? 'Export finished (${res.summary})' : 'Export failed: ${res.errorMessage}')),
-                              );
-                            }
-                          },
-                          child: const Text('Export'),
-                        ),
-                      ],
-                    ),
-                  ],
-                ),
-              ),
-              actions: [
-                TextButton(
-                  onPressed: () => Navigator.of(ctx).pop(),
-                  child: const Text('Close'),
-                ),
-              ],
-            );
-          },
-        );
-      },
-    );
-
-    dbCtrl.dispose();
-    importCtrl.dispose();
-    exportCtrl.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
+    final s = AppStringsScope.of(context);
     final theme = Theme.of(context);
     final cs = theme.colorScheme;
     final isWide = MediaQuery.sizeOf(context).width >= 1100;
@@ -279,10 +172,12 @@ class _MainShellState extends State<MainShell> {
     return CallbackShortcuts(
       bindings: <ShortcutActivator, VoidCallback>{
         const SingleActivator(LogicalKeyboardKey.keyF, control: true): () {
-          setState(() => _selectedIndex = 2);
+          setState(() => _selectedIndex = 3);
           _searchFocusNode.requestFocus();
         },
-        const SingleActivator(LogicalKeyboardKey.keyO, control: true): _showArchiveAndImportDialog,
+        const SingleActivator(LogicalKeyboardKey.keyO, control: true): () {
+          setState(() => _selectedIndex = 1);
+        },
         const SingleActivator(LogicalKeyboardKey.keyR, control: true): _triggerReload,
         const SingleActivator(LogicalKeyboardKey.f5): _triggerReload,
       },
@@ -291,52 +186,63 @@ class _MainShellState extends State<MainShell> {
         child: Scaffold(
           body: Column(
             children: [
-              // Windows 11 Desktop Top Bar (Archive status, Theme toggle, CLI triggers)
+              // Google Material 3 Clean Top App Bar
               Container(
-                height: 44,
-                padding: const EdgeInsets.symmetric(horizontal: 14),
+                height: 56,
+                padding: const EdgeInsets.symmetric(horizontal: 18),
                 decoration: BoxDecoration(
-                  color: cs.surface,
+                  color: cs.surfaceContainerLow,
                   border: Border(bottom: BorderSide(color: theme.dividerColor)),
                 ),
                 child: Row(
                   children: [
-                    Icon(Icons.archive_outlined, size: 18, color: cs.primary),
-                    const SizedBox(width: 8),
-                    const Text('Session Manager', style: TextStyle(fontWeight: FontWeight.w600, fontSize: 13.5)),
+                    Container(
+                      width: 34,
+                      height: 34,
+                      decoration: BoxDecoration(
+                        color: cs.primaryContainer,
+                        borderRadius: BorderRadius.circular(10),
+                      ),
+                      child: Icon(Icons.archive_outlined, size: 19, color: cs.onPrimaryContainer),
+                    ),
+                    const SizedBox(width: 12),
+                    Text(s.appTitle, style: theme.textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w600)),
                     const SizedBox(width: 12),
                     ValueListenableBuilder<bool>(
                       valueListenable: _store.isConnectedNotifier,
                       builder: (context, connected, _) {
-                        final badgeColor = connected ? const Color(0xFF10B981) : const Color(0xFFD97706);
-                        return Container(
-                          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-                          decoration: BoxDecoration(
-                            color: badgeColor.withOpacity(0.14),
-                            borderRadius: BorderRadius.circular(10),
-                          ),
-                          child: Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              Icon(Icons.circle, size: 8, color: badgeColor),
-                              const SizedBox(width: 5),
-                              Text(
-                                connected ? 'SQLite WAL Read-Only' : 'Demo Fallback',
-                                style: TextStyle(fontSize: 11, fontWeight: FontWeight.w600, color: badgeColor),
-                              ),
-                            ],
+                        final badgeColor = connected ? const Color(0xFF137333) : const Color(0xFFB06000);
+                        return Tooltip(
+                          message: _store.dbPath,
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                            decoration: BoxDecoration(
+                              color: badgeColor.withOpacity(0.12),
+                              borderRadius: BorderRadius.circular(20),
+                            ),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Icon(Icons.circle, size: 8, color: badgeColor),
+                                const SizedBox(width: 6),
+                                Text(
+                                  connected ? s.statusDirectConnected : s.statusDemoMode,
+                                  style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: badgeColor),
+                                ),
+                              ],
+                            ),
                           ),
                         );
                       },
                     ),
-                    const SizedBox(width: 10),
+                    const SizedBox(width: 12),
                     Expanded(
                       child: ValueListenableBuilder<String>(
                         valueListenable: _store.dbPathNotifier,
                         builder: (context, path, _) {
                           return Text(
                             path,
-                            style: WinAdaptiveTheme.monoTextStyle(fontSize: 11, color: cs.onSurfaceVariant),
+                            style: GoogleMaterialTheme.monoTextStyle(fontSize: 11.5, color: cs.onSurfaceVariant),
                             overflow: TextOverflow.ellipsis,
                           );
                         },
@@ -347,35 +253,63 @@ class _MainShellState extends State<MainShell> {
                       builder: (context, last, _) {
                         if (last == null) return const SizedBox.shrink();
                         return Padding(
-                          padding: const EdgeInsets.only(right: 8),
-                          child: Text(
-                            'Last CLI: ${last.command} (${last.ok ? last.summary : 'err'})',
-                            style: TextStyle(fontSize: 11, color: last.ok ? cs.onSurfaceVariant : cs.error),
+                          padding: const EdgeInsets.only(right: 12),
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                            decoration: BoxDecoration(
+                              color: last.ok ? cs.surfaceContainerHigh : cs.errorContainer,
+                              borderRadius: BorderRadius.circular(20),
+                            ),
+                            child: Text(
+                              '${last.command}: ${last.ok ? last.summary : 'err'}',
+                              style: TextStyle(
+                                fontSize: 11.5,
+                                color: last.ok ? cs.onSurfaceVariant : cs.onErrorContainer,
+                              ),
+                            ),
                           ),
                         );
                       },
                     ),
-                    TextButton.icon(
-                      onPressed: _showArchiveAndImportDialog,
-                      icon: const Icon(Icons.folder_open, size: 15),
-                      label: const Text('Archive / Import', style: TextStyle(fontSize: 12)),
+                    // Bilingual 中文 / EN Switcher
+                    ValueListenableBuilder<AppLocale>(
+                      valueListenable: widget.localeNotifier,
+                      builder: (context, loc, _) {
+                        return SegmentedButton<AppLocale>(
+                          showSelectedIcon: false,
+                          style: SegmentedButton.styleFrom(
+                            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 0),
+                            visualDensity: VisualDensity.compact,
+                            textStyle: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
+                          ),
+                          segments: const [
+                            ButtonSegment(value: AppLocale.zh, label: Text('中文')),
+                            ButtonSegment(value: AppLocale.en, label: Text('EN')),
+                          ],
+                          selected: {loc},
+                          onSelectionChanged: (val) {
+                            widget.localeNotifier.value = val.first;
+                          },
+                        );
+                      },
                     ),
+                    const SizedBox(width: 8),
                     IconButton(
-                      tooltip: 'Reload SQLite Store (F5 / Ctrl+R)',
-                      icon: const Icon(Icons.refresh, size: 17),
+                      tooltip: s.reloadTooltip,
+                      icon: const Icon(Icons.refresh, size: 20),
                       onPressed: _triggerReload,
                     ),
                     ValueListenableBuilder<ThemeMode>(
                       valueListenable: widget.themeModeNotifier,
                       builder: (context, mode, _) {
                         final icon = switch (mode) {
-                          ThemeMode.system => Icons.brightness_auto,
+                          ThemeMode.system => Icons.brightness_auto_outlined,
                           ThemeMode.light => Icons.light_mode_outlined,
                           ThemeMode.dark => Icons.dark_mode_outlined,
                         };
                         return IconButton(
-                          tooltip: 'Theme: ${mode.name} (click to switch)',
-                          icon: Icon(icon, size: 17),
+                          tooltip: s.themeTooltip(mode),
+                          icon: Icon(icon, size: 20),
                           onPressed: _cycleThemeMode,
                         );
                       },
@@ -390,26 +324,32 @@ class _MainShellState extends State<MainShell> {
                       selectedIndex: _selectedIndex,
                       onDestinationSelected: (index) => setState(() => _selectedIndex = index),
                       labelType: NavigationRailLabelType.all,
-                      destinations: const [
+                      minWidth: 76,
+                      destinations: [
                         NavigationRailDestination(
-                          icon: Icon(Icons.forum_outlined),
-                          selectedIcon: Icon(Icons.forum),
-                          label: Text('Sessions'),
+                          icon: const Icon(Icons.forum_outlined),
+                          selectedIcon: const Icon(Icons.forum),
+                          label: Text(s.navSessions),
                         ),
                         NavigationRailDestination(
-                          icon: Icon(Icons.alt_route_outlined),
-                          selectedIcon: Icon(Icons.alt_route),
-                          label: Text('Reader'),
+                          icon: const Icon(Icons.cloud_download_outlined),
+                          selectedIcon: const Icon(Icons.cloud_download),
+                          label: Text(s.navImport),
                         ),
                         NavigationRailDestination(
-                          icon: Icon(Icons.search_outlined),
-                          selectedIcon: Icon(Icons.search),
-                          label: Text('Search'),
+                          icon: const Icon(Icons.alt_route_outlined),
+                          selectedIcon: const Icon(Icons.alt_route),
+                          label: Text(s.navReader),
                         ),
                         NavigationRailDestination(
-                          icon: Icon(Icons.fact_check_outlined),
-                          selectedIcon: Icon(Icons.fact_check),
-                          label: Text('Integrity'),
+                          icon: const Icon(Icons.search_outlined),
+                          selectedIcon: const Icon(Icons.search),
+                          label: Text(s.navSearch),
+                        ),
+                        NavigationRailDestination(
+                          icon: const Icon(Icons.fact_check_outlined),
+                          selectedIcon: const Icon(Icons.fact_check),
+                          label: Text(s.navIntegrity),
                         ),
                       ],
                     ),
@@ -418,17 +358,17 @@ class _MainShellState extends State<MainShell> {
                       child: IndexedStack(
                         index: _selectedIndex,
                         children: [
-                          // Responsive wide-screen split master-detail layout (>= 1100px)
                           isWide
                               ? Row(
                                   children: [
                                     SizedBox(
-                                      width: 440,
+                                      width: 420,
                                       child: SessionListView(
                                         store: _store,
                                         refreshTick: _refreshTick,
                                         selectedConversationId: _selectedConversationId,
                                         onSelectSession: _navigateToConversation,
+                                        onGoToImport: () => setState(() => _selectedIndex = 1),
                                       ),
                                     ),
                                     VerticalDivider(width: 1, thickness: 1, color: theme.dividerColor),
@@ -447,7 +387,14 @@ class _MainShellState extends State<MainShell> {
                                   refreshTick: _refreshTick,
                                   selectedConversationId: _selectedConversationId,
                                   onSelectSession: _navigateToConversation,
+                                  onGoToImport: () => setState(() => _selectedIndex = 1),
                                 ),
+                          ImportView(
+                            store: _store,
+                            cliRunner: _cliRunner,
+                            discoveryService: _discovery,
+                            onDataChanged: _triggerReload,
+                          ),
                           BranchTreeReaderView(
                             store: _store,
                             refreshTick: _refreshTick,
