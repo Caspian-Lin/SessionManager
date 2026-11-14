@@ -99,5 +99,5 @@ SessionManager/
 ├─ tools/probe-formats.mjs  # 格式探针（只读扫描，不上传任何数据）
 ├─ scripts/                 # GitHub 计划同步等辅助脚本
 ├─ packages/                # shared, store, adapters, core, fixtures
-└─ apps/                    # cli (`sm`), ui-win (Flutter + Dart sqlite3 FFI)
+└─ apps/                    # cli (`sm`), ui_win (Flutter + Dart sqlite3 FFI)
 ```

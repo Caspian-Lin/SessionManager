@@ -1,6 +1,6 @@
-# `ui-win` · Session Manager Windows Reader
+# `ui_win` · Session Manager Windows Reader
 
-`sm_ui_win` is a lightweight, high-performance Flutter desktop reader application tailored for Windows (`flutter build windows`). Built with **Flutter native Material 3 + Windows 11 platform-adapted desktop styling** (Win11 Fluent neutral palette, `Segoe UI Variable` / `Segoe UI` typography, `Cascadia Mono` code typography, compact desktop density, adaptive Light/Dark/System themes, and keyboard shortcuts), it provides instant browsing and branch inspection across archived AI dialogues.
+`ui_win` is a lightweight, high-performance Flutter desktop reader application tailored for Windows (`flutter build windows`, producing `sm_ui_win.exe`). Built with **Flutter native Material 3 + Windows 11 platform-adapted desktop styling** (Win11 Fluent neutral palette, `Segoe UI Variable` / `Segoe UI` typography, `Cascadia Mono` code typography, compact desktop density, adaptive Light/Dark/System themes, and keyboard shortcuts), it provides instant browsing and branch inspection across archived AI dialogues.
 
 ---
 
@@ -24,7 +24,7 @@
 ```
 
 1. **Zero WebView2 / Zero Resident Daemon**:
-   - By using Flutter's native Windows renderer (DirectX 12 / Skia / Impeller) paired with **CQRS Hybrid Direct-Connection**, `ui-win` reads `archive.db` directly via Dart `sqlite3` FFI (`OpenMode.readOnly`, WAL concurrent reads) without spawning or managing any background HTTP server (`sm serve` has been removed).
+   - By using Flutter's native Windows renderer (DirectX 12 / Skia / Impeller) paired with **CQRS Hybrid Direct-Connection**, `ui_win` reads `archive.db` directly via Dart `sqlite3` FFI (`OpenMode.readOnly`, WAL concurrent reads) without spawning or managing any background HTTP server (`sm serve` has been removed).
    - No `127.0.0.1` port binding, no Windows Firewall prompts, no ephemeral token handshakes, and no orphan daemon processes.
 2. **Zero-Copy Local Media (`blobs/`)**:
    - `ArchiveDirectStore.resolveBlobFile(sha256, ext: ..., relPath: ...)` resolves local paths under `<archiveRoot>/blobs/<2-char>/<sha256><ext>` directly for Flutter `Image.file()` rendering without HTTP Range proxy overhead.
@@ -37,7 +37,7 @@
 
 ## 2. Configuration (`--dart-define`)
 
-When running or building `ui-win`:
+When running or building `ui_win`:
 
 - **`SM_ARCHIVE_DIR`**: Path to the archive root directory containing `archive.db` and `blobs/` (or direct path to `archive.db`). Defaults to `./archive.db` or `./archive/archive.db`.
 - **`SM_CLI_BIN`**: Path to the `sm` executable or `apps/cli/dist/index.js` entrypoint for `SmCliRunner`. Defaults to `apps/cli/dist/index.js` (via `node`) or `sm` on `PATH`.
@@ -75,8 +75,8 @@ flutter run -d windows `
 ### Commands
 
 ```powershell
-# In apps/ui-win
-cd apps/ui-win
+# In apps/ui_win
+cd apps/ui_win
 
 # Get dependencies (sqlite3 + sqlite3_flutter_libs + path + intl)
 flutter pub get
