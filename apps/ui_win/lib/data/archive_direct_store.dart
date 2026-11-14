@@ -882,7 +882,7 @@ class ArchiveDirectStore {
       }
     }
 
-    return [
+    return const [
       SearchHit(
         itemId: 11,
         conversationId: 1,

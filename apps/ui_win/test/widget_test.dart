@@ -7,12 +7,12 @@ import 'package:path/path.dart' as p;
 import 'package:sqlite3/open.dart' as sq_open;
 import 'package:sqlite3/sqlite3.dart' as sq;
 
-import 'package:sm_ui_win/data/archive_direct_store.dart';
-import 'package:sm_ui_win/data/sm_cli_runner.dart';
-import 'package:sm_ui_win/main.dart';
-import 'package:sm_ui_win/theme.dart';
-import 'package:sm_ui_win/views/branch_reader_view.dart';
-import 'package:sm_ui_win/views/integrity_view.dart';
+import 'package:ui_win/data/archive_direct_store.dart';
+import 'package:ui_win/data/sm_cli_runner.dart';
+import 'package:ui_win/main.dart';
+import 'package:ui_win/theme.dart';
+import 'package:ui_win/views/branch_reader_view.dart';
+import 'package:ui_win/views/integrity_view.dart';
 
 ffi.DynamicLibrary _openWindowsSqliteForTest() {
   final candidates = [

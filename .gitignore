@@ -17,12 +17,12 @@ build/
 *.db-wal
 
 # Flutter / Dart
-apps/ui-win/.dart_tool/
-apps/ui-win/.packages
-apps/ui-win/.flutter-plugins
-apps/ui-win/.flutter-plugins-dependencies
-apps/ui-win/build/
-apps/ui-win/windows/flutter/ephemeral/
+apps/ui_win/.dart_tool/
+apps/ui_win/.packages
+apps/ui_win/.flutter-plugins
+apps/ui_win/.flutter-plugins-dependencies
+apps/ui_win/build/
+apps/ui_win/windows/flutter/ephemeral/
 
 # Logs & OS
 *.log

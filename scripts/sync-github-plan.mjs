@@ -21,7 +21,7 @@ export const LABELS = [
   { name: 'pkg:core', color: '0E8A16', description: 'Validation, deduplication, merge, and diff pipeline (@sm/core)' },
   { name: 'app:cli', color: 'FBCA04', description: 'sm CLI commands and terminal reporting (@sm/cli)' },
   { name: 'arch:cqrs-direct', color: '006B75', description: 'CQRS Hybrid Direct-Connection (Dart SQLite FFI read-only + on-demand CLI runner)' },
-  { name: 'app:ui-win', color: 'C2E0C6', description: 'Flutter Windows lightweight desktop reader (apps/ui-win)' },
+  { name: 'app:ui-win', color: 'C2E0C6', description: 'Flutter Windows lightweight desktop reader (apps/ui_win)' },
   { name: 'testing', color: 'BFD4F2', description: 'Synthetic fixtures and golden ViewModel snapshot tests' },
   { name: 'P0-blocker', color: 'B60205', description: 'Critical path blocker for milestone completion' },
   { name: 'P1-core', color: 'D93F0B', description: 'Core MVP deliverable' },
@@ -289,7 +289,7 @@ export const ISSUES = [
     labels: ['app:ui-win', 'pkg:store', 'arch:cqrs-direct', 'P1-core'],
     body: `### 任务拆解
 - [x] 移除常驻 \`apps/server\`（\`@sm/server\`）与 \`sm serve\` 子命令，消除本地端口监听、防火墙弹窗、一次性 Token 鉴权与孤儿进程问题
-- [x] 在 \`apps/ui-win\` 实现基于 Dart \`sqlite3\` FFI 的只读仓储层（\`OpenMode.readOnly\`，复用 SQLite WAL 并发读）：直接查询 \`conversation\`、\`item.blocks_json\`、\`import_batch.report_json\` 及 FTS5 双索引（\`item_fts_uni\` / \`item_fts_tri\` / \`conv_fts_tri\`）
+- [x] 在 \`apps/ui_win\` 实现基于 Dart \`sqlite3\` FFI 的只读仓储层（\`OpenMode.readOnly\`，复用 SQLite WAL 并发读）：直接查询 \`conversation\`、\`item.blocks_json\`、\`import_batch.report_json\` 及 FTS5 双索引（\`item_fts_uni\` / \`item_fts_tri\` / \`conv_fts_tri\`）
 - [x] 实现 \`blobs/<2位前缀>/<sha256><ext>\` 本地文件路径解析，供 Flutter \`Image.file()\` / 原生控件零拷贝直读媒体资产
 - [x] 实现写操作按需 CLI 桥接器（\`SmCliRunner\`）：通过 \`Process.run('sm', [..., '--json'])\` 按需单次执行 \`import\` / \`verify\` / \`dedupe\` / \`reindex\` / \`export\` 并在完成后刷新只读视图`,
   },
@@ -310,7 +310,7 @@ export const ISSUES = [
 - [x] 实现会话树分支切换器（可视化切换 regenerate 旁支）与 \`is_synthetic\` 注入节点默认折叠
 - [x] 实现 Agent 工具调用、代码高亮、LaTeX 与基于 \`blobs/\` 本地文件直读（\`Image.file\`）的媒体预览渲染
 - [x] 实现「查重与批次差异报告」视图（一键高亮展示「内容缩短」会话与疑似重复双栏对比）
-- [x] 编写 Windows 便携版打包脚本（\`scripts/build-win-portable.mjs\`，打包 CLI 运行时与 \`apps/ui-win\`，无需后台守护进程）`,
+- [x] 编写 Windows 便携版打包脚本（\`scripts/build-win-portable.mjs\`，打包 CLI 运行时与 \`apps/ui_win\`，无需后台守护进程）`,
   },
 ];
 

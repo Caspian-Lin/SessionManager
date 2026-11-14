@@ -1,4 +1,4 @@
-name: sm_ui_win
+name: ui_win
 description: Session Manager lightweight Windows reader (Flutter Material 3 + Windows 11 adaptive desktop style)
 publish_to: "none"
 version: 0.1.0+1

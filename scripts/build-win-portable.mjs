@@ -6,7 +6,7 @@
  *   - Compiled workspace packages (@sm/shared, @sm/store, @sm/adapters, @sm/core)
  *   - Compiled CLI entrypoint (@sm/cli -> apps/cli/dist/index.js)
  *   - Required runtime dependencies (e.g., fzstd)
- *   - Flutter Windows desktop source / release bundle (apps/ui-win)
+ *   - Flutter Windows desktop source / release bundle (apps/ui_win)
  *   - Windows launcher scripts (sm.cmd, sm-ui.cmd)
  *   - portable-manifest.json
  *
@@ -113,13 +113,17 @@ function main() {
   }
 
   // Stage Flutter Windows app (compiled Release bundle if present, else source + pubspec)
-  const uiWinSrc = path.join(REPO_ROOT, 'apps', 'ui-win');
+  const uiWinSrc = path.join(REPO_ROOT, 'apps', 'ui_win');
   const releaseRunner = path.join(uiWinSrc, 'build', 'windows', 'x64', 'runner', 'Release');
-  const uiOutDir = path.join(outDir, 'ui-win');
+  const uiOutDir = path.join(outDir, 'ui_win');
   let uiMode = 'flutter-source';
+  let releaseExeName = 'sm_ui_win.exe';
   if (fs.existsSync(releaseRunner)) {
     copyDirClean(releaseRunner, uiOutDir);
     uiMode = 'windows-release-binary';
+    if (!fs.existsSync(path.join(releaseRunner, 'sm_ui_win.exe')) && fs.existsSync(path.join(releaseRunner, 'ui_win.exe'))) {
+      releaseExeName = 'ui_win.exe';
+    }
   } else {
     copyDirClean(uiWinSrc, uiOutDir, new Set(['.dart_tool', 'build', '.git']));
   }
@@ -142,7 +146,7 @@ function main() {
           'set "ROOT=%~dp0"',
           'set "SM_CLI_BIN=%ROOT%runtime\\apps\\cli\\dist\\index.js"',
           'if "%SM_ARCHIVE_DIR%"=="" set "SM_ARCHIVE_DIR=%ROOT%archive"',
-          'start "" "%ROOT%ui-win\\sm_ui_win.exe"',
+          `start "" "%ROOT%ui_win\\${releaseExeName}"`,
           '',
         ].join('\r\n')
       : [
@@ -151,7 +155,7 @@ function main() {
           'set "ROOT=%~dp0"',
           'set "SM_CLI_BIN=%ROOT%runtime\\apps\\cli\\dist\\index.js"',
           'if "%SM_ARCHIVE_DIR%"=="" set "SM_ARCHIVE_DIR=%ROOT%archive"',
-          'pushd "%ROOT%ui-win"',
+          'pushd "%ROOT%ui_win"',
           'flutter run -d windows --dart-define=SM_ARCHIVE_DIR="%SM_ARCHIVE_DIR%" --dart-define=SM_CLI_BIN="%SM_CLI_BIN%"',
           'popd',
           '',
