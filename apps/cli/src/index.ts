@@ -3,44 +3,98 @@
  * @sm/cli — Session Manager Command Line Interface (`sm`)
  *
  * Commands:
- *   sm probe <path> [--kind auto|codex|dsh|claude] [--json]
- *   sm import <path> [--db <archive.db>]
- *   sm ls [--provider <id>] [--limit <n>]
- *   sm search <query>
- *   sm verify [--batch <id>]
- *   sm dedupe
- *   sm export --format native|md|jsonl --out <dir>
- *   sm reindex
- *   sm serve [--port <port>]
+ *   sm probe <path> [--kind auto|<provider>] [--json]
+ *   sm import <path> [--kind auto|<provider>] [--db <archive.db>] [--json]
+ *   sm ls [--provider <id>] [--limit <n>] [--db <archive.db>] [--json]
+ *   sm show <id> [--all-branches] [--include-synthetic] [--json] [--db <archive.db>]
+ *   sm search <query> [--limit <n>] [--provider <id>] [--role <role>] [--db <archive.db>] [--json]
+ *   sm verify [--batch <id>] [--out <path>] [--db <archive.db>] [--json]
+ *   sm dedupe [--db <archive.db>] [--json]
+ *   sm export --format native|md|jsonl --out <dir> [--provider <id>] [--db <archive.db>]
+ *   sm reindex [--db <archive.db>]
+ *   sm serve [--port <port>] [--db <archive.db>]
  *   sm --help / sm --version
  */
 
 import fs from 'node:fs';
 import path from 'node:path';
-import crypto from 'node:crypto';
-import zlib from 'node:zlib';
-import { DatabaseSync } from 'node:sqlite';
+import { fileURLToPath } from 'node:url';
 import {
-  computeSemanticItemHash,
-  computeConversationMerkleHash,
-  computeMinHashFingerprint,
-  estimateJaccardSimilarity,
-  normalizeText,
+  AdapterRegistry,
+  defaultAdapterRegistry,
+  type ProbeResult,
+  type SourceRef,
+} from '@sm/adapters';
+import {
+  ArchiveService,
+  exportNativeManifest,
+  formatConversationMarkdown,
+  formatIntegrityReportJson,
+  formatIntegrityReportMarkdown,
+  type PipelineResult,
+} from '@sm/core';
+import type {
+  BlobAsset,
+  BlobOriginKind,
+  ConversationViewModel,
+  IntegrityIssue,
+  IntegrityReport,
+  ItemStatus,
+  ProviderId,
+  SessionRole,
+  TitleSource,
+  TurnKind,
+  ViewBlock,
+  ViewNode,
 } from '@sm/shared';
+import {
+  ArchiveDatabase,
+  BlobStore,
+  RawStore,
+  type BlobRow,
+  type ConversationRow,
+  type ItemRow,
+} from '@sm/store';
 
 const VERSION = '0.1.0';
 
-// ─────────────────────────────────────────────────────────────────────────────
-// CLI Parser & Main Entry
-// ─────────────────────────────────────────────────────────────────────────────
+const BOOLEAN_FLAGS = new Set([
+  'json',
+  'all-branches',
+  'include-synthetic',
+  'include-hidden',
+  'help',
+  'version',
+]);
 
-interface ParsedArgs {
+const KIND_ALIASES: Record<string, ProviderId> = {
+  openai: 'openai-web',
+  'openai-web': 'openai-web',
+  anthropic: 'anthropic-web',
+  'anthropic-web': 'anthropic-web',
+  deepseek: 'deepseek-web',
+  'deepseek-web': 'deepseek-web',
+  codex: 'codex-local',
+  'codex-local': 'codex-local',
+  claude: 'claude-code-local',
+  'claude-code': 'claude-code-local',
+  'claude-code-local': 'claude-code-local',
+  dsh: 'dsh-local',
+  'dsh-local': 'dsh-local',
+  json: 'generic-json',
+  'generic-json': 'generic-json',
+  md: 'generic-md',
+  markdown: 'generic-md',
+  'generic-md': 'generic-md',
+};
+
+export interface ParsedArgs {
   subcommand?: string;
   positional: string[];
   flags: Record<string, string | boolean>;
 }
 
-function parseArgs(args: string[]): ParsedArgs {
+export function parseArgs(args: readonly string[]): ParsedArgs {
   const positional: string[] = [];
   const flags: Record<string, string | boolean> = {};
   let subcommand: string | undefined;
@@ -50,18 +104,35 @@ function parseArgs(args: string[]): ParsedArgs {
     if (!arg) continue;
 
     if (arg.startsWith('--')) {
-      const key = arg.slice(2);
-      const next = args[i + 1];
-      if (next && !next.startsWith('-')) {
-        flags[key] = next;
-        i++;
-      } else {
-        flags[key] = true;
+      const eqIdx = arg.indexOf('=');
+      if (eqIdx !== -1) {
+        const key = arg.slice(2, eqIdx);
+        const val = arg.slice(eqIdx + 1);
+        if (BOOLEAN_FLAGS.has(key)) {
+          flags[key] = val !== 'false' && val !== '0';
+        } else {
+          flags[key] = val;
+        }
+        continue;
       }
-    } else if (arg.startsWith('-')) {
+
+      const key = arg.slice(2);
+      if (BOOLEAN_FLAGS.has(key)) {
+        flags[key] = true;
+      } else {
+        const next = args[i + 1];
+        if (next !== undefined && !next.startsWith('-')) {
+          flags[key] = next;
+          i++;
+        } else {
+          flags[key] = true;
+        }
+      }
+    } else if (arg.startsWith('-') && arg.length > 1) {
       const key = arg.slice(1);
       if (key === 'h') flags['help'] = true;
       else if (key === 'v') flags['version'] = true;
+      else if (key === 'j') flags['json'] = true;
       else flags[key] = true;
     } else if (!subcommand) {
       subcommand = arg;
@@ -73,15 +144,20 @@ function parseArgs(args: string[]): ParsedArgs {
   return { subcommand, positional, flags };
 }
 
-async function main(): Promise<void> {
-  const args = parseArgs(process.argv.slice(2));
+export async function runCli(argv: readonly string[]): Promise<void> {
+  const args = parseArgs(argv);
 
   if (args.flags['version'] || args.subcommand === '--version' || args.subcommand === '-v') {
     console.log(`sm version ${VERSION}`);
     return;
   }
 
-  if (args.flags['help'] || !args.subcommand || args.subcommand === '--help' || args.subcommand === 'help') {
+  if (
+    args.flags['help'] ||
+    !args.subcommand ||
+    args.subcommand === '--help' ||
+    args.subcommand === 'help'
+  ) {
     printHelp();
     return;
   }
@@ -96,6 +172,9 @@ async function main(): Promise<void> {
     case 'ls':
     case 'list':
       await runList(args);
+      break;
+    case 'show':
+      await runShow(args);
       break;
     case 'search':
       await runSearch(args);
@@ -116,8 +195,16 @@ async function main(): Promise<void> {
       await runServe(args);
       break;
     default:
-      console.error(`Error: Unknown subcommand "${args.subcommand}". Run "sm --help" for available commands.`);
-      process.exit(1);
+      throw new CliError(
+        `Unknown subcommand "${args.subcommand}". Run "sm --help" for available commands.`
+      );
+  }
+}
+
+class CliError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'CliError';
   }
 }
 
@@ -129,21 +216,23 @@ Usage:
   sm <command> [arguments] [options]
 
 Commands:
-  probe <path>                 Probe conversation source or zip and output structural profile
-                               Options: --kind auto|codex|dsh|claude, --json
+  probe <path>                 Probe conversation source or zip and output adapter profile
+                               Options: --kind auto|<provider>, --json
   import <path>                Import conversation logs/export into archive database
-                               Options: --db <archive.db>
+                               Options: --kind auto|<provider>, --db <archive.db>, --json
   ls                           List archived conversations
-                               Options: --provider <id>, --limit <n>, --db <archive.db>
-  search <query>               Full-text search conversations & item snippets
-                               Options: --db <archive.db>
-  verify                       Run structural & cross-batch diff integrity checks
-                               Options: --batch <id>, --db <archive.db>
-  dedupe                       Identify exact duplicates and high-similarity candidate pairs
-                               Options: --db <archive.db>
+                               Options: --provider <id>, --limit <n>, --db <archive.db>, --json
+  show <id>                    Inspect conversation metadata, revisions, and item tree
+                               Options: --all-branches, --include-synthetic, --json, --db <archive.db>
+  search <query>               Full-text search conversations & item snippets (FTS5 + CJK router)
+                               Options: --limit <n>, --provider <id>, --role <role>, --db <archive.db>, --json
+  verify                       Run structural, blob, and cross-batch diff integrity checks
+                               Options: --batch <id>, --out <path>, --db <archive.db>, --json
+  dedupe                       List exact duplicate clusters and similarity candidate pairs
+                               Options: --db <archive.db>, --json
   export                       Export archive conversations to folder
-                               Options: --format native|md|jsonl, --out <dir>, --db <archive.db>
-  reindex                      Rebuild search index and update conversation statistics
+                               Options: --format native|md|jsonl, --out <dir>, --provider <id>, --db <archive.db>
+  reindex                      Rebuild FTS5 search indexes and recalculate conversation counts
                                Options: --db <archive.db>
   serve                        Start local HTTP API server on 127.0.0.1 with ephemeral token
                                Options: --port <port>, --db <archive.db>
@@ -155,870 +244,1247 @@ Global Flags:
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Database Helpers & Schema Setup
+// Helpers: Source Resolution, Store Setup & View Reconstruction
 // ─────────────────────────────────────────────────────────────────────────────
 
-function getArchiveDb(flags: Record<string, string | boolean>): { db: DatabaseSync; dbPath: string } {
-  const dbPath = path.resolve(typeof flags['db'] === 'string' ? flags['db'] : './archive.db');
-  const dir = path.dirname(dbPath);
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
+function resolveSourceRef(targetPath: string): SourceRef {
+  const resolved = path.resolve(targetPath);
+  if (!fs.existsSync(resolved)) {
+    throw new CliError(`Path does not exist: ${resolved}`);
   }
-  const db = new DatabaseSync(dbPath);
-  ensureTables(db);
-  return { db, dbPath };
+  const stat = fs.statSync(resolved);
+  if (stat.isDirectory()) {
+    return { kind: 'dir', path: resolved };
+  }
+  const lower = resolved.toLowerCase();
+  if (
+    lower.endsWith('.sqlite') ||
+    lower.endsWith('.sqlite3') ||
+    lower.endsWith('.db') ||
+    lower.endsWith('.vscdb')
+  ) {
+    return { kind: 'sqlite', path: resolved };
+  }
+  return { kind: 'file', path: resolved };
 }
 
-function ensureTables(db: DatabaseSync): void {
-  db.exec(`
-    PRAGMA journal_mode = WAL;
-    PRAGMA foreign_keys = ON;
-
-    CREATE TABLE IF NOT EXISTS meta (
-      key TEXT PRIMARY KEY,
-      value TEXT NOT NULL
+function resolveKindRegistry(kindFlag: string | boolean | undefined): {
+  providerId?: ProviderId;
+  registry: AdapterRegistry;
+} {
+  if (!kindFlag || kindFlag === true || kindFlag === 'auto') {
+    return { registry: defaultAdapterRegistry };
+  }
+  const normalized = kindFlag.trim().toLowerCase();
+  const providerId = KIND_ALIASES[normalized];
+  if (!providerId) {
+    throw new CliError(
+      `Unknown adapter kind "${kindFlag}". Supported: auto, ${Object.values(KIND_ALIASES)
+        .filter((v, idx, arr) => arr.indexOf(v) === idx)
+        .join(', ')}`
     );
+  }
+  const adapter = defaultAdapterRegistry.get(providerId);
+  if (!adapter) {
+    throw new CliError(`Adapter "${providerId}" is not registered.`);
+  }
+  const scoped = new AdapterRegistry(false);
+  scoped.register(adapter);
+  return { providerId, registry: scoped };
+}
 
-    CREATE TABLE IF NOT EXISTS account (
-      id INTEGER PRIMARY KEY,
-      provider TEXT NOT NULL,
-      label TEXT,
-      external_id TEXT,
-      created_at INTEGER NOT NULL
-    );
+function openCliArchive(
+  flags: Record<string, string | boolean>,
+  registry: AdapterRegistry = defaultAdapterRegistry
+): { service: ArchiveService; dbPath: string; archiveRoot: string } {
+  const dbPath = path.resolve(typeof flags['db'] === 'string' ? flags['db'] : './archive.db');
+  const archiveRoot = path.dirname(dbPath);
+  const db = ArchiveDatabase.openArchiveDb(dbPath);
+  db.migrate();
+  const rawStore = new RawStore(archiveRoot);
+  const blobStore = new BlobStore(archiveRoot);
+  const service = new ArchiveService(db, {
+    archiveRoot,
+    rawStore,
+    blobStore,
+    registry,
+  });
+  return { service, dbPath, archiveRoot };
+}
 
-    CREATE TABLE IF NOT EXISTS import_batch (
-      id INTEGER PRIMARY KEY,
-      provider TEXT NOT NULL,
-      adapter_id TEXT NOT NULL,
-      adapter_version TEXT NOT NULL,
-      account_id INTEGER REFERENCES account(id),
-      kind TEXT NOT NULL,
-      source_path TEXT,
-      source_sha256 TEXT NOT NULL,
-      exported_at INTEGER,
-      imported_at INTEGER NOT NULL,
-      status TEXT NOT NULL,
-      stats_json TEXT,
-      report_json TEXT
-    );
+function measureSourceSize(src: SourceRef): { fileCount: number; totalBytes: number } {
+  if (src.kind !== 'dir') {
+    const stat = fs.statSync(src.path);
+    return { fileCount: 1, totalBytes: stat.size };
+  }
+  let fileCount = 0;
+  let totalBytes = 0;
+  const stack: string[] = [src.path];
+  while (stack.length > 0) {
+    const dir = stack.pop()!;
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const ent of entries) {
+      const full = path.join(dir, ent.name);
+      if (ent.isDirectory()) {
+        stack.push(full);
+      } else if (ent.isFile()) {
+        fileCount++;
+        try {
+          totalBytes += fs.statSync(full).size;
+        } catch {
+          // ignore unreadable entry
+        }
+      }
+    }
+  }
+  return { fileCount, totalBytes };
+}
 
-    CREATE TABLE IF NOT EXISTS import_file (
-      id INTEGER PRIMARY KEY,
-      batch_id INTEGER NOT NULL REFERENCES import_batch(id) ON DELETE CASCADE,
-      rel_path TEXT NOT NULL,
-      sha256 TEXT NOT NULL,
-      size INTEGER NOT NULL,
-      mtime INTEGER,
-      role TEXT,
-      parsed_ok INTEGER NOT NULL DEFAULT 0,
-      error TEXT
-    );
+function parseJsonArray<T>(raw: string | null): T[] {
+  if (!raw) return [];
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    return Array.isArray(parsed) ? (parsed as T[]) : [];
+  } catch {
+    return [];
+  }
+}
 
-    CREATE TABLE IF NOT EXISTS conversation (
-      id INTEGER PRIMARY KEY,
-      provider TEXT NOT NULL,
-      account_id INTEGER REFERENCES account(id),
-      external_id TEXT,
-      title TEXT,
-      title_source TEXT,
-      summary TEXT,
-      created_at INTEGER,
-      updated_at INTEGER,
-      exported_at INTEGER,
-      default_model TEXT,
-      cwd TEXT,
-      project_id INTEGER,
-      item_count INTEGER NOT NULL DEFAULT 0,
-      char_count INTEGER NOT NULL DEFAULT 0,
-      blob_count INTEGER NOT NULL DEFAULT 0,
-      head_hash TEXT,
-      content_hash TEXT,
-      fingerprint TEXT,
-      revision_count INTEGER NOT NULL DEFAULT 1,
-      first_batch_id INTEGER REFERENCES import_batch(id),
-      last_batch_id INTEGER REFERENCES import_batch(id),
-      starred INTEGER NOT NULL DEFAULT 0,
-      archived INTEGER NOT NULL DEFAULT 0,
-      deleted_at INTEGER,
-      raw_format TEXT,
-      raw_blob_sha256 TEXT,
-      flags_json TEXT
-    );
+function parseJsonObject(raw: string | null): Record<string, unknown> {
+  if (!raw) return {};
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
+  } catch {
+    // ignore malformed json
+  }
+  return {};
+}
 
-    CREATE TABLE IF NOT EXISTS item (
-      id INTEGER PRIMARY KEY,
-      conversation_id INTEGER NOT NULL REFERENCES conversation(id) ON DELETE CASCADE,
-      parent_id INTEGER REFERENCES item(id) ON DELETE CASCADE,
-      external_id TEXT,
-      ordinal INTEGER NOT NULL,
-      depth INTEGER NOT NULL DEFAULT 0,
-      role TEXT NOT NULL,
-      kind TEXT NOT NULL,
-      created_at INTEGER,
-      model TEXT,
-      text TEXT,
-      text_len INTEGER NOT NULL DEFAULT 0,
-      content_hash TEXT NOT NULL,
-      is_active_branch INTEGER NOT NULL DEFAULT 1,
-      is_hidden INTEGER NOT NULL DEFAULT 0,
-      is_synthetic INTEGER NOT NULL DEFAULT 0,
-      status TEXT,
-      tool_name TEXT,
-      blocks_json TEXT,
-      payload_ref TEXT,
-      flags_json TEXT
-    );
+function normalizeExportBlobRelPath(row: BlobRow): string {
+  if (row.rel_path.startsWith('blobs/')) {
+    return row.rel_path;
+  }
+  const ext = row.ext ?? (path.extname(row.rel_path) || '.bin');
+  return path.posix.join('blobs', row.sha256.slice(0, 2), `${row.sha256}${ext}`);
+}
 
-    CREATE TABLE IF NOT EXISTS blob (
-      id INTEGER PRIMARY KEY,
-      sha256 TEXT NOT NULL UNIQUE,
-      mime TEXT NOT NULL,
-      bytes INTEGER NOT NULL,
-      ext TEXT,
-      width INTEGER,
-      height INTEGER,
-      duration_ms INTEGER,
-      rel_path TEXT NOT NULL,
-      origin_kind TEXT NOT NULL,
-      created_at INTEGER NOT NULL
-    );
+function blobRowToAsset(row: BlobRow, overrideRelPath?: string): BlobAsset {
+  return {
+    sha256: row.sha256,
+    mime: row.mime,
+    bytes: row.bytes,
+    ext: row.ext,
+    width: row.width,
+    height: row.height,
+    duration_ms: row.duration_ms,
+    rel_path: overrideRelPath ?? row.rel_path,
+    origin_kind: row.origin_kind as BlobOriginKind,
+    created_at: row.created_at,
+  };
+}
 
-    CREATE TABLE IF NOT EXISTS dedupe_candidate (
-      id INTEGER PRIMARY KEY,
-      a_id INTEGER NOT NULL REFERENCES conversation(id) ON DELETE CASCADE,
-      b_id INTEGER NOT NULL REFERENCES conversation(id) ON DELETE CASCADE,
-      similarity REAL NOT NULL,
-      reason TEXT NOT NULL,
-      status TEXT NOT NULL DEFAULT 'open',
-      decided_at INTEGER,
-      created_at INTEGER NOT NULL,
-      UNIQUE(a_id, b_id)
-    );
-  `);
+function collectBlobShasFromItems(
+  conv: ConversationRow,
+  items: readonly ItemRow[]
+): Set<string> {
+  const shas = new Set<string>();
+  if (conv.raw_blob_sha256) {
+    shas.add(conv.raw_blob_sha256);
+  }
+  for (const item of items) {
+    if (item.payload_ref) {
+      shas.add(item.payload_ref);
+    }
+    const blocks = parseJsonArray<ViewBlock>(item.blocks_json);
+    for (const b of blocks) {
+      if (b.blob_sha256) {
+        shas.add(b.blob_sha256);
+      }
+    }
+  }
+  return shas;
+}
+
+function buildViewModelFromRows(
+  service: ArchiveService,
+  conv: ConversationRow,
+  activeItems: readonly ItemRow[],
+  allItemsForBlobs: readonly ItemRow[]
+): { view: ConversationViewModel; blobRows: BlobRow[] } {
+  const idToExtId = new Map<number, string>();
+  for (const item of activeItems) {
+    idToExtId.set(item.id, item.external_id ?? String(item.id));
+  }
+
+  const nodes: ViewNode[] = activeItems.map((item) => ({
+    external_id: item.external_id ?? String(item.id),
+    parent_external_id:
+      item.parent_id != null ? (idToExtId.get(item.parent_id) ?? null) : null,
+    ordinal: item.ordinal,
+    depth: item.depth,
+    role: item.role as SessionRole,
+    kind: item.kind as TurnKind,
+    created_at: item.created_at,
+    model: item.model,
+    text: item.text ?? '',
+    text_len: item.text_len,
+    content_hash: item.content_hash,
+    is_active_branch: item.is_active_branch === 1,
+    is_hidden: item.is_hidden === 1,
+    is_synthetic: item.is_synthetic === 1,
+    status: (item.status as ItemStatus) ?? null,
+    payload_ref: item.payload_ref,
+    blocks: parseJsonArray<ViewBlock>(item.blocks_json),
+  }));
+
+  const blobShas = collectBlobShasFromItems(conv, allItemsForBlobs);
+  const blobRows: BlobRow[] = [];
+  for (const sha of blobShas) {
+    const row = service.repository.getBlobBySha256(sha);
+    if (row) {
+      blobRows.push(row);
+    }
+  }
+
+  const view: ConversationViewModel = {
+    meta: {
+      provider: conv.provider as ProviderId,
+      external_id: conv.external_id,
+      title: conv.title,
+      title_source: (conv.title_source as TitleSource) ?? null,
+      summary: conv.summary,
+      created_at: conv.created_at,
+      updated_at: conv.updated_at,
+      exported_at: conv.exported_at,
+      default_model: conv.default_model,
+      cwd: conv.cwd,
+      message_count: conv.item_count,
+      char_count: conv.char_count,
+      blob_count: conv.blob_count,
+      head_hash: conv.head_hash,
+      content_hash: conv.content_hash ?? '',
+      fingerprint: conv.fingerprint ?? '',
+      raw_format: conv.raw_format ?? conv.provider,
+    },
+    nodes,
+    blobs: blobRows.map((br) => blobRowToAsset(br, normalizeExportBlobRelPath(br))),
+  };
+
+  return { view, blobRows };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 1. Subcommand: sm probe <path> [--kind auto|codex|dsh|claude] [--json]
+// 1. Subcommand: sm probe <path> [--kind auto|<provider>] [--json]
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function runProbe(args: ParsedArgs): Promise<void> {
   const targetPath = args.positional[0];
   if (!targetPath) {
-    console.error('Error: "sm probe" requires a <path> argument.');
-    process.exit(1);
+    throw new CliError('"sm probe" requires a <path> argument.');
   }
 
-  const resolved = path.resolve(targetPath);
-  if (!fs.existsSync(resolved)) {
-    console.error(`Error: Path does not exist: ${resolved}`);
-    process.exit(1);
-  }
-
-  const kindFlag = (args.flags['kind'] as string) ?? 'auto';
+  const src = resolveSourceRef(targetPath);
+  const { providerId, registry } = resolveKindRegistry(args.flags['kind']);
   const isJson = Boolean(args.flags['json']);
 
-  const isZip = resolved.toLowerCase().endsWith('.zip');
-  const stat = fs.statSync(resolved);
-
-  let detectedKind = kindFlag;
-  let fileCount = 0;
-  let totalBytes = 0;
-  let conversationEstimate = 0;
-  let itemEstimate = 0;
-  const eventTypes: Record<string, number> = {};
-
-  if (isZip) {
-    detectedKind = detectedKind === 'auto' ? 'openai-web' : detectedKind;
-    fileCount = 1;
-    totalBytes = stat.size;
-    conversationEstimate = 100;
-  } else if (stat.isDirectory()) {
-    const files = walkFiles(resolved, 500);
-    fileCount = files.length;
-    for (const f of files) {
-      try {
-        const s = fs.statSync(f);
-        totalBytes += s.size;
-        const base = path.basename(f).toLowerCase();
-        if (base.includes('rollout') || base.endsWith('.sqlite')) {
-          if (detectedKind === 'auto') detectedKind = 'codex';
-          conversationEstimate++;
-          eventTypes['turn_context'] = (eventTypes['turn_context'] ?? 0) + 10;
-          eventTypes['response_item'] = (eventTypes['response_item'] ?? 0) + 40;
-        } else if (base.includes('session.v4') || f.includes('.dsh')) {
-          if (detectedKind === 'auto') detectedKind = 'dsh';
-          conversationEstimate++;
-          eventTypes['assistant/chunk'] = (eventTypes['assistant/chunk'] ?? 0) + 50;
-        } else if (base.endsWith('.jsonl') || f.includes('.claude')) {
-          if (detectedKind === 'auto') detectedKind = 'claude';
-          conversationEstimate++;
-          eventTypes['user_message'] = (eventTypes['user_message'] ?? 0) + 5;
-          eventTypes['assistant_message'] = (eventTypes['assistant_message'] ?? 0) + 15;
-        } else if (base === 'conversations.json') {
-          if (detectedKind === 'auto') detectedKind = 'openai-web';
-          conversationEstimate += 25;
-          eventTypes['mapping_nodes'] = (eventTypes['mapping_nodes'] ?? 0) + 200;
-        }
-      } catch {
-        // ignore unreadable file
-      }
-    }
+  let results: ProbeResult[];
+  if (providerId) {
+    const adapter = registry.get(providerId)!;
+    const single = await adapter.probe(src);
+    results = single && single.confidence > 0 ? [single] : [];
   } else {
-    fileCount = 1;
-    totalBytes = stat.size;
-    conversationEstimate = 1;
+    results = await registry.probeSource(src);
   }
 
-  itemEstimate = Object.values(eventTypes).reduce((a, b) => a + b, 0);
-  if (itemEstimate === 0) itemEstimate = conversationEstimate * 15;
+  const { fileCount, totalBytes } = measureSourceSize(src);
+  const best = results[0] ?? null;
+
+  if (!best) {
+    if (isJson) {
+      console.log(
+        JSON.stringify(
+          {
+            path: src.path,
+            sourceKind: src.kind,
+            matched: false,
+            fileCount,
+            totalBytes,
+            humanSize: formatBytes(totalBytes),
+            candidates: [],
+          },
+          null,
+          2
+        )
+      );
+    }
+    throw new CliError(
+      providerId
+        ? `Source "${src.path}" did not match adapter "${providerId}".`
+        : `No compatible adapter matched source: ${src.path}`
+    );
+  }
 
   const report = {
-    path: resolved,
-    kind: detectedKind === 'auto' ? 'generic-json' : detectedKind,
-    file_count: fileCount,
-    total_bytes: totalBytes,
-    human_size: formatBytes(totalBytes),
-    estimated_conversations: conversationEstimate,
-    estimated_items: itemEstimate,
-    event_distribution: eventTypes,
-    probed_at: Date.now(),
+    path: src.path,
+    sourceKind: src.kind,
+    matched: true,
+    adapterId: best.adapterId,
+    version: best.version,
+    confidence: best.confidence,
+    evidence: best.evidence,
+    warnings: best.warnings,
+    entryCount: best.entries.length,
+    entries: best.entries,
+    fileCount,
+    totalBytes,
+    humanSize: formatBytes(totalBytes),
+    candidates: results.map((r) => ({
+      adapterId: r.adapterId,
+      version: r.version,
+      confidence: r.confidence,
+      entryCount: r.entries.length,
+    })),
+    probedAt: Date.now(),
   };
 
   if (isJson) {
     console.log(JSON.stringify(report, null, 2));
-  } else {
-    console.log('\n=== Session Manager Probe Report ===');
-    console.log(`Target:      ${resolved}`);
-    console.log(`Kind:        ${report.kind}`);
-    console.log(`Files:       ${report.file_count}`);
-    console.log(`Total Size:  ${report.human_size}`);
-    console.log(`Est. Convs:  ${report.estimated_conversations}`);
-    console.log(`Est. Items:  ${report.estimated_items}`);
-    console.log('Event distribution:');
-    for (const [k, v] of Object.entries(report.event_distribution)) {
-      console.log(`  - ${k.padEnd(20)}: ${v}`);
-    }
-    console.log('====================================\n');
+    return;
   }
+
+  console.log('\n=== Session Manager Probe Report ===');
+  console.log(`Target:      ${report.path}`);
+  console.log(`Source Kind: ${report.sourceKind}`);
+  console.log(`Adapter ID:  ${report.adapterId}`);
+  console.log(`Version:     ${report.version}`);
+  console.log(`Confidence:  ${(report.confidence * 100).toFixed(1)}%`);
+  console.log(`Files:       ${report.fileCount} (${report.humanSize})`);
+  console.log(`Entries:     ${report.entryCount}`);
+  if (report.entries.length > 0) {
+    const preview = report.entries.slice(0, 10);
+    for (const entry of preview) {
+      console.log(`  - ${entry}`);
+    }
+    if (report.entries.length > preview.length) {
+      console.log(`  ... and ${report.entries.length - preview.length} more`);
+    }
+  }
+  console.log('Evidence:');
+  if (report.evidence.length === 0) {
+    console.log('  (none)');
+  } else {
+    for (const ev of report.evidence) {
+      console.log(`  * ${ev}`);
+    }
+  }
+  if (report.warnings.length > 0) {
+    console.log('Warnings:');
+    for (const w of report.warnings) {
+      console.log(`  ! ${w}`);
+    }
+  }
+  console.log('====================================\n');
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 2. Subcommand: sm import <path> [--db <archive.db>]
+// 2. Subcommand: sm import <path> [--kind auto|<provider>] [--db <archive.db>]
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function runImport(args: ParsedArgs): Promise<void> {
   const targetPath = args.positional[0];
   if (!targetPath) {
-    console.error('Error: "sm import" requires a <path> argument.');
-    process.exit(1);
+    throw new CliError('"sm import" requires a <path> argument.');
   }
 
-  const resolved = path.resolve(targetPath);
-  if (!fs.existsSync(resolved)) {
-    console.error(`Error: Source path does not exist: ${resolved}`);
-    process.exit(1);
-  }
-
-  const { db, dbPath } = getArchiveDb(args.flags);
-  console.log(`Importing from "${resolved}" into archive "${dbPath}"...`);
-
-  const stat = fs.statSync(resolved);
-  const now = Date.now();
-  const fileHash = crypto.createHash('sha256').update(resolved + stat.mtimeMs).digest('hex');
-
-  // Detect provider
-  let provider = 'generic-json';
-  const lower = resolved.toLowerCase();
-  if (lower.includes('codex')) provider = 'codex-local';
-  else if (lower.includes('dsh')) provider = 'dsh-local';
-  else if (lower.includes('claude')) provider = 'claude-code-local';
-  else if (lower.includes('chatgpt') || lower.includes('openai')) provider = 'openai-web';
-  else if (lower.includes('anthropic')) provider = 'anthropic-web';
-  else if (lower.includes('deepseek')) provider = 'deepseek-web';
-
-  // Check for previous batch to compute diff report
-  const prevBatchStmt = db.prepare('SELECT id, stats_json FROM import_batch WHERE status = ? ORDER BY id DESC LIMIT 1');
-  const prevBatch = prevBatchStmt.get('ok') as { id: number; stats_json: string } | undefined;
-
-  // Insert import_batch record
-  const insertBatchStmt = db.prepare(`
-    INSERT INTO import_batch (provider, adapter_id, adapter_version, kind, source_path, source_sha256, imported_at, status)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `);
-  const batchKind = stat.isDirectory() ? 'local_dir' : 'single_file';
-  const batchRes = insertBatchStmt.run(provider, `${provider}-adapter`, '1.0.0', batchKind, resolved, fileHash, now, 'running');
-  const batchId = Number(batchRes.lastInsertRowid);
-
-  // Discover and parse conversations
-  const files = stat.isDirectory() ? walkFiles(resolved, 100) : [resolved];
-  let importedConvs = 0;
-  let importedItems = 0;
-  let importedBlobs = 0;
-
-  db.exec('BEGIN TRANSACTION;');
+  const src = resolveSourceRef(targetPath);
+  const { registry } = resolveKindRegistry(args.flags['kind']);
+  const isJson = Boolean(args.flags['json']);
+  const { service, dbPath } = openCliArchive(args.flags, registry);
 
   try {
-    for (const file of files) {
-      const rel = path.relative(resolved, file) || path.basename(file);
-      const fstat = fs.statSync(file);
-      const fsha = crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+    const result: PipelineResult = await service.importSource(src, { registry });
+    const batch = result.batchId != null ? service.repository.getBatch(result.batchId) : null;
+    const stats = parseJsonObject(batch?.stats_json ?? null);
+    const diff = result.report.diff;
 
-      db.prepare(`
-        INSERT INTO import_file (batch_id, rel_path, sha256, size, mtime, role, parsed_ok)
-        VALUES (?, ?, ?, ?, ?, ?, 1)
-      `).run(batchId, rel, fsha, fstat.size, Math.floor(fstat.mtimeMs), 'conversations');
-
-      // Synthesize conversation representation from file
-      const convExternalId = `conv-${fsha.slice(0, 16)}`;
-      const title = path.basename(file, path.extname(file));
-      const summary = `Imported session from ${rel}`;
-
-      // Mock turns for realistic demo
-      const userText = normalizeText(`Hello, analyze project file ${rel}`);
-      const asstText = normalizeText(`Understood! I have processed ${rel} (${formatBytes(fstat.size)}). Everything looks solid.`);
-
-      const item1Hash = computeSemanticItemHash({
-        role: 'user',
-        kind: 'message',
-        blocks: [{ idx: 0, type: 'text', text: userText }],
-      });
-      const item2Hash = computeSemanticItemHash({
-        role: 'assistant',
-        kind: 'message',
-        blocks: [{ idx: 0, type: 'text', text: asstText }],
-      });
-
-      const merkleRoot = computeConversationMerkleHash([item1Hash, item2Hash]);
-      const minHashFp = computeMinHashFingerprint([item1Hash, item2Hash]);
-
-      const convRes = db.prepare(`
-        INSERT INTO conversation (
-          provider, external_id, title, title_source, summary, created_at, updated_at,
-          item_count, char_count, head_hash, content_hash, fingerprint,
-          first_batch_id, last_batch_id, raw_format
-        ) VALUES (?, ?, ?, 'first_user', ?, ?, ?, 2, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        provider,
-        convExternalId,
-        title,
-        summary,
-        now,
-        now,
-        userText.length + asstText.length,
-        item1Hash,
-        merkleRoot,
-        minHashFp,
-        batchId,
-        batchId,
-        provider
-      );
-
-      const convId = Number(convRes.lastInsertRowid);
-
-      // Insert Items (native view blocks stored inline in blocks_json)
-      db.prepare(`
-        INSERT INTO item (
-          conversation_id, external_id, ordinal, depth, role, kind, created_at,
-          text, text_len, content_hash, is_active_branch, blocks_json
-        )
-        VALUES (?, ?, 0, 0, 'user', 'message', ?, ?, ?, ?, 1, ?)
-      `).run(
-        convId,
-        `${convExternalId}-m0`,
-        now,
-        userText,
-        userText.length,
-        item1Hash,
-        JSON.stringify([{ idx: 0, type: 'text', text: userText }])
-      );
-
-      db.prepare(`
-        INSERT INTO item (
-          conversation_id, external_id, ordinal, depth, role, kind, created_at,
-          text, text_len, content_hash, is_active_branch, blocks_json
-        )
-        VALUES (?, ?, 1, 1, 'assistant', 'message', ?, ?, ?, ?, 1, ?)
-      `).run(
-        convId,
-        `${convExternalId}-m1`,
-        now + 1000,
-        asstText,
-        asstText.length,
-        item2Hash,
-        JSON.stringify([{ idx: 0, type: 'text', text: asstText }])
-      );
-
-      importedConvs++;
-      importedItems += 2;
+    const decisionCounts: Record<string, number> = {};
+    for (const d of result.decisions) {
+      decisionCounts[d.decision] = (decisionCounts[d.decision] ?? 0) + 1;
     }
 
-    // Build batch diff & integrity report
-    const diffStats = {
-      previous_batch_id: prevBatch?.id ?? null,
-      added_conversations: importedConvs,
-      grown_conversations: 0,
-      shrunk_conversations: 0,
-      shrunk_conversation_ids: [] as string[],
-      disappeared_conversations: 0,
-      identical_conversations: 0,
-      ambiguous_candidates: 0,
-    };
+    const totalItems =
+      typeof stats['items'] === 'number'
+        ? stats['items']
+        : result.sessions.reduce((sum, s) => sum + s.getMeta().message_count, 0);
+    const totalBlobs = typeof stats['blobs'] === 'number' ? stats['blobs'] : 0;
 
-    const statsJson = JSON.stringify({
-      files: files.length,
-      conversations: importedConvs,
-      items: importedItems,
-      blobs: importedBlobs,
-      bytes: stat.size,
-    });
+    if (isJson) {
+      console.log(
+        JSON.stringify(
+          {
+            dbPath,
+            batchId: result.batchId ?? null,
+            provider: result.report.provider,
+            adapterId: result.adapterId,
+            adapterVersion: result.adapterVersion,
+            sourceSha256: result.sourceSha256,
+            skipped_identical_batch: Boolean(result.skipped_identical_batch),
+            conversations: result.sessions.length,
+            items: totalItems,
+            blobs: totalBlobs,
+            decisions: decisionCounts,
+            diff: diff ?? null,
+            issuesCount: result.report.issues.length,
+          },
+          null,
+          2
+        )
+      );
+      return;
+    }
 
-    const reportJson = JSON.stringify({
-      schema_version: 'v1',
-      provider,
-      adapter_id: `${provider}-adapter`,
-      adapter_version: '1.0.0',
-      generated_at: now,
-      issues: [],
-      diff: diffStats,
-    });
+    if (result.skipped_identical_batch) {
+      console.log(
+        `\n✔ L0 idempotent skip: source already imported in Batch #${result.batchId} (${result.report.provider}, sha256=${result.sourceSha256.slice(0, 12)}..., 0 new conversations).`
+      );
+      if (diff) {
+        console.log(
+          `  Previous Diff:  +${diff.added_conversations} added, ~${diff.grown_conversations} grown, !${diff.shrunk_conversations} shrunk, =${diff.identical_conversations} identical`
+        );
+      }
+      console.log('');
+      return;
+    }
 
-    db.prepare(`
-      UPDATE import_batch
-      SET status = 'ok', stats_json = ?, report_json = ?
-      WHERE id = ?
-    `).run(statsJson, reportJson, batchId);
-
-    db.exec('COMMIT;');
-
-    console.log(`\n✔ Import succeeded! (Batch #${batchId})`);
-    console.log(`  Provider:       ${provider}`);
-    console.log(`  Conversations:  ${importedConvs}`);
-    console.log(`  Items:          ${importedItems}`);
-    console.log(`  Diff Stats:     +${diffStats.added_conversations} added, ${diffStats.shrunk_conversations} shrunk`);
-  } catch (err: unknown) {
-    db.exec('ROLLBACK;');
-    db.prepare(`UPDATE import_batch SET status = 'failed' WHERE id = ?`).run(batchId);
-    const msg = err instanceof Error ? err.message : String(err);
-    console.error(`Import failed: ${msg}`);
-    process.exit(1);
+    console.log(`\n✔ Import succeeded! (Batch #${result.batchId}) -> "${dbPath}"`);
+    console.log(`  Provider:       ${result.report.provider} (${result.adapterId}@${result.adapterVersion})`);
+    console.log(`  Source SHA256:  ${result.sourceSha256.slice(0, 16)}...`);
+    console.log(`  Conversations:  ${result.sessions.length}`);
+    console.log(`  Items:          ${totalItems}`);
+    console.log(`  Blobs:          ${totalBlobs}`);
+    if (Object.keys(decisionCounts).length > 0) {
+      const summary = Object.entries(decisionCounts)
+        .map(([k, v]) => `${k}=${v}`)
+        .join(', ');
+      console.log(`  Decisions:      ${summary}`);
+    }
+    if (diff) {
+      console.log(
+        `  Diff Stats:     +${diff.added_conversations} added, ~${diff.grown_conversations} grown, !${diff.shrunk_conversations} shrunk, =${diff.identical_conversations} identical`
+      );
+      if (diff.shrunk_conversations > 0) {
+        console.log(
+          `  ⚠ Shrunk IDs:   ${diff.shrunk_conversation_ids.join(', ')}`
+        );
+      }
+    }
+    if (result.report.issues.length > 0) {
+      const errors = result.report.issues.filter((i) => i.severity === 'error').length;
+      const warns = result.report.issues.filter((i) => i.severity === 'warn').length;
+      console.log(`  Issues:         ${result.report.issues.length} (${errors} error, ${warns} warn)`);
+    }
+    console.log('');
+  } finally {
+    service.close();
   }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 3. Subcommand: sm ls [--provider <id>] [--limit <n>]
+// 3. Subcommand: sm ls [--provider <id>] [--limit <n>] [--db <archive.db>]
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function runList(args: ParsedArgs): Promise<void> {
-  const { db } = getArchiveDb(args.flags);
-  const provider = args.flags['provider'] as string | undefined;
-  const limitParam = args.flags['limit'] as string | undefined;
-  const limit = Math.min(Math.max(parseInt(limitParam ?? '25', 10) || 25, 1), 100);
+  const provider = typeof args.flags['provider'] === 'string' ? args.flags['provider'] : undefined;
+  const limitParam = typeof args.flags['limit'] === 'string' ? args.flags['limit'] : undefined;
+  const limit = Math.min(Math.max(parseInt(limitParam ?? '25', 10) || 25, 1), 500);
+  const isJson = Boolean(args.flags['json']);
 
-  const conditions: string[] = ['deleted_at IS NULL'];
-  const params: (string | number)[] = [];
+  const { service } = openCliArchive(args.flags);
+  try {
+    const rows = service.listConversations({ provider, limit });
 
-  if (provider) {
-    conditions.push('provider = ?');
-    params.push(provider);
+    if (isJson) {
+      console.log(JSON.stringify(rows, null, 2));
+      return;
+    }
+
+    if (rows.length === 0) {
+      console.log('No conversations found in archive.');
+      return;
+    }
+
+    console.log('\nID   Provider          Items  Revs  Updated              Title [Head Hash]');
+    console.log('─'.repeat(92));
+    for (const r of rows) {
+      const id = String(r.id).padEnd(4);
+      const prov = r.provider.slice(0, 16).padEnd(17);
+      const items = String(r.item_count).padStart(5);
+      const revs = String(r.revision_count).padStart(4);
+      const updated = r.updated_at
+        ? new Date(r.updated_at).toISOString().slice(0, 19).replace('T', ' ')
+        : 'N/A'.padEnd(19);
+      const title = (r.title ?? 'Untitled').slice(0, 32);
+      const hash = r.head_hash ? ` [${r.head_hash.slice(0, 8)}]` : '';
+      console.log(`${id} ${prov} ${items}  ${revs}  ${updated}  ${title}${hash}`);
+    }
+    console.log('─'.repeat(92));
+    console.log(`Showing ${rows.length} conversation(s).\n`);
+  } finally {
+    service.close();
   }
-
-  const where = `WHERE ${conditions.join(' AND ')}`;
-  const stmt = db.prepare(`
-    SELECT id, provider, title, item_count, updated_at, head_hash
-    FROM conversation
-    ${where}
-    ORDER BY updated_at DESC, id DESC
-    LIMIT ?
-  `);
-
-  const rows = stmt.all(...params, limit) as {
-    id: number;
-    provider: string;
-    title: string | null;
-    item_count: number;
-    updated_at: number | null;
-    head_hash: string | null;
-  }[];
-
-  if (rows.length === 0) {
-    console.log('No conversations found in archive.');
-    return;
-  }
-
-  console.log('\nID   Provider          Items  Updated               Title (Head Hash)');
-  console.log('─'.repeat(80));
-  for (const r of rows) {
-    const id = String(r.id).padEnd(4);
-    const prov = r.provider.slice(0, 16).padEnd(17);
-    const items = String(r.item_count).padStart(5);
-    const updated = r.updated_at ? new Date(r.updated_at).toISOString().slice(0, 19).replace('T', ' ') : 'N/A';
-    const title = (r.title ?? 'Untitled').slice(0, 32);
-    const hash = r.head_hash ? ` [${r.head_hash.slice(0, 8)}]` : '';
-    console.log(`${id} ${prov} ${items}  ${updated}  ${title}${hash}`);
-  }
-  console.log('─'.repeat(80));
-  console.log(`Showing ${rows.length} conversation(s).\n`);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 4. Subcommand: sm search <query>
+// 4. Subcommand: sm show <id> [--all-branches] [--include-synthetic] [--json]
+// ─────────────────────────────────────────────────────────────────────────────
+
+function resolveConversationByArg(service: ArchiveService, idArg: string): ConversationRow | null {
+  if (/^\d+$/.test(idArg.trim())) {
+    const byId = service.repository.getConversationById(parseInt(idArg.trim(), 10));
+    if (byId) return byId;
+  }
+  const stmt = service.db.prepare(
+    `SELECT * FROM conversation WHERE external_id = ? AND deleted_at IS NULL LIMIT 1`
+  );
+  const byExt = stmt.get(idArg.trim()) as ConversationRow | undefined;
+  return byExt ?? null;
+}
+
+async function runShow(args: ParsedArgs): Promise<void> {
+  const idArg = args.positional[0];
+  if (!idArg) {
+    throw new CliError('"sm show" requires a <id> argument.');
+  }
+
+  const allBranches = Boolean(args.flags['all-branches']);
+  const includeSynthetic = Boolean(args.flags['include-synthetic']);
+  const isJson = Boolean(args.flags['json']);
+
+  const { service } = openCliArchive(args.flags);
+  try {
+    const conv = resolveConversationByArg(service, idArg);
+    if (!conv) {
+      throw new CliError(`Conversation "${idArg}" not found.`);
+    }
+
+    const revisions = service.repository.getConversationRevisions(conv.id);
+    const allItems = service.repository.getConversationItems(conv.id, false);
+    const inactiveBranchCount = allItems.filter((i) => i.is_active_branch === 0).length;
+    const syntheticCount = allItems.filter((i) => i.is_synthetic === 1).length;
+
+    const branchFiltered = allBranches
+      ? allItems
+      : allItems.filter((i) => i.is_active_branch === 1);
+
+    // Preload referenced blob rows for display
+    const blobShas = collectBlobShasFromItems(conv, allItems);
+    const blobMap = new Map<string, BlobRow>();
+    for (const sha of blobShas) {
+      const row = service.repository.getBlobBySha256(sha);
+      if (row) blobMap.set(sha, row);
+    }
+
+    if (isJson) {
+      const visibleItems = includeSynthetic
+        ? branchFiltered
+        : branchFiltered.filter((i) => i.is_synthetic === 0);
+      console.log(
+        JSON.stringify(
+          {
+            conversation: conv,
+            revisions: revisions.map((r) => ({
+              ...r,
+              diff: r.diff_json ? parseJsonObject(r.diff_json) : null,
+            })),
+            items: visibleItems.map((item) => ({
+              ...item,
+              is_active_branch: item.is_active_branch === 1,
+              is_hidden: item.is_hidden === 1,
+              is_synthetic: item.is_synthetic === 1,
+              blocks: parseJsonArray<ViewBlock>(item.blocks_json),
+              flags: item.flags_json ? parseJsonObject(item.flags_json) : null,
+            })),
+            blobs: Object.fromEntries(blobMap.entries()),
+            stats: {
+              total_items: allItems.length,
+              inactive_branch_count: inactiveBranchCount,
+              synthetic_count: syntheticCount,
+              displayed_count: visibleItems.length,
+            },
+          },
+          null,
+          2
+        )
+      );
+      return;
+    }
+
+    console.log('\n=== Conversation Detail ===');
+    console.log(`ID:            #${conv.id}`);
+    console.log(`Provider:      ${conv.provider} (raw_format=${conv.raw_format ?? 'N/A'})`);
+    console.log(`External ID:   ${conv.external_id ?? 'N/A'}`);
+    console.log(`Title:         ${conv.title ?? 'Untitled'} (source=${conv.title_source ?? 'N/A'})`);
+    console.log(`Model:         ${conv.default_model ?? 'N/A'}`);
+    if (conv.cwd) console.log(`CWD:           ${conv.cwd}`);
+    console.log(
+      `Timestamps:    created=${formatTs(conv.created_at)} | updated=${formatTs(conv.updated_at)} | exported=${formatTs(conv.exported_at)}`
+    );
+    console.log(
+      `Counts:        items=${conv.item_count}, chars=${conv.char_count}, blobs=${conv.blob_count}, revisions=${conv.revision_count}`
+    );
+    console.log(`Head Hash:     ${conv.head_hash ?? 'N/A'}`);
+    console.log(`Content Hash:  ${conv.content_hash ?? 'N/A'}`);
+    if (conv.raw_blob_sha256) {
+      const rawBlob = blobMap.get(conv.raw_blob_sha256);
+      console.log(
+        `Raw Session:   blob:${conv.raw_blob_sha256}${rawBlob ? ` (${rawBlob.rel_path}, ${formatBytes(rawBlob.bytes)})` : ''}`
+      );
+    }
+
+    console.log('\n--- Revision History ---');
+    if (revisions.length === 0) {
+      console.log('  (no revision records)');
+    } else {
+      for (const rev of revisions) {
+        const diffObj = rev.diff_json ? parseJsonObject(rev.diff_json) : null;
+        const diffStatus = diffObj && typeof diffObj['status'] === 'string' ? ` [${diffObj['status']}]` : '';
+        console.log(
+          `  Rev #${rev.revision_no} | batch=#${rev.batch_id ?? '-'} | items=${rev.item_count ?? '-'} | chars=${rev.char_count ?? '-'} | hash=${rev.content_hash.slice(0, 12)}...${diffStatus}`
+        );
+      }
+    }
+
+    console.log('\n--- Items & Branches ---');
+    if (!allBranches && inactiveBranchCount > 0) {
+      console.log(
+        `  (${inactiveBranchCount} inactive/superseded branch item(s) hidden; pass --all-branches to show)`
+      );
+    }
+
+    let collapsedSyntheticRun: ItemRow[] = [];
+    const flushSyntheticRun = () => {
+      if (collapsedSyntheticRun.length === 0) return;
+      const kinds = [...new Set(collapsedSyntheticRun.map((x) => x.kind))].join(', ');
+      console.log(
+        `  [synthetic] Collapsed ${collapsedSyntheticRun.length} synthetic item(s) (kinds: ${kinds}; pass --include-synthetic to expand)`
+      );
+      collapsedSyntheticRun = [];
+    };
+
+    for (const item of branchFiltered) {
+      if (!includeSynthetic && item.is_synthetic === 1) {
+        collapsedSyntheticRun.push(item);
+        continue;
+      }
+      flushSyntheticRun();
+
+      const indent = '  '.repeat(Math.min(item.depth, 6) + 1);
+      const flags = parseJsonObject(item.flags_json);
+      const branchTag =
+        item.is_active_branch === 1
+          ? 'active'
+          : typeof flags['superseded_by'] === 'string'
+            ? `side-branch superseded_by=${flags['superseded_by']}`
+            : 'side-branch';
+      const badges = [`[${branchTag}]`];
+      if (item.is_synthetic === 1) badges.push('[synthetic]');
+      if (item.is_hidden === 1) badges.push('[hidden]');
+      const modelStr = item.model ? ` (${item.model})` : '';
+      const extStr = item.external_id ? ` id=${item.external_id}` : '';
+      const toolStr = item.tool_name ? ` tool=${item.tool_name}` : '';
+
+      console.log(
+        `${indent}#${item.ordinal} ${badges.join(' ')} ${item.role}/${item.kind}${modelStr}${toolStr}${extStr}`
+      );
+
+      if (item.text && item.text.trim().length > 0) {
+        const preview = item.text.length > 300 ? `${item.text.slice(0, 300)}...` : item.text;
+        console.log(`${indent}  ${preview.replace(/\r?\n/g, `\n${indent}  `)}`);
+      }
+
+      const blocks = parseJsonArray<ViewBlock>(item.blocks_json);
+      for (const b of blocks) {
+        if (b.type === 'tool_use') {
+          const inputPreview = b.tool_input
+            ? b.tool_input.length > 120
+              ? `${b.tool_input.slice(0, 120)}...`
+              : b.tool_input
+            : '';
+          const spillRef = b.blob_sha256 ? ` blob:${b.blob_sha256}` : '';
+          console.log(
+            `${indent}  [tool_call] ${b.tool_name ?? 'tool'}${b.tool_call_id ? ` (${b.tool_call_id})` : ''}${spillRef}${inputPreview ? ` ${inputPreview}` : ''}`
+          );
+        } else if (b.type === 'tool_result') {
+          const spillRef = b.blob_sha256 ? ` blob:${b.blob_sha256}` : '';
+          console.log(
+            `${indent}  [tool_result] status=${b.status ?? 'ok'}${spillRef}`
+          );
+        } else if (b.blob_sha256) {
+          const blob = blobMap.get(b.blob_sha256);
+          console.log(
+            `${indent}  [blob:${b.type}] sha256=${b.blob_sha256} avail=${b.availability ?? 'full'}${blob ? ` (${blob.mime}, ${blob.rel_path})` : ''}`
+          );
+        }
+      }
+
+      if (item.payload_ref) {
+        const blob = blobMap.get(item.payload_ref);
+        console.log(
+          `${indent}  [payload_ref] blob:${item.payload_ref}${blob ? ` (${blob.rel_path}, ${formatBytes(blob.bytes)})` : ''}`
+        );
+      }
+    }
+    flushSyntheticRun();
+    console.log('===========================\n');
+  } finally {
+    service.close();
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 5. Subcommand: sm search <query> [--limit <n>] [--provider <id>]
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function runSearch(args: ParsedArgs): Promise<void> {
-  const query = args.positional.join(' ');
-  if (!query.trim()) {
-    console.error('Error: "sm search" requires a <query> string.');
-    process.exit(1);
+  const query = args.positional.join(' ').trim();
+  if (!query) {
+    throw new CliError('"sm search" requires a <query> string.');
   }
 
-  const { db } = getArchiveDb(args.flags);
-  const pattern = `%${query.trim()}%`;
+  const limitParam = typeof args.flags['limit'] === 'string' ? args.flags['limit'] : undefined;
+  const limit = Math.min(Math.max(parseInt(limitParam ?? '20', 10) || 20, 1), 200);
+  const provider = typeof args.flags['provider'] === 'string' ? args.flags['provider'] : undefined;
+  const role = typeof args.flags['role'] === 'string' ? args.flags['role'] : undefined;
+  const isJson = Boolean(args.flags['json']);
 
-  const stmt = db.prepare(`
-    SELECT i.id as item_id, i.conversation_id, i.role, i.text, c.title, c.provider
-    FROM item i
-    JOIN conversation c ON i.conversation_id = c.id
-    WHERE c.deleted_at IS NULL AND (i.text LIKE ? OR c.title LIKE ?)
-    ORDER BY i.created_at DESC
-    LIMIT 20
-  `);
+  const { service } = openCliArchive(args.flags);
+  try {
+    const result = service.search(query, {
+      limit,
+      provider,
+      role,
+      includeSynthetic: true,
+      downweightSynthetic: true,
+    });
 
-  const rows = stmt.all(pattern, pattern) as {
-    item_id: number;
-    conversation_id: number;
-    role: string;
-    text: string | null;
-    title: string | null;
-    provider: string;
-  }[];
-
-  console.log(`\nSearch results for "${query}":`);
-  console.log('─'.repeat(80));
-
-  if (rows.length === 0) {
-    console.log('No matches found.');
-    return;
-  }
-
-  for (const r of rows) {
-    const rawText = r.text ?? '';
-    const idx = rawText.toLowerCase().indexOf(query.toLowerCase());
-    let snippet = rawText;
-    if (idx >= 0) {
-      const s = Math.max(0, idx - 30);
-      const e = Math.min(rawText.length, idx + 70);
-      snippet = (s > 0 ? '...' : '') + rawText.slice(s, e) + (e < rawText.length ? '...' : '');
-    } else {
-      snippet = rawText.slice(0, 80) + '...';
+    if (isJson) {
+      console.log(JSON.stringify(result, null, 2));
+      return;
     }
 
-    console.log(`[Conv #${r.conversation_id}] (${r.provider}) "${r.title ?? 'Untitled'}" - [${r.role}]`);
-    console.log(`  Hit: ${snippet}\n`);
+    console.log(
+      `\nSearch results for "${result.query}" (strategy: ${result.strategy}, total: ${result.total}):`
+    );
+    console.log('─'.repeat(84));
+
+    if (result.hits.length === 0) {
+      console.log('No matches found.\n');
+      return;
+    }
+
+    for (const h of result.hits) {
+      const synthBadge = h.is_synthetic ? ' [synthetic]' : '';
+      const toolBadge = h.tool_name ? ` (tool: ${h.tool_name})` : '';
+      console.log(
+        `[Conv #${h.conversation_id}] (${h.provider}) "${h.conversation_title ?? 'Untitled'}" - [${h.role}/${h.kind}]${synthBadge}${toolBadge} [strategy=${result.strategy}, source=${h.match_source}, score=${h.score.toFixed(3)}]`
+      );
+      console.log(`  Hit: ${h.snippet.replace(/\r?\n/g, ' ')}\n`);
+    }
+    console.log(`Showing ${result.hits.length} of ${result.total} hit(s).\n`);
+  } finally {
+    service.close();
   }
-  console.log(`Found ${rows.length} hit(s).\n`);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 5. Subcommand: sm verify [--batch <id>]
+// 6. Subcommand: sm verify [--batch <id>] [--out <path>] [--db <archive.db>]
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function runVerify(args: ParsedArgs): Promise<void> {
-  const { db } = getArchiveDb(args.flags);
-  const batchIdParam = args.flags['batch'] as string | undefined;
+  const batchParam = typeof args.flags['batch'] === 'string' ? args.flags['batch'] : undefined;
+  const outParam = typeof args.flags['out'] === 'string' ? args.flags['out'] : undefined;
+  const isJson = Boolean(args.flags['json']);
 
-  console.log('\n=== Session Manager Integrity Verification ===');
-
-  // Check 1: Orphan items
-  const orphanStmt = db.prepare(`
-    SELECT count(*) as count FROM item
-    WHERE parent_id IS NOT NULL AND parent_id NOT IN (SELECT id FROM item)
-  `);
-  const orphans = (orphanStmt.get() as { count: number }).count;
-  console.log(`- Orphan Nodes:              ${orphans === 0 ? '✓ None' : `⚠ ${orphans} detected`}`);
-
-  // Check 2: Time anomalies
-  const timeStmt = db.prepare(`
-    SELECT count(*) as count FROM conversation
-    WHERE created_at > updated_at OR created_at < 0
-  `);
-  const timeAnomalies = (timeStmt.get() as { count: number }).count;
-  console.log(`- Timestamp Anomalies:       ${timeAnomalies === 0 ? '✓ None' : `⚠ ${timeAnomalies} detected`}`);
-
-  // Check 3: Batches and diff stats
-  let batchQuery = 'SELECT id, provider, imported_at, status, report_json FROM import_batch';
-  const params: (string | number)[] = [];
-  if (batchIdParam) {
-    batchQuery += ' WHERE id = ?';
-    params.push(parseInt(batchIdParam, 10));
-  } else {
-    batchQuery += ' ORDER BY id DESC LIMIT 5';
-  }
-
-  const batches = db.prepare(batchQuery).all(...params) as {
-    id: number;
-    provider: string;
-    imported_at: number;
-    status: string;
-    report_json: string | null;
-  }[];
-
-  console.log('\n--- Batch Verification & Diff Summaries ---');
-  for (const b of batches) {
-    const report = b.report_json ? JSON.parse(b.report_json) : null;
-    const diff = report?.diff;
-    console.log(`Batch #${b.id} (${b.provider}) - Status: ${b.status}`);
-    if (diff) {
-      console.log(`  + Added:       ${diff.added_conversations}`);
-      console.log(`  ~ Grown:       ${diff.grown_conversations}`);
-      if (diff.shrunk_conversations > 0) {
-        console.log(`  ⚠ SHRUNK:     ${diff.shrunk_conversations} (Upstream content was pruned or deleted!)`);
-      } else {
-        console.log(`  ✓ Shrunk:      0 (No upstream loss)`);
-      }
-      console.log(`  = Identical:   ${diff.identical_conversations}`);
+  let batchId: number | undefined;
+  if (batchParam !== undefined) {
+    batchId = parseInt(batchParam, 10);
+    if (!Number.isFinite(batchId) || batchId <= 0) {
+      throw new CliError(`Invalid --batch id: "${batchParam}"`);
     }
   }
-  console.log('==============================================\n');
-}
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 6. Subcommand: sm dedupe
-// ─────────────────────────────────────────────────────────────────────────────
+  const { service } = openCliArchive(args.flags);
+  try {
+    if (batchId !== undefined && !service.repository.getBatch(batchId)) {
+      throw new CliError(`Import batch #${batchId} not found.`);
+    }
 
-async function runDedupe(args: ParsedArgs): Promise<void> {
-  const { db } = getArchiveDb(args.flags);
+    const verification = service.verify(batchId);
 
-  console.log('\n=== Session Manager Deduplication Scanner ===');
+    // Check blobs on disk & dangling blob references
+    const allBlobs = service.db
+      .prepare(`SELECT * FROM blob ORDER BY id ASC`)
+      .all() as unknown as BlobRow[];
+    const blobShaSet = new Set(allBlobs.map((b) => b.sha256));
+    const missingBlobsOnDisk: { sha256: string; rel_path: string }[] = [];
+    for (const b of allBlobs) {
+      if (!service.blobStore.hasBlob(b.rel_path)) {
+        missingBlobsOnDisk.push({ sha256: b.sha256, rel_path: b.rel_path });
+      }
+    }
 
-  // Exact duplicate detection (L0 / L1: same content_hash)
-  const exactStmt = db.prepare(`
-    SELECT content_hash, count(*) as count, group_concat(id) as ids
-    FROM conversation
-    WHERE content_hash IS NOT NULL AND deleted_at IS NULL
-    GROUP BY content_hash
-    HAVING count > 1
-  `);
-  const exactDups = exactStmt.all() as { content_hash: string; count: number; ids: string }[];
+    const missingBlobRefs: { source: string; sha256: string }[] = [];
+    const convBlobs = service.db
+      .prepare(`SELECT id, raw_blob_sha256 FROM conversation WHERE deleted_at IS NULL AND raw_blob_sha256 IS NOT NULL`)
+      .all() as { id: number; raw_blob_sha256: string }[];
+    for (const cb of convBlobs) {
+      if (!blobShaSet.has(cb.raw_blob_sha256)) {
+        missingBlobRefs.push({ source: `conversation:${cb.id}`, sha256: cb.raw_blob_sha256 });
+      }
+    }
 
-  console.log(`- Exact Duplicate Clusters: ${exactDups.length}`);
-  for (const d of exactDups) {
-    console.log(`  Hash ${d.content_hash.slice(0, 16)}... -> ${d.count} conversations (IDs: ${d.ids})`);
-  }
-
-  // Near-duplicate candidates via MinHash Jaccard
-  const convsStmt = db.prepare(`
-    SELECT id, title, fingerprint FROM conversation
-    WHERE fingerprint IS NOT NULL AND deleted_at IS NULL
-    LIMIT 200
-  `);
-  const convs = convsStmt.all() as { id: number; title: string | null; fingerprint: string }[];
-
-  let candidateCount = 0;
-  console.log('\n- Approximate Duplicate Candidates (Similarity >= 75%):');
-
-  for (let i = 0; i < convs.length; i++) {
-    for (let j = i + 1; j < convs.length; j++) {
-      const a = convs[i];
-      const b = convs[j];
-      if (!a || !b) continue;
-
-      const sim = estimateJaccardSimilarity(a.fingerprint, b.fingerprint);
-      if (sim >= 0.75) {
-        candidateCount++;
-        console.log(`  [${(sim * 100).toFixed(1)}%] Conv #${a.id} ("${a.title ?? ''}") vs Conv #${b.id} ("${b.title ?? ''}")`);
-
-        // Record into dedupe_candidate table if not exists
-        try {
-          db.prepare(`
-            INSERT OR IGNORE INTO dedupe_candidate (a_id, b_id, similarity, reason, created_at)
-            VALUES (?, ?, ?, 'fingerprint', ?)
-          `).run(Math.min(a.id, b.id), Math.max(a.id, b.id), sim, Date.now());
-        } catch {
-          // ignore duplicate pair constraint
+    const itemPayloads = service.db
+      .prepare(`SELECT id, payload_ref, blocks_json FROM item WHERE payload_ref IS NOT NULL OR blocks_json IS NOT NULL`)
+      .all() as { id: number; payload_ref: string | null; blocks_json: string | null }[];
+    for (const it of itemPayloads) {
+      if (it.payload_ref && !blobShaSet.has(it.payload_ref)) {
+        missingBlobRefs.push({ source: `item:${it.id}:payload_ref`, sha256: it.payload_ref });
+      }
+      for (const block of parseJsonArray<ViewBlock>(it.blocks_json)) {
+        if (block.blob_sha256 && !blobShaSet.has(block.blob_sha256)) {
+          missingBlobRefs.push({ source: `item:${it.id}:block:${block.idx}`, sha256: block.blob_sha256 });
         }
       }
     }
-  }
 
-  if (candidateCount === 0) {
-    console.log('  No near-duplicate candidate pairs detected.');
+    const extraIssues: IntegrityIssue[] = [];
+    if (
+      verification.orphanItems > 0 &&
+      !verification.report.issues.some((i) => i.code === 'orphan_node')
+    ) {
+      extraIssues.push({
+        code: 'orphan_node',
+        severity: 'warn',
+        message: `Detected ${verification.orphanItems} item(s) referencing missing parent_id`,
+      });
+    }
+    if (
+      verification.timeAnomalies > 0 &&
+      !verification.report.issues.some((i) => i.code === 'time_anomaly')
+    ) {
+      extraIssues.push({
+        code: 'time_anomaly',
+        severity: 'warn',
+        message: `Detected ${verification.timeAnomalies} conversation(s) with timestamp anomalies`,
+      });
+    }
+    for (const mb of missingBlobsOnDisk) {
+      extraIssues.push({
+        code: 'orphan_blob_ref',
+        severity: 'error',
+        message: `Blob file missing on disk: ${mb.rel_path} (sha256=${mb.sha256})`,
+      });
+    }
+    for (const mr of missingBlobRefs) {
+      extraIssues.push({
+        code: 'orphan_blob_ref',
+        severity: 'error',
+        message: `Missing blob metadata for ${mr.source}: sha256=${mr.sha256}`,
+      });
+    }
+
+    const enrichedReport: IntegrityReport = {
+      ...verification.report,
+      issues: [...verification.report.issues, ...extraIssues],
+    };
+
+    const writtenReports: string[] = [];
+    if (outParam) {
+      const resolvedOut = path.resolve(outParam);
+      const lowerOut = resolvedOut.toLowerCase();
+      if (lowerOut.endsWith('.json')) {
+        fs.mkdirSync(path.dirname(resolvedOut), { recursive: true });
+        fs.writeFileSync(resolvedOut, formatIntegrityReportJson(enrichedReport), 'utf8');
+        writtenReports.push(resolvedOut);
+      } else if (lowerOut.endsWith('.md')) {
+        fs.mkdirSync(path.dirname(resolvedOut), { recursive: true });
+        fs.writeFileSync(resolvedOut, formatIntegrityReportMarkdown(enrichedReport), 'utf8');
+        writtenReports.push(resolvedOut);
+      } else {
+        fs.mkdirSync(resolvedOut, { recursive: true });
+        const jsonOut = path.join(resolvedOut, 'verify-report.json');
+        const mdOut = path.join(resolvedOut, 'verify-report.md');
+        fs.writeFileSync(jsonOut, formatIntegrityReportJson(enrichedReport), 'utf8');
+        fs.writeFileSync(mdOut, formatIntegrityReportMarkdown(enrichedReport), 'utf8');
+        writtenReports.push(jsonOut, mdOut);
+      }
+    }
+
+    const batchesToDisplay =
+      batchId !== undefined
+        ? [service.repository.getBatch(batchId)!]
+        : service.listBatches(5);
+
+    if (isJson) {
+      console.log(
+        JSON.stringify(
+          {
+            batchId: verification.batchId,
+            orphanItems: verification.orphanItems,
+            timeAnomalies: verification.timeAnomalies,
+            totalBlobs: allBlobs.length,
+            missingBlobsOnDisk,
+            missingBlobRefs,
+            report: enrichedReport,
+            writtenReports,
+          },
+          null,
+          2
+        )
+      );
+      return;
+    }
+
+    console.log('\n=== Session Manager Integrity Verification ===');
+    console.log(
+      `- Orphan Nodes:              ${verification.orphanItems === 0 ? '✓ None' : `⚠ ${verification.orphanItems} detected`}`
+    );
+    console.log(
+      `- Timestamp Anomalies:       ${verification.timeAnomalies === 0 ? '✓ None' : `⚠ ${verification.timeAnomalies} detected`}`
+    );
+    console.log(
+      `- Blobs Checked on Disk:     ${allBlobs.length} total, ${missingBlobsOnDisk.length === 0 && missingBlobRefs.length === 0 ? '✓ All present' : `⚠ ${missingBlobsOnDisk.length} missing on disk, ${missingBlobRefs.length} broken ref(s)`}`
+    );
+
+    if (missingBlobsOnDisk.length > 0) {
+      for (const mb of missingBlobsOnDisk) {
+        console.log(`  ! Missing blob: ${mb.rel_path} (${mb.sha256})`);
+      }
+    }
+
+    console.log('\n--- Batch Verification & Diff Summaries ---');
+    if (batchesToDisplay.length === 0) {
+      console.log('  (no import batches recorded)');
+    } else {
+      for (const b of batchesToDisplay) {
+        const rep = b.report_json ? (JSON.parse(b.report_json) as IntegrityReport) : null;
+        const diff = rep?.diff;
+        console.log(`Batch #${b.id} (${b.provider}) - Status: ${b.status}`);
+        if (diff) {
+          console.log(`  + Added:       ${diff.added_conversations}`);
+          console.log(`  ~ Grown:       ${diff.grown_conversations}`);
+          if (diff.shrunk_conversations > 0) {
+            console.log(
+              `  ⚠ SHRUNK:      ${diff.shrunk_conversations} (Upstream content deleted/pruned: ${diff.shrunk_conversation_ids.join(', ')})`
+            );
+          } else {
+            console.log(`  ✓ Shrunk:      0 (No upstream loss)`);
+          }
+          console.log(`  - Disappeared: ${diff.disappeared_conversations}`);
+          console.log(`  = Identical:   ${diff.identical_conversations}`);
+        }
+      }
+    }
+
+    if (writtenReports.length > 0) {
+      console.log('\n--- Exported Verification Report(s) ---');
+      for (const p of writtenReports) {
+        console.log(`  ✔ ${p}`);
+      }
+    }
+    console.log('==============================================\n');
+  } finally {
+    service.close();
   }
-  console.log('=============================================\n');
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 7. Subcommand: sm export --format native|md|jsonl --out <dir>
+// 7. Subcommand: sm dedupe [--db <archive.db>] [--json]
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function runDedupe(args: ParsedArgs): Promise<void> {
+  const isJson = Boolean(args.flags['json']);
+  const { service } = openCliArchive(args.flags);
+
+  try {
+    const exactClusters = service.db
+      .prepare(`
+        SELECT content_hash, count(*) AS count, group_concat(id) AS ids
+        FROM conversation
+        WHERE content_hash IS NOT NULL AND deleted_at IS NULL
+        GROUP BY content_hash
+        HAVING count > 1
+      `)
+      .all() as { content_hash: string; count: number; ids: string }[];
+
+    const candidateRows = service.listDedupeCandidates();
+    const enrichedCandidates = candidateRows.map((c) => {
+      const convA = service.repository.getConversationById(c.a_id);
+      const convB = service.repository.getConversationById(c.b_id);
+      return {
+        ...c,
+        a_provider: convA?.provider ?? null,
+        a_title: convA?.title ?? null,
+        a_external_id: convA?.external_id ?? null,
+        b_provider: convB?.provider ?? null,
+        b_title: convB?.title ?? null,
+        b_external_id: convB?.external_id ?? null,
+      };
+    });
+
+    if (isJson) {
+      console.log(
+        JSON.stringify(
+          {
+            exactDuplicateClusters: exactClusters,
+            dedupeCandidates: enrichedCandidates,
+          },
+          null,
+          2
+        )
+      );
+      return;
+    }
+
+    console.log('\n=== Session Manager Deduplication Scanner ===');
+    console.log(`- Exact Duplicate Clusters: ${exactClusters.length}`);
+    for (const d of exactClusters) {
+      console.log(
+        `  Hash ${d.content_hash.slice(0, 16)}... -> ${d.count} conversations (IDs: ${d.ids})`
+      );
+    }
+
+    console.log(`\n- Dedupe Candidate Pairs (${enrichedCandidates.length}):`);
+    if (enrichedCandidates.length === 0) {
+      console.log('  No dedupe_candidate pairs recorded.');
+    } else {
+      for (const c of enrichedCandidates) {
+        console.log(
+          `  #${c.id} [${(c.similarity * 100).toFixed(1)}% | ${c.status} | ${c.reason}] Conv #${c.a_id} ("${c.a_title ?? 'Untitled'}") <-> Conv #${c.b_id} ("${c.b_title ?? 'Untitled'}")`
+        );
+      }
+    }
+    console.log('=============================================\n');
+  } finally {
+    service.close();
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 8. Subcommand: sm export --format native|md|jsonl --out <dir>
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function runExport(args: ParsedArgs): Promise<void> {
-  const format = (args.flags['format'] as string) ?? 'native';
-  const outDir = args.flags['out'] as string;
+  const format = (typeof args.flags['format'] === 'string' ? args.flags['format'] : 'native').toLowerCase();
+  const outDir = typeof args.flags['out'] === 'string' ? args.flags['out'] : undefined;
+  const provider = typeof args.flags['provider'] === 'string' ? args.flags['provider'] : undefined;
 
   if (!outDir) {
-    console.error('Error: "sm export" requires --out <dir> parameter.');
-    process.exit(1);
+    throw new CliError('"sm export" requires --out <dir> parameter.');
+  }
+  if (format !== 'native' && format !== 'md' && format !== 'jsonl') {
+    throw new CliError(`Unsupported export format "${format}". Expected: native, md, jsonl`);
   }
 
-  const { db } = getArchiveDb(args.flags);
   const resolvedOut = path.resolve(outDir);
-  if (!fs.existsSync(resolvedOut)) {
-    fs.mkdirSync(resolvedOut, { recursive: true });
-  }
+  fs.mkdirSync(resolvedOut, { recursive: true });
 
-  const convStmt = db.prepare(`SELECT * FROM conversation WHERE deleted_at IS NULL`);
-  const convs = convStmt.all() as {
-    id: number;
-    provider: string;
-    title: string | null;
-    created_at: number | null;
-    updated_at: number | null;
-    content_hash: string | null;
-  }[];
+  const { service } = openCliArchive(args.flags);
+  try {
+    const convs = service.listConversations({ provider, limit: 100_000 });
+    console.log(`Exporting ${convs.length} conversation(s) to "${resolvedOut}" in format "${format}"...`);
 
-  console.log(`Exporting ${convs.length} conversation(s) to "${resolvedOut}" in format "${format}"...`);
+    const entries: {
+      conv: ConversationRow;
+      view: ConversationViewModel;
+      blobRows: BlobRow[];
+    }[] = [];
 
-  if (format === 'jsonl') {
-    const jsonlPath = path.join(resolvedOut, 'conversations.jsonl');
-    const stream = fs.createWriteStream(jsonlPath, { flags: 'w' });
-    for (const c of convs) {
-      const items = db.prepare(`SELECT * FROM item WHERE conversation_id = ? ORDER BY ordinal`).all(c.id);
-      stream.write(JSON.stringify({ ...c, items }) + '\n');
-    }
-    stream.end();
-    console.log(`✔ Written JSONL file: ${jsonlPath}`);
-  } else if (format === 'md') {
-    for (const c of convs) {
-      const safeTitle = (c.title ?? `conv_${c.id}`).replace(/[^a-zA-Z0-9_\u4e00-\u9fa5-]/g, '_');
-      const mdFile = path.join(resolvedOut, `${c.id}_${safeTitle}.md`);
-      const items = db.prepare(`SELECT * FROM item WHERE conversation_id = ? ORDER BY ordinal`).all(c.id) as {
-        role: string;
-        text: string | null;
-      }[];
+    const allBlobRowsBySha = new Map<string, BlobRow>();
 
-      let md = `---\nid: ${c.id}\ntitle: "${c.title ?? 'Untitled'}"\nprovider: ${c.provider}\ncreated_at: ${c.created_at}\n---\n\n`;
-      for (const item of items) {
-        md += `### ${item.role.toUpperCase()}\n\n${item.text ?? ''}\n\n`;
+    for (const conv of convs) {
+      const activeItems = service.repository.getConversationItems(conv.id, true);
+      const allItems = service.repository.getConversationItems(conv.id, false);
+      const { view, blobRows } = buildViewModelFromRows(service, conv, activeItems, allItems);
+      entries.push({ conv, view, blobRows });
+      for (const br of blobRows) {
+        allBlobRowsBySha.set(br.sha256, br);
       }
-      fs.writeFileSync(mdFile, md, 'utf8');
-    }
-    console.log(`✔ Exported ${convs.length} Markdown files to ${resolvedOut}`);
-  } else {
-    // Default Native Archive JSON format (per-provider slice + manifest)
-    const sessionsExportPath = path.join(resolvedOut, 'sessions.json');
-    const fullConvs = [];
-    for (const c of convs) {
-      const items = db.prepare(`SELECT * FROM item WHERE conversation_id = ? ORDER BY ordinal`).all(c.id);
-      fullConvs.push({ ...c, items });
     }
 
-    const manifest = {
-      format: 'sm-native-archive',
-      schema_version: '1.0.0',
-      exported_at: Date.now(),
-      generator: `sm-cli/${VERSION}`,
-      conversation_count: convs.length,
-      sessions_file: 'sessions.json',
-      blobs_dir: 'blobs',
-    };
+    if (format === 'md') {
+      for (const { conv, view } of entries) {
+        const safeTitle = (conv.title ?? `conv_${conv.id}`).replace(
+          /[^a-zA-Z0-9_\u4e00-\u9fa5-]/g,
+          '_'
+        );
+        const mdFile = path.join(resolvedOut, `${conv.id}_${safeTitle}.md`);
+        const md = formatConversationMarkdown(view);
+        fs.writeFileSync(mdFile, md, 'utf8');
+      }
+      console.log(`✔ Exported ${entries.length} Markdown file(s) to ${resolvedOut}`);
+      return;
+    }
 
-    fs.writeFileSync(sessionsExportPath, JSON.stringify(fullConvs, null, 2), 'utf8');
-    fs.writeFileSync(path.join(resolvedOut, 'native-manifest.json'), JSON.stringify(manifest, null, 2), 'utf8');
-    console.log(`✔ Exported native archive with manifest to ${resolvedOut}`);
+    if (format === 'jsonl') {
+      const jsonlPath = path.join(resolvedOut, 'conversations.jsonl');
+      const lines = entries.map(({ conv, view }) =>
+        JSON.stringify({
+          id: conv.id,
+          raw_blob_sha256: conv.raw_blob_sha256,
+          revision_count: conv.revision_count,
+          ...view,
+        })
+      );
+      fs.writeFileSync(jsonlPath, lines.length > 0 ? lines.join('\n') + '\n' : '', 'utf8');
+      console.log(`✔ Written JSONL file: ${jsonlPath}`);
+      return;
+    }
+
+    // format === 'native'
+    const allBlobAssets = [...allBlobRowsBySha.values()].map((br) =>
+      blobRowToAsset(br, normalizeExportBlobRelPath(br))
+    );
+    const manifest = exportNativeManifest(
+      entries.map((e) => e.view),
+      allBlobAssets,
+      {
+        generator: `sm-cli/${VERSION}`,
+        conversationsFile: 'conversations.jsonl',
+        blobsDir: 'blobs',
+      }
+    );
+
+    const jsonlPath = path.join(resolvedOut, 'conversations.jsonl');
+    const jsonlLines = entries.map(({ conv, view }) =>
+      JSON.stringify({
+        id: conv.id,
+        raw_blob_sha256: conv.raw_blob_sha256,
+        revision_count: conv.revision_count,
+        ...view,
+      })
+    );
+    fs.writeFileSync(jsonlPath, jsonlLines.length > 0 ? jsonlLines.join('\n') + '\n' : '', 'utf8');
+
+    const sessionsPayload = entries.map(({ conv, view }) => {
+      const rawBlob = conv.raw_blob_sha256 ? allBlobRowsBySha.get(conv.raw_blob_sha256) : undefined;
+      return {
+        id: conv.id,
+        provider: conv.provider,
+        external_id: conv.external_id,
+        raw_format: conv.raw_format,
+        raw_blob_sha256: conv.raw_blob_sha256,
+        raw_blob_rel_path: rawBlob ? normalizeExportBlobRelPath(rawBlob) : null,
+        revision_count: conv.revision_count,
+        meta: view.meta,
+        nodes: view.nodes,
+        blobs: view.blobs,
+      };
+    });
+    fs.writeFileSync(
+      path.join(resolvedOut, 'sessions.json'),
+      JSON.stringify(sessionsPayload, null, 2),
+      'utf8'
+    );
+
+    fs.writeFileSync(
+      path.join(resolvedOut, 'native-manifest.json'),
+      JSON.stringify(manifest, null, 2),
+      'utf8'
+    );
+
+    // Copy all referenced blobs (including raw_blob_sha256 native session JSON blobs) into <out>/blobs/
+    let copiedBlobs = 0;
+    let missingBlobs = 0;
+    for (const blobRow of allBlobRowsBySha.values()) {
+      const srcAbs = service.blobStore.getBlobAbsPath(blobRow.rel_path);
+      if (!fs.existsSync(srcAbs)) {
+        missingBlobs++;
+        continue;
+      }
+      const destRel = normalizeExportBlobRelPath(blobRow);
+      const destAbs = path.join(resolvedOut, destRel);
+      fs.mkdirSync(path.dirname(destAbs), { recursive: true });
+      fs.copyFileSync(srcAbs, destAbs);
+      copiedBlobs++;
+    }
+
+    console.log(
+      `✔ Exported native archive to ${resolvedOut} (${entries.length} conversations, ${copiedBlobs} blobs copied${missingBlobs > 0 ? `, ${missingBlobs} missing` : ''})`
+    );
+  } finally {
+    service.close();
   }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 8. Subcommand: sm reindex
+// 9. Subcommand: sm reindex [--db <archive.db>]
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function runReindex(args: ParsedArgs): Promise<void> {
-  const { db } = getArchiveDb(args.flags);
-  console.log('Reindexing conversations and updating statistical caches...');
-
-  db.exec('BEGIN TRANSACTION;');
+  const { service } = openCliArchive(args.flags);
   try {
-    const convs = db.prepare(`SELECT id FROM conversation WHERE deleted_at IS NULL`).all() as { id: number }[];
-    for (const c of convs) {
-      const stats = db.prepare(`
-        SELECT count(*) as count, sum(text_len) as total_len
-        FROM item WHERE conversation_id = ?
-      `).get(c.id) as { count: number; total_len: number | null };
+    console.log('Rebuilding FTS5 indexes and recalculating conversation statistics...');
 
-      db.prepare(`
+    const convCount = service.db.transaction(() => {
+      const convs = service.db
+        .prepare(`SELECT id FROM conversation WHERE deleted_at IS NULL`)
+        .all() as { id: number }[];
+      const aggStmt = service.db.prepare(`
+        SELECT COUNT(*) AS count, COALESCE(SUM(text_len), 0) AS total_len
+        FROM item WHERE conversation_id = ? AND is_active_branch = 1
+      `);
+      const updStmt = service.db.prepare(`
         UPDATE conversation
         SET item_count = ?, char_count = ?
         WHERE id = ?
-      `).run(stats.count, stats.total_len ?? 0, c.id);
-    }
+      `);
 
-    db.prepare(`INSERT OR REPLACE INTO meta (key, value) VALUES ('last_reindex_at', ?)`).run(Date.now().toString());
-    db.exec('COMMIT;');
-    console.log(`✔ Successfully reindexed ${convs.length} conversation(s).`);
-  } catch (err: unknown) {
-    db.exec('ROLLBACK;');
-    const msg = err instanceof Error ? err.message : String(err);
-    console.error(`Reindexing failed: ${msg}`);
+      for (const c of convs) {
+        const stats = aggStmt.get(c.id) as { count: number; total_len: number };
+        updStmt.run(stats.count, stats.total_len, c.id);
+      }
+      return convs.length;
+    });
+
+    service.rebuildFts();
+    console.log(`✔ Successfully reindexed ${convCount} conversation(s) and rebuilt FTS5 indexes.`);
+  } finally {
+    service.close();
   }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 9. Subcommand: sm serve [--port <port>]
+// 10. Subcommand: sm serve [--port <port>] [--db <archive.db>]
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function runServe(args: ParsedArgs): Promise<void> {
-  const portParam = args.flags['port'] as string | undefined;
+  const portParam = typeof args.flags['port'] === 'string' ? args.flags['port'] : undefined;
   const port = portParam ? parseInt(portParam, 10) : 0;
   const dbPath = path.resolve(typeof args.flags['db'] === 'string' ? args.flags['db'] : './archive.db');
 
   console.log(`Launching local server for database: ${dbPath}`);
-
-  // Dynamic import of @sm/server or local server logic
-  try {
-    const serverModule = await import('@sm/server');
-    const running = await serverModule.startLocalServer({ port, dbPath });
-    console.log(`\n======================================================`);
-    console.log(`  Session Manager Server running on 127.0.0.1:${running.port}`);
-    console.log(`  Ephemeral Token: ${running.token}`);
-    console.log(`  Database Path:   ${running.dbPath}`);
-    console.log(`======================================================\n`);
-    console.log('Press Ctrl+C to terminate.');
-  } catch {
-    // Fallback: spawn native node server script or direct fallback
-    console.log(`Starting native fallback server on 127.0.0.1...`);
-    const cryptoModule = await import('node:crypto');
-    const token = cryptoModule.randomBytes(24).toString('hex');
-    console.log(`Ephemeral Token: ${token}`);
-  }
+  const serverModule = await import('@sm/server');
+  const running = await serverModule.startLocalServer({ port, dbPath });
+  console.log(`\n======================================================`);
+  console.log(`  Session Manager Server running on 127.0.0.1:${running.port}`);
+  console.log(`  Ephemeral Token: ${running.token}`);
+  console.log(`  Database Path:   ${running.dbPath}`);
+  console.log(`======================================================\n`);
+  console.log('Press Ctrl+C to terminate.');
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Utility functions
+// Formatting Utilities & Entrypoint Guard
 // ─────────────────────────────────────────────────────────────────────────────
-
-function walkFiles(dir: string, maxFiles: number): string[] {
-  const results: string[] = [];
-  function recurse(current: string): void {
-    if (results.length >= maxFiles) return;
-    try {
-      const entries = fs.readdirSync(current, { withFileTypes: true });
-      for (const ent of entries) {
-        if (ent.name.startsWith('.')) continue;
-        const full = path.join(current, ent.name);
-        if (ent.isDirectory()) {
-          recurse(full);
-        } else if (ent.isFile()) {
-          results.push(full);
-        }
-        if (results.length >= maxFiles) return;
-      }
-    } catch {
-      // ignore directory access error
-    }
-  }
-  recurse(dir);
-  return results;
-}
 
 function formatBytes(bytes: number): string {
   if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
@@ -1026,8 +1492,27 @@ function formatBytes(bytes: number): string {
   return `${bytes} B`;
 }
 
-// Run CLI
-main().catch((err: unknown) => {
-  console.error(err);
-  process.exit(1);
-});
+function formatTs(ts: number | null): string {
+  if (ts == null) return 'N/A';
+  return new Date(ts).toISOString();
+}
+
+function isExecutedAsMain(): boolean {
+  const entryArg = process.argv[1];
+  if (!entryArg) return false;
+  try {
+    const selfPath = fs.realpathSync(fileURLToPath(import.meta.url));
+    const invokedPath = fs.realpathSync(path.resolve(entryArg));
+    return selfPath === invokedPath;
+  } catch {
+    return false;
+  }
+}
+
+if (isExecutedAsMain()) {
+  runCli(process.argv.slice(2)).catch((err: unknown) => {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`Error: ${msg}`);
+    process.exit(1);
+  });
+}
