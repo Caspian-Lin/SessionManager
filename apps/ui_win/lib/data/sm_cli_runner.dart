@@ -46,10 +46,11 @@ class SmCliRunner {
 
   Future<SmCliResult> runCommand(List<String> args) async {
     final cmd = _resolveCommand();
+    final isProbe = args.isNotEmpty && args.first == 'probe';
     final fullArgs = <String>[
       ...cmd.prefixArgs,
       ...args,
-      if (!args.contains('--db')) ...['--db', store.dbPath],
+      if (!isProbe && !args.contains('--db')) ...['--db', store.dbPath],
       if (!args.contains('--json')) '--json',
     ];
     final cmdDisplay = 'sm ${args.join(' ')}';
@@ -90,6 +91,10 @@ class SmCliRunner {
       lastResultNotifier.value = result;
       return result;
     }
+  }
+
+  Future<SmCliResult> probeSource(String sourcePath, {String kind = 'auto'}) {
+    return runCommand(['probe', sourcePath, '--kind', kind]);
   }
 
   Future<SmCliResult> importSource(String sourcePath, {String kind = 'auto'}) {

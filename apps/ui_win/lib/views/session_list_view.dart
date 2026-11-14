@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 
 import '../data/archive_direct_store.dart';
+import '../l10n/app_strings.dart';
 import '../models.dart';
 import '../theme.dart';
 
@@ -10,6 +11,7 @@ class SessionListView extends StatefulWidget {
   final ValueNotifier<int> refreshTick;
   final int? selectedConversationId;
   final ValueChanged<int> onSelectSession;
+  final VoidCallback? onGoToImport;
 
   const SessionListView({
     super.key,
@@ -17,6 +19,7 @@ class SessionListView extends StatefulWidget {
     required this.refreshTick,
     this.selectedConversationId,
     required this.onSelectSession,
+    this.onGoToImport,
   });
 
   @override
@@ -71,16 +74,25 @@ class _SessionListViewState extends State<SessionListView> {
     });
   }
 
+  String _sortLabel(AppStrings s, SmSortBy sortBy) {
+    return switch (sortBy) {
+      SmSortBy.updatedDesc => s.sortUpdated,
+      SmSortBy.itemsDesc => s.sortItems,
+      SmSortBy.titleAsc => s.isZh ? '标题 A-Z' : 'Title A-Z',
+    };
+  }
+
   @override
   Widget build(BuildContext context) {
+    final s = AppStringsScope.of(context);
     final theme = Theme.of(context);
     final cs = theme.colorScheme;
 
     return Column(
       children: [
-        // Filter Header Bar
+        // Clean Material 3 Filter Header
         Container(
-          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+          padding: const EdgeInsets.fromLTRB(16, 14, 16, 12),
           decoration: BoxDecoration(
             color: cs.surface,
             border: Border(bottom: BorderSide(color: theme.dividerColor)),
@@ -90,39 +102,47 @@ class _SessionListViewState extends State<SessionListView> {
             children: [
               Row(
                 children: [
-                  const Flexible(
+                  Flexible(
                     child: Text(
-                      'Archived Sessions',
-                      style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+                      s.archivedSessions,
+                      maxLines: 1,
                       overflow: TextOverflow.ellipsis,
+                      style: theme.textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w600),
                     ),
                   ),
                   const SizedBox(width: 8),
                   Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 3),
                     decoration: BoxDecoration(
-                      color: cs.primary.withOpacity(0.12),
-                      borderRadius: BorderRadius.circular(10),
+                      color: cs.secondaryContainer,
+                      borderRadius: BorderRadius.circular(20),
                     ),
                     child: Text(
-                      '${_sessions.length}',
-                      style: TextStyle(fontSize: 11, fontWeight: FontWeight.w600, color: cs.primary),
-                    ),
-                  ),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: TextField(
-                      controller: _searchCtrl,
-                      onChanged: (_) => _loadSessions(),
-                      decoration: const InputDecoration(
-                        hintText: 'Filter title or summary...',
-                        prefixIcon: Icon(Icons.filter_list, size: 16),
-                      ),
+                      s.sessionsCount(_sessions.length),
+                      style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: cs.onSecondaryContainer),
                     ),
                   ),
                 ],
               ),
-              const SizedBox(height: 8),
+              const SizedBox(height: 10),
+              TextField(
+                controller: _searchCtrl,
+                onChanged: (_) => _loadSessions(),
+                decoration: InputDecoration(
+                  hintText: s.filterHint,
+                  prefixIcon: const Icon(Icons.search, size: 19),
+                  suffixIcon: _searchCtrl.text.isNotEmpty
+                      ? IconButton(
+                          icon: const Icon(Icons.clear, size: 17),
+                          onPressed: () {
+                            _searchCtrl.clear();
+                            _loadSessions();
+                          },
+                        )
+                      : null,
+                ),
+              ),
+              const SizedBox(height: 10),
               Wrap(
                 spacing: 8,
                 runSpacing: 6,
@@ -132,14 +152,14 @@ class _SessionListViewState extends State<SessionListView> {
                     value: _providerFilter,
                     isDense: true,
                     underline: const SizedBox.shrink(),
-                    items: const [
-                      DropdownMenuItem(value: 'all', child: Text('All Providers')),
-                      DropdownMenuItem(value: 'openai-web', child: Text('openai-web')),
-                      DropdownMenuItem(value: 'anthropic-web', child: Text('anthropic-web')),
-                      DropdownMenuItem(value: 'deepseek-web', child: Text('deepseek-web')),
-                      DropdownMenuItem(value: 'codex-local', child: Text('codex-local')),
-                      DropdownMenuItem(value: 'claude-code-local', child: Text('claude-code-local')),
-                      DropdownMenuItem(value: 'dsh-local', child: Text('dsh-local')),
+                    items: [
+                      DropdownMenuItem(value: 'all', child: Text(s.allProviders)),
+                      const DropdownMenuItem(value: 'openai-web', child: Text('openai-web')),
+                      const DropdownMenuItem(value: 'anthropic-web', child: Text('anthropic-web')),
+                      const DropdownMenuItem(value: 'deepseek-web', child: Text('deepseek-web')),
+                      const DropdownMenuItem(value: 'codex-local', child: Text('codex-local')),
+                      const DropdownMenuItem(value: 'claude-code-local', child: Text('claude-code-local')),
+                      const DropdownMenuItem(value: 'dsh-local', child: Text('dsh-local')),
                     ],
                     onChanged: (val) {
                       if (val != null) {
@@ -154,7 +174,7 @@ class _SessionListViewState extends State<SessionListView> {
                       isDense: true,
                       underline: const SizedBox.shrink(),
                       items: [
-                        const DropdownMenuItem<int?>(value: null, child: Text('All Projects')),
+                        DropdownMenuItem<int?>(value: null, child: Text(s.allProjects)),
                         ..._projects.map(
                           (proj) => DropdownMenuItem<int?>(
                             value: proj.id,
@@ -172,7 +192,7 @@ class _SessionListViewState extends State<SessionListView> {
                     isDense: true,
                     underline: const SizedBox.shrink(),
                     items: SmSortBy.values
-                        .map((s) => DropdownMenuItem(value: s, child: Text(s.label)))
+                        .map((item) => DropdownMenuItem(value: item, child: Text(_sortLabel(s, item))))
                         .toList(),
                     onChanged: (val) {
                       if (val != null) {
@@ -182,18 +202,16 @@ class _SessionListViewState extends State<SessionListView> {
                     },
                   ),
                   FilterChip(
-                    label: const Text('Starred', style: TextStyle(fontSize: 11)),
+                    label: Text(s.starredOnly),
                     selected: _starredOnly,
-                    visualDensity: VisualDensity.compact,
                     onSelected: (v) {
                       _starredOnly = v;
                       _loadSessions();
                     },
                   ),
                   FilterChip(
-                    label: const Text('Shrunk', style: TextStyle(fontSize: 11)),
+                    label: Text(s.shrunkOnly),
                     selected: _shrunkOnly,
-                    visualDensity: VisualDensity.compact,
                     onSelected: (v) {
                       _shrunkOnly = v;
                       _loadSessions();
@@ -210,20 +228,46 @@ class _SessionListViewState extends State<SessionListView> {
           child: _loading
               ? const Center(child: CircularProgressIndicator())
               : _sessions.isEmpty
-                  ? const Center(child: Text('No sessions matching current filter.'))
+                  ? Center(
+                      child: Padding(
+                        padding: const EdgeInsets.all(24),
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(Icons.inbox_outlined, size: 44, color: cs.onSurfaceVariant.withOpacity(0.5)),
+                            const SizedBox(height: 12),
+                            Text(s.noSessionsMatch, style: theme.textTheme.titleSmall),
+                            const SizedBox(height: 6),
+                            Text(
+                              s.noSessionsHint,
+                              style: theme.textTheme.bodySmall?.copyWith(color: cs.onSurfaceVariant),
+                              textAlign: TextAlign.center,
+                            ),
+                            if (widget.onGoToImport != null) ...[
+                              const SizedBox(height: 16),
+                              FilledButton.tonalIcon(
+                                onPressed: widget.onGoToImport,
+                                icon: const Icon(Icons.cloud_download_outlined, size: 17),
+                                label: Text(s.goToImport),
+                              ),
+                            ],
+                          ],
+                        ),
+                      ),
+                    )
                   : Scrollbar(
                       controller: _scrollCtrl,
                       child: ListView.builder(
                         controller: _scrollCtrl,
-                        padding: const EdgeInsets.all(12),
+                        padding: const EdgeInsets.all(14),
                         itemCount: _sessions.length,
                         itemBuilder: (context, index) {
-                          final s = _sessions[index];
-                          final isSelected = widget.selectedConversationId == s.id;
+                          final session = _sessions[index];
+                          final isSelected = widget.selectedConversationId == session.id;
                           return _SessionCard(
-                            session: s,
+                            session: session,
                             isSelected: isSelected,
-                            onTap: () => widget.onSelectSession(s.id),
+                            onTap: () => widget.onSelectSession(session.id),
                           );
                         },
                       ),
@@ -248,123 +292,124 @@ class _SessionCard extends StatelessWidget {
   Color _providerColor(String provider) {
     switch (provider) {
       case 'openai-web':
-        return const Color(0xFF10A37F);
+        return const Color(0xFF137333);
       case 'anthropic-web':
       case 'claude-code-local':
-        return const Color(0xFFD97706);
+        return const Color(0xFFB06000);
       case 'deepseek-web':
-        return const Color(0xFF2563EB);
+        return const Color(0xFF1967D2);
       case 'codex-local':
-        return const Color(0xFF0067C0);
+        return const Color(0xFF1A73E8);
       case 'dsh-local':
-        return const Color(0xFF7C3AED);
+        return const Color(0xFF7627BB);
       default:
-        return const Color(0xFF6B7280);
+        return const Color(0xFF5F6368);
     }
   }
 
   @override
   Widget build(BuildContext context) {
+    final s = AppStringsScope.of(context);
     final theme = Theme.of(context);
     final cs = theme.colorScheme;
     final badgeColor = _providerColor(session.provider);
     final updatedStr = session.updatedAt != null
         ? DateFormat('yyyy-MM-dd HH:mm').format(DateTime.fromMillisecondsSinceEpoch(session.updatedAt!))
-        : 'Unknown';
+        : '';
 
     return Card(
-      margin: const EdgeInsets.only(bottom: 8),
+      margin: const EdgeInsets.only(bottom: 10),
+      color: isSelected ? cs.primaryContainer.withOpacity(0.45) : cs.surfaceContainerLowest,
       shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(6),
+        borderRadius: BorderRadius.circular(14),
         side: BorderSide(
-          color: isSelected ? cs.primary : theme.dividerColor,
+          color: isSelected ? cs.primary : cs.outlineVariant.withOpacity(0.55),
           width: isSelected ? 1.5 : 1,
         ),
       ),
       child: InkWell(
         onTap: onTap,
-        borderRadius: BorderRadius.circular(6),
+        borderRadius: BorderRadius.circular(14),
         child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+          padding: const EdgeInsets.all(14),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Row(
                 children: [
                   Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
                     decoration: BoxDecoration(
-                      color: badgeColor.withOpacity(0.14),
-                      borderRadius: BorderRadius.circular(4),
-                      border: Border.all(color: badgeColor.withOpacity(0.45)),
+                      color: badgeColor.withOpacity(0.12),
+                      borderRadius: BorderRadius.circular(8),
                     ),
                     child: Text(
                       session.provider,
-                      style: TextStyle(fontSize: 10.5, fontWeight: FontWeight.w600, color: badgeColor),
+                      style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w600, color: badgeColor),
                     ),
                   ),
                   const SizedBox(width: 8),
                   Expanded(
                     child: Text(
                       session.title,
-                      style: const TextStyle(fontSize: 13.5, fontWeight: FontWeight.w600),
+                      style: theme.textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w600),
                       overflow: TextOverflow.ellipsis,
                     ),
                   ),
                   if (session.starred)
                     const Padding(
                       padding: EdgeInsets.only(left: 6),
-                      child: Icon(Icons.star, size: 15, color: Color(0xFFF59E0B)),
+                      child: Icon(Icons.star, size: 16, color: Color(0xFFF9AB00)),
                     ),
                   if (session.isShrunk)
                     Container(
                       margin: const EdgeInsets.only(left: 6),
-                      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+                      padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
                       decoration: BoxDecoration(
-                        color: Colors.amber.withOpacity(0.18),
-                        borderRadius: BorderRadius.circular(4),
+                        color: const Color(0xFFB06000).withOpacity(0.14),
+                        borderRadius: BorderRadius.circular(8),
                       ),
-                      child: const Text(
-                        'SHRUNK',
-                        style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Color(0xFFD97706)),
+                      child: Text(
+                        s.shrunkBadge,
+                        style: const TextStyle(fontSize: 10.5, fontWeight: FontWeight.w600, color: Color(0xFFB06000)),
                       ),
                     ),
                   if (session.revisionCount > 1)
                     Container(
                       margin: const EdgeInsets.only(left: 6),
-                      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+                      padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
                       decoration: BoxDecoration(
-                        color: cs.primary.withOpacity(0.1),
-                        borderRadius: BorderRadius.circular(4),
+                        color: cs.secondaryContainer,
+                        borderRadius: BorderRadius.circular(8),
                       ),
                       child: Text(
                         'Rev x${session.revisionCount}',
-                        style: TextStyle(fontSize: 10, fontWeight: FontWeight.w600, color: cs.primary),
+                        style: TextStyle(fontSize: 10.5, fontWeight: FontWeight.w600, color: cs.onSecondaryContainer),
                       ),
                     ),
                 ],
               ),
               if (session.summary != null && session.summary!.isNotEmpty) ...[
-                const SizedBox(height: 5),
+                const SizedBox(height: 6),
                 Text(
                   session.summary!,
-                  style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
+                  style: theme.textTheme.bodySmall?.copyWith(color: cs.onSurfaceVariant),
                   maxLines: 2,
                   overflow: TextOverflow.ellipsis,
                 ),
               ],
-              const SizedBox(height: 6),
+              const SizedBox(height: 8),
               Row(
                 children: [
-                  Text('${session.itemCount} items', style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant)),
+                  Text(s.itemsLabel(session.itemCount), style: theme.textTheme.labelSmall?.copyWith(color: cs.onSurfaceVariant)),
                   if (session.projectName != null) ...[
                     const SizedBox(width: 10),
-                    Icon(Icons.folder_outlined, size: 13, color: cs.onSurfaceVariant),
-                    const SizedBox(width: 3),
+                    Icon(Icons.folder_outlined, size: 14, color: cs.onSurfaceVariant),
+                    const SizedBox(width: 4),
                     Flexible(
                       child: Text(
                         session.projectName!,
-                        style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
+                        style: theme.textTheme.labelSmall?.copyWith(color: cs.onSurfaceVariant),
                         overflow: TextOverflow.ellipsis,
                       ),
                     ),
@@ -373,13 +418,14 @@ class _SessionCard extends StatelessWidget {
                     Flexible(
                       child: Text(
                         session.cwd!,
-                        style: WinAdaptiveTheme.monoTextStyle(fontSize: 10.5, color: cs.onSurfaceVariant),
+                        style: GoogleMaterialTheme.monoTextStyle(fontSize: 11, color: cs.onSurfaceVariant),
                         overflow: TextOverflow.ellipsis,
                       ),
                     ),
                   ],
                   const Spacer(),
-                  Text(updatedStr, style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant)),
+                  if (updatedStr.isNotEmpty)
+                    Text(updatedStr, style: theme.textTheme.labelSmall?.copyWith(color: cs.onSurfaceVariant)),
                 ],
               ),
             ],

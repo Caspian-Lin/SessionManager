@@ -8,7 +8,9 @@ import 'package:sqlite3/open.dart' as sq_open;
 import 'package:sqlite3/sqlite3.dart' as sq;
 
 import 'package:ui_win/data/archive_direct_store.dart';
+import 'package:ui_win/data/local_agent_discovery.dart';
 import 'package:ui_win/data/sm_cli_runner.dart';
+import 'package:ui_win/l10n/app_strings.dart';
 import 'package:ui_win/main.dart';
 import 'package:ui_win/theme.dart';
 import 'package:ui_win/views/branch_reader_view.dart';
@@ -333,14 +335,14 @@ void main() {
     }
   });
 
-  test('WinAdaptiveTheme builds Material 3 light & dark themes with Windows typography', () {
-    final light = WinAdaptiveTheme.light();
-    final dark = WinAdaptiveTheme.dark();
+  test('GoogleMaterialTheme builds Material 3 light & dark flat themes with Google Blue seed', () {
+    final light = GoogleMaterialTheme.light();
+    final dark = GoogleMaterialTheme.dark();
     expect(light.useMaterial3, isTrue);
     expect(dark.useMaterial3, isTrue);
-    expect(light.visualDensity, VisualDensity.compact);
-    expect(light.colorScheme.primary, WinAdaptiveTheme.winLightAccent);
-    expect(dark.colorScheme.primary, WinAdaptiveTheme.winDarkAccent);
+    expect(light.brightness, Brightness.light);
+    expect(dark.brightness, Brightness.dark);
+    expect(light.navigationRailTheme.indicatorShape, const StadiumBorder());
   });
 
   testWidgets('BranchTreeReaderView switches branches (< Branch 1 / 2 >), folds synthetic, and loads spilled blob',
@@ -359,14 +361,17 @@ void main() {
     });
 
     await tester.pumpWidget(
-      MaterialApp(
-        theme: WinAdaptiveTheme.dark(),
-        home: Scaffold(
-          body: BranchTreeReaderView(
-            store: store,
-            refreshTick: ValueNotifier<int>(0),
-            conversationId: 1,
-            onSelectOtherSession: (_) {},
+      AppStringsScope(
+        notifier: ValueNotifier<AppLocale>(AppLocale.en),
+        child: MaterialApp(
+          theme: GoogleMaterialTheme.dark(),
+          home: Scaffold(
+            body: BranchTreeReaderView(
+              store: store,
+              refreshTick: ValueNotifier<int>(0),
+              conversationId: 1,
+              onSelectOtherSession: (_) {},
+            ),
           ),
         ),
       ),
@@ -374,12 +379,12 @@ void main() {
     await tester.pumpAndSettle();
 
     // Synthetic item collapsed by default
-    expect(find.textContaining('1 synthetic orchestration item(s) collapsed'), findsOneWidget);
+    expect(find.textContaining('1 synthetic / system node(s) collapsed'), findsOneWidget);
     expect(find.text('synthetic turn context'), findsNothing);
 
     // Branch selector pill shown on fork (Branch 1 / 2)
     expect(find.text('Branch 1 / 2'), findsOneWidget);
-    expect(find.text('Reasoning / Thinking'), findsOneWidget);
+    expect(find.text('Thinking Process'), findsOneWidget);
     expect(find.text('print("branch 1");'), findsOneWidget);
 
     // Switch to sibling regenerate branch (Branch 2 / 2)
@@ -391,7 +396,7 @@ void main() {
     // Switch back to Branch 1 / 2 and expand synthetic banner + spilled payload
     await tester.tap(find.byIcon(Icons.chevron_left));
     await tester.pumpAndSettle();
-    await tester.tap(find.textContaining('1 synthetic orchestration item(s) collapsed'));
+    await tester.tap(find.textContaining('1 synthetic / system node(s) collapsed'));
     await tester.pumpAndSettle();
     expect(find.text('synthetic turn context'), findsOneWidget);
 
@@ -416,22 +421,25 @@ void main() {
     });
 
     await tester.pumpWidget(
-      MaterialApp(
-        theme: WinAdaptiveTheme.light(),
-        home: Scaffold(
-          body: IntegrityReportView(
-            store: store,
-            cliRunner: cliRunner,
-            refreshTick: ValueNotifier<int>(0),
-            onDataChanged: () {},
-            onOpenConversation: (id) => openedId = id,
+      AppStringsScope(
+        notifier: ValueNotifier<AppLocale>(AppLocale.en),
+        child: MaterialApp(
+          theme: GoogleMaterialTheme.light(),
+          home: Scaffold(
+            body: IntegrityReportView(
+              store: store,
+              cliRunner: cliRunner,
+              refreshTick: ValueNotifier<int>(0),
+              onDataChanged: () {},
+              onOpenConversation: (id) => openedId = id,
+            ),
           ),
         ),
       ),
     );
     await tester.pumpAndSettle();
 
-    expect(find.textContaining('SHRINK ALERT: 1 Conversation(s) Lost Items Upstream'), findsOneWidget);
+    expect(find.textContaining('Alert: 1 Conversation(s) Shrunk Upstream'), findsOneWidget);
     expect(find.text('86.0% Similarity'), findsOneWidget);
     expect(find.text('Conversation A (#1)'), findsOneWidget);
     expect(find.text('Conversation B (#2)'), findsOneWidget);
@@ -441,26 +449,87 @@ void main() {
     expect(openedId, 1);
   });
 
-  testWidgets('SessionManagerApp renders wide desktop shell with SQLite WAL Read-Only badge',
+  testWidgets('SessionManagerApp supports Google M3 flat shell, 中文/EN switch, and Import Hub discovery',
       (WidgetTester tester) async {
-    tester.view.physicalSize = const Size(1400, 900);
+    tester.view.physicalSize = const Size(1440, 900);
     tester.view.devicePixelRatio = 1.0;
     addTearDown(tester.view.resetPhysicalSize);
 
     final dir = _createTempArchiveFixture();
     final store = ArchiveDirectStore(archiveDir: dir.path);
     final cliRunner = SmCliRunner(store: store);
+    final mockInstances = [
+      const LocalAgentInstance(
+        provider: 'codex-local',
+        displayName: 'Codex CLI',
+        installMethod: 'User Home (~/.codex)',
+        path: r'C:\Users\demo\.codex\sessions',
+        supportedForImport: true,
+        sessionFileCount: 18,
+        hasSqliteDb: true,
+        totalBytes: 204800,
+      ),
+      const LocalAgentInstance(
+        provider: 'opencode-local',
+        displayName: 'OpenCode',
+        installMethod: 'XDG Data',
+        path: r'C:\Users\demo\.local\share\opencode',
+        supportedForImport: false,
+        sessionFileCount: 4,
+        hasSqliteDb: false,
+        totalBytes: 4096,
+      ),
+    ];
     addTearDown(() {
       cliRunner.dispose();
       store.dispose();
       dir.deleteSync(recursive: true);
     });
 
-    await tester.pumpWidget(SessionManagerApp(storeOverride: store, cliRunnerOverride: cliRunner));
+    await tester.pumpWidget(
+      SessionManagerApp(
+        storeOverride: store,
+        cliRunnerOverride: cliRunner,
+        discoveryOverride: _FakeDiscoveryService(mockInstances),
+      ),
+    );
     await tester.pumpAndSettle();
 
-    expect(find.text('SQLite WAL Read-Only'), findsOneWidget);
-    expect(find.text('Archived Sessions'), findsOneWidget);
+    // Default Chinese UI
+    expect(find.text('SQLite WAL 直连'), findsOneWidget);
+    expect(find.text('归档会话'), findsOneWidget);
     expect(find.text('会话归档与分支测试'), findsOneWidget);
+
+    // Switch language to EN via top-bar SegmentedButton
+    await tester.tap(find.text('EN'));
+    await tester.pumpAndSettle();
+    expect(find.text('SQLite WAL Direct'), findsOneWidget);
+    expect(find.text('Archived Sessions'), findsOneWidget);
+
+    // Navigate to Import Hub tab
+    await tester.tap(find.text('Import'));
+    await tester.pumpAndSettle();
+    expect(find.text('Import & Local Sync Hub'), findsOneWidget);
+    expect(find.text('Codex CLI'), findsOneWidget);
+    expect(find.text('OpenCode'), findsOneWidget);
+    expect(find.text('One-Click Import / Sync'), findsOneWidget);
+    expect(find.text('Probe'), findsOneWidget);
+
+    // Switch guided source to Claude Web
+    await tester.tap(find.text('Claude Web'));
+    await tester.pumpAndSettle();
+    expect(find.textContaining('Claude.ai'), findsOneWidget);
   });
+}
+
+class _FakeDiscoveryService extends LocalAgentDiscoveryService {
+  final List<LocalAgentInstance> instances;
+  const _FakeDiscoveryService(this.instances);
+
+  @override
+  Future<List<LocalAgentInstance>> scanLocalInstances({
+    Map<String, String>? envOverride,
+    bool includeWsl = true,
+  }) async =>
+      instances;
 }

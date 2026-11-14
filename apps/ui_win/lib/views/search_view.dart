@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../data/archive_direct_store.dart';
+import '../l10n/app_strings.dart';
 import '../models.dart';
 import '../theme.dart';
 
@@ -25,6 +26,7 @@ class _FullTextSearchViewState extends State<FullTextSearchView> {
   final ScrollController _scrollCtrl = ScrollController();
   List<SearchHit> _hits = [];
   bool _searching = false;
+  bool _hasSearched = false;
   String _provider = 'all';
   String _role = 'all';
   bool _includeSynthetic = false;
@@ -50,156 +52,164 @@ class _FullTextSearchViewState extends State<FullTextSearchView> {
     setState(() {
       _hits = results;
       _searching = false;
+      _hasSearched = true;
     });
   }
 
   @override
   Widget build(BuildContext context) {
+    final s = AppStringsScope.of(context);
     final theme = Theme.of(context);
     final cs = theme.colorScheme;
 
     return Padding(
-      padding: const EdgeInsets.all(20),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          const Text('Full-Text Archive Search', style: TextStyle(fontSize: 18, fontWeight: FontWeight.w600)),
-          const SizedBox(height: 2),
-          Text(
-            'Dual FTS5 router (unicode61 + trigram + bounded CJK LIKE) with BM25 weighting.',
-            style: TextStyle(color: cs.onSurfaceVariant, fontSize: 12),
-          ),
-          const SizedBox(height: 12),
-          Row(
+      padding: const EdgeInsets.all(24),
+      child: Center(
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 1040),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Expanded(
-                child: TextField(
-                  controller: _ctrl,
-                  focusNode: widget.searchFocusNode,
-                  onSubmitted: (_) => _executeSearch(),
-                  decoration: const InputDecoration(
-                    hintText: 'Search English tokens or 中文关键词 (Ctrl+F)...',
-                    prefixIcon: Icon(Icons.search, size: 18),
-                  ),
-                ),
-              ),
-              const SizedBox(width: 8),
-              FilledButton(
-                onPressed: _executeSearch,
-                child: const Text('Search'),
-              ),
-            ],
-          ),
-          const SizedBox(height: 8),
-          Wrap(
-            spacing: 10,
-            crossAxisAlignment: WrapCrossAlignment.center,
-            children: [
-              DropdownButton<String>(
-                value: _provider,
-                isDense: true,
-                underline: const SizedBox.shrink(),
-                items: const [
-                  DropdownMenuItem(value: 'all', child: Text('All Providers')),
-                  DropdownMenuItem(value: 'openai-web', child: Text('openai-web')),
-                  DropdownMenuItem(value: 'codex-local', child: Text('codex-local')),
-                  DropdownMenuItem(value: 'dsh-local', child: Text('dsh-local')),
-                  DropdownMenuItem(value: 'claude-code-local', child: Text('claude-code-local')),
-                ],
-                onChanged: (v) {
-                  if (v != null) setState(() => _provider = v);
-                },
-              ),
-              DropdownButton<String>(
-                value: _role,
-                isDense: true,
-                underline: const SizedBox.shrink(),
-                items: const [
-                  DropdownMenuItem(value: 'all', child: Text('All Roles')),
-                  DropdownMenuItem(value: 'user', child: Text('user')),
-                  DropdownMenuItem(value: 'assistant', child: Text('assistant')),
-                  DropdownMenuItem(value: 'tool', child: Text('tool')),
-                  DropdownMenuItem(value: 'system', child: Text('system')),
-                ],
-                onChanged: (v) {
-                  if (v != null) setState(() => _role = v);
-                },
-              ),
-              FilterChip(
-                label: const Text('Include Synthetic', style: TextStyle(fontSize: 11)),
-                selected: _includeSynthetic,
-                visualDensity: VisualDensity.compact,
-                onSelected: (v) => setState(() => _includeSynthetic = v),
-              ),
-            ],
-          ),
-          const SizedBox(height: 12),
-          Expanded(
-            child: _searching
-                ? const Center(child: CircularProgressIndicator())
-                : _hits.isEmpty
-                    ? Center(
-                        child: Text(
-                          'Enter keywords and press Enter to search across local SQLite FTS5 indexes.',
-                          style: TextStyle(color: cs.onSurfaceVariant),
-                        ),
-                      )
-                    : Scrollbar(
-                        controller: _scrollCtrl,
-                        child: ListView.builder(
-                          controller: _scrollCtrl,
-                          itemCount: _hits.length,
-                          itemBuilder: (context, index) {
-                            final hit = _hits[index];
-                            return Card(
-                              margin: const EdgeInsets.only(bottom: 8),
-                              child: ListTile(
-                                dense: true,
-                                onTap: () => widget.onSelectSession(hit.conversationId),
-                                title: Row(
-                                  children: [
-                                    Container(
-                                      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
-                                      decoration: BoxDecoration(
-                                        color: cs.primary.withOpacity(0.12),
-                                        borderRadius: BorderRadius.circular(4),
-                                      ),
-                                      child: Text(
-                                        hit.strategy,
-                                        style: WinAdaptiveTheme.monoTextStyle(fontSize: 10, color: cs.primary),
-                                      ),
-                                    ),
-                                    const SizedBox(width: 8),
-                                    Expanded(
-                                      child: Text(
-                                        hit.title,
-                                        style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 13),
-                                        overflow: TextOverflow.ellipsis,
-                                      ),
-                                    ),
-                                    Text(
-                                      hit.provider,
-                                      style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
-                                    ),
-                                  ],
-                                ),
-                                subtitle: Padding(
-                                  padding: const EdgeInsets.only(top: 4),
-                                  child: Text(
-                                    '[${hit.role}] ${hit.snippet}',
-                                    maxLines: 3,
-                                    overflow: TextOverflow.ellipsis,
-                                    style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
-                                  ),
-                                ),
-                                trailing: const Icon(Icons.chevron_right, size: 18),
-                              ),
-                            );
-                          },
-                        ),
+              Text(s.searchTitle, style: theme.textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.w600)),
+              const SizedBox(height: 6),
+              Text(s.searchSubtitle, style: theme.textTheme.bodyMedium?.copyWith(color: cs.onSurfaceVariant)),
+              const SizedBox(height: 18),
+              Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: _ctrl,
+                      focusNode: widget.searchFocusNode,
+                      onSubmitted: (_) => _executeSearch(),
+                      decoration: InputDecoration(
+                        hintText: s.searchInputHint,
+                        prefixIcon: const Icon(Icons.search),
                       ),
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  FilledButton.icon(
+                    onPressed: _searching ? null : _executeSearch,
+                    icon: const Icon(Icons.search, size: 18),
+                    label: Text(s.searchAction),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 12),
+              Wrap(
+                spacing: 12,
+                runSpacing: 8,
+                crossAxisAlignment: WrapCrossAlignment.center,
+                children: [
+                  DropdownButton<String>(
+                    value: _provider,
+                    isDense: true,
+                    underline: const SizedBox.shrink(),
+                    items: [
+                      DropdownMenuItem(value: 'all', child: Text(s.allProviders)),
+                      const DropdownMenuItem(value: 'openai-web', child: Text('openai-web')),
+                      const DropdownMenuItem(value: 'codex-local', child: Text('codex-local')),
+                      const DropdownMenuItem(value: 'dsh-local', child: Text('dsh-local')),
+                      const DropdownMenuItem(value: 'claude-code-local', child: Text('claude-code-local')),
+                    ],
+                    onChanged: (v) {
+                      if (v != null) setState(() => _provider = v);
+                    },
+                  ),
+                  DropdownButton<String>(
+                    value: _role,
+                    isDense: true,
+                    underline: const SizedBox.shrink(),
+                    items: [
+                      DropdownMenuItem(value: 'all', child: Text(s.allRoles)),
+                      const DropdownMenuItem(value: 'user', child: Text('user')),
+                      const DropdownMenuItem(value: 'assistant', child: Text('assistant')),
+                      const DropdownMenuItem(value: 'tool', child: Text('tool')),
+                      const DropdownMenuItem(value: 'system', child: Text('system')),
+                    ],
+                    onChanged: (v) {
+                      if (v != null) setState(() => _role = v);
+                    },
+                  ),
+                  FilterChip(
+                    label: Text(s.includeSynthetic),
+                    selected: _includeSynthetic,
+                    onSelected: (v) => setState(() => _includeSynthetic = v),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 16),
+              Expanded(
+                child: _searching
+                    ? const Center(child: CircularProgressIndicator())
+                    : _hits.isEmpty
+                        ? Center(
+                            child: Text(
+                              _hasSearched ? s.searchNoHits : s.searchEmptyHint,
+                              style: theme.textTheme.bodyMedium?.copyWith(color: cs.onSurfaceVariant),
+                            ),
+                          )
+                        : Scrollbar(
+                            controller: _scrollCtrl,
+                            child: ListView.builder(
+                              controller: _scrollCtrl,
+                              itemCount: _hits.length,
+                              itemBuilder: (context, index) {
+                                final hit = _hits[index];
+                                return Card(
+                                  margin: const EdgeInsets.only(bottom: 10),
+                                  child: ListTile(
+                                    contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                                    onTap: () => widget.onSelectSession(hit.conversationId),
+                                    title: Row(
+                                      children: [
+                                        Container(
+                                          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                                          decoration: BoxDecoration(
+                                            color: cs.secondaryContainer,
+                                            borderRadius: BorderRadius.circular(8),
+                                          ),
+                                          child: Text(
+                                            hit.strategy,
+                                            style: GoogleMaterialTheme.monoTextStyle(
+                                              fontSize: 11,
+                                              color: cs.onSecondaryContainer,
+                                            ),
+                                          ),
+                                        ),
+                                        const SizedBox(width: 10),
+                                        Expanded(
+                                          child: Text(
+                                            hit.title,
+                                            style: theme.textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w600),
+                                            overflow: TextOverflow.ellipsis,
+                                          ),
+                                        ),
+                                        Text(
+                                          hit.provider,
+                                          style: theme.textTheme.labelMedium?.copyWith(color: cs.onSurfaceVariant),
+                                        ),
+                                      ],
+                                    ),
+                                    subtitle: Padding(
+                                      padding: const EdgeInsets.only(top: 6),
+                                      child: Text(
+                                        '[${hit.role}] ${hit.snippet}',
+                                        maxLines: 3,
+                                        overflow: TextOverflow.ellipsis,
+                                        style: theme.textTheme.bodySmall?.copyWith(color: cs.onSurfaceVariant, height: 1.45),
+                                      ),
+                                    ),
+                                    trailing: const Icon(Icons.chevron_right),
+                                  ),
+                                );
+                              },
+                            ),
+                          ),
+              ),
+            ],
           ),
-        ],
+        ),
       ),
     );
   }
