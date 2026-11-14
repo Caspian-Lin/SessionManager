@@ -14,6 +14,7 @@ export interface ArchiveDatabaseOptions {
 export class ArchiveDatabase {
   public readonly rawDb: DatabaseSync;
   public readonly path: string;
+  private txDepth = 0;
 
   constructor(db: DatabaseSync, dbPath: string) {
     this.rawDb = db;
@@ -116,9 +117,28 @@ export class ArchiveDatabase {
 
   /**
    * Executes a synchronous callback within a transaction.
-   * Automatically commits on success and rolls back on error.
+   * Supports nested calls via SQLite SAVEPOINTs and automatically commits/releases
+   * on success or rolls back on error.
    */
   transaction<T>(fn: () => T): T {
+    if (this.txDepth > 0) {
+      const savepoint = `sm_sp_${this.txDepth}`;
+      this.txDepth++;
+      this.rawDb.exec(`SAVEPOINT ${savepoint}`);
+      try {
+        const result = fn();
+        this.rawDb.exec(`RELEASE SAVEPOINT ${savepoint}`);
+        return result;
+      } catch (err) {
+        this.rawDb.exec(`ROLLBACK TO SAVEPOINT ${savepoint}`);
+        this.rawDb.exec(`RELEASE SAVEPOINT ${savepoint}`);
+        throw err;
+      } finally {
+        this.txDepth--;
+      }
+    }
+
+    this.txDepth++;
     this.rawDb.exec('BEGIN IMMEDIATE');
     try {
       const result = fn();
@@ -127,6 +147,8 @@ export class ArchiveDatabase {
     } catch (err) {
       this.rawDb.exec('ROLLBACK');
       throw err;
+    } finally {
+      this.txDepth--;
     }
   }
 
