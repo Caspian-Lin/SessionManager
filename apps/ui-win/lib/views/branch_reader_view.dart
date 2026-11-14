@@ -492,7 +492,7 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
                     )
                   else
                     _buildFormattedText(item.text),
-                  if (item.payloadRef != null && item.payloadRef!.startsWith('blob:')) ...[
+                  if (ArchiveDirectStore.extractPayloadSha256(item.payloadRef) != null) ...[
                     const SizedBox(height: 8),
                     _buildSpilledPayloadControl(item.payloadRef!),
                   ],

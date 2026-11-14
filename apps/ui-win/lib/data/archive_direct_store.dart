@@ -160,11 +160,23 @@ class ArchiveDirectStore {
     return candidate;
   }
 
-  /// Lazy-reads spilled `blob:<sha256>` payload directly from disk.
+  static final RegExp _sha256Re = RegExp(r'^[0-9a-fA-F]{64}$');
+
+  /// Extracts a 64-hex SHA256 digest from either a bare `<sha256>` (persisted
+  /// by `@sm/store` / `codex-local`) or a `blob:<sha256>` reference.
+  static String? extractPayloadSha256(String? payloadRef) {
+    if (payloadRef == null) return null;
+    final trimmed = payloadRef.trim();
+    if (trimmed.isEmpty) return null;
+    final candidate = trimmed.startsWith('blob:') ? trimmed.substring('blob:'.length).trim() : trimmed;
+    if (_sha256Re.hasMatch(candidate)) return candidate;
+    return null;
+  }
+
+  /// Lazy-reads spilled `<sha256>` or `blob:<sha256>` payload directly from disk.
   Future<String?> readSpilledPayload(String payloadRef, {int maxChars = 65536}) async {
-    if (!payloadRef.startsWith('blob:')) return null;
-    final sha = payloadRef.substring('blob:'.length).trim();
-    if (sha.isEmpty) return null;
+    final sha = extractPayloadSha256(payloadRef);
+    if (sha == null) return null;
     final file = resolveBlobFile(sha);
     if (!file.existsSync()) return null;
     try {

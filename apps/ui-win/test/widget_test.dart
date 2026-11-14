@@ -250,7 +250,7 @@ Directory _createTempArchiveFixture() {
         (5, 1, 3, 'n5', 4, 3, 'tool', 'tool_call', ?, NULL, 'exec_command', 'ran tool command', 16, NULL, 'h5', 1, 0, ?),
         (6, 2, NULL, 'm1', 0, 0, 'user', 'message', ?, NULL, NULL, 'Duplicate candidate turn one', 28, NULL, 'h6', 1, 0, NULL)
       ''',
-      [now - 4000, now - 3000, now - 2000, blocksJson, now - 1500, now - 1000, 'blob:$spillSha', now - 4000],
+      [now - 4000, now - 3000, now - 2000, blocksJson, now - 1500, now - 1000, spillSha, now - 4000],
     );
 
     db.execute(
@@ -312,10 +312,12 @@ void main() {
       final cjk2Hits = await store.search('架构');
       expect(cjk2Hits.any((h) => h.conversationId == 1 && h.strategy == 'like'), isTrue);
 
-      // Spilled blob resolution & lazy read
+      // Spilled blob resolution & lazy read (both bare <sha256> and blob:<sha256>)
       final payloadRef = detail.items.last.payloadRef!;
-      final payload = await store.readSpilledPayload(payloadRef);
-      expect(payload, contains('spilled payload ok'));
+      final payloadBare = await store.readSpilledPayload(payloadRef);
+      expect(payloadBare, contains('spilled payload ok'));
+      final payloadPrefixed = await store.readSpilledPayload('blob:$payloadRef');
+      expect(payloadPrefixed, contains('spilled payload ok'));
 
       final batches = await store.getBatches();
       expect(batches.length, 1);
