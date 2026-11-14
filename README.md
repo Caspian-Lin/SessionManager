@@ -2,7 +2,7 @@
 
 > 把散落在各家网页导出包、以及本地 Agent 运行日志里的对话，收进一个**原始不可变、可查重、可校验、带多媒体**的本地会话库。
 
-当前状态：**调研 + 方案阶段**（本目录暂无代码，只有设计文档与一个格式探针脚本）。
+当前状态：**架构重构与核心骨架阶段**（已包含完整设计文档、格式探针，以及 `packages/` 与 `apps/` 的多态会话引擎骨架）。
 
 ---
 
@@ -12,11 +12,11 @@
 |---|---|
 | 是否已有同类项目 | 有大量「单一 provider 导出查看器」和几个「记忆中枢」，但**没有**同时做到：官方导出包 + 本地 Agent 日志 + 分支保真 + 重复导出查重/校验 + 多媒体。详见 [01-既有方案调研](docs/01-既有方案调研.md) |
 | 产品形态与平台 | **CLI 核心优先（`sm` CLI）+ 简短轻量的桌面阅读器 UI（v1 仅限 Windows 端，macOS 后续再议）** |
-| 技术栈 | `oca`（开放会话中间表示，CC0/MIT）+ TypeScript 核心引擎（`core` + `adapters` + `store` + `cli` + 本地 `server`）+ **Flutter (Dart) Windows 桌面 UI（与 `Chatea` 共用同一套设计风格与消息树组件）**；存储 SQLite（FTS5）+ 内容寻址 blob 仓库 |
+| 技术栈 | **多态原生会话接口（`SessionDocument<TRaw>`：保留各 provider 原生结构，各自实现校验/哈希/投影方法）** + TypeScript 核心引擎（`shared` + `store` + `adapters` + `core` + `cli` + 本地 `server`）+ **Flutter (Dart) Windows 桌面 UI（与 `Chatea` 共用同一套设计风格与消息树组件）**；存储 SQLite（FTS5）+ 内容寻址 blob 仓库 |
 | 为什么不是纯浏览器应用 | 需要读 `~/.codex`、`~/.claude`、`~/.dsh` 目录、处理 GB 级 zstd/JSON、做增量同步与后台任务，浏览器沙箱做不到 |
-| 最大技术风险 | 各 provider 格式漂移（尤其 DeepSeek 与 Codex）；已用「探针 + 版本化适配器 + 原始层不动」把风险关进笼子 |
-| MVP 工期 | **约 310 人时**（因聚焦 CLI 核心 + 简短 Windows 专属 UI，砍掉跨平台打包与重型前端后大幅缩减），覆盖 OpenAI / Anthropic / DeepSeek 导出 + Codex / Claude Code / DSH 本地会话 + 查重校验 + 轻量阅读器 |
-| 差异化 | ① 分支保真（保留 regenerate 的全部旁支）② 多次导出之间的**会话级查重与差异报告** ③ 网页对话与 Agent 轨迹用**同一套归一化模型（OCA）** ④ 原始数据只读、可重建索引 |
+| 最大技术风险 | 各 provider 格式漂移（尤其 DeepSeek 与 Codex）；已用「探针 + 原生类型版本化适配器 + 原始层不动」把风险关进笼子 |
+| MVP 工期 | **约 300 人时**（聚焦多态适配器、CLI 核心与轻量 Windows UI，去掉独立的跨格式重编码 OCA 规范包与多语言 codegen 负担），覆盖 OpenAI / Anthropic / DeepSeek 导出 + Codex / Claude Code / DSH 本地会话 + 同源查重校验 + 轻量阅读器 |
+| 差异化 | ① 分支保真（保留 regenerate 的全部旁支）② 多次导出之间的**同源会话级查重与差异报告** ③ 网页对话与 Agent 轨迹保留原生类型并实现**同一套行为接口（按需投影为阅读 ViewModel 与 FTS 索引）** ④ 原始数据只读、可重建索引 |
 
 ---
 
@@ -25,8 +25,8 @@
 | 文档 | 内容 |
 |---|---|
 | [docs/01-既有方案调研.md](docs/01-既有方案调研.md) | 竞品/开源项目横评、可借鉴的具体机制、合规边界 |
-| [docs/02-数据格式规范.md](docs/02-数据格式规范.md) | 6 个数据源的真实格式（部分在本机实测）、坑位、归一化映射表 |
-| [docs/03-架构设计.md](docs/03-架构设计.md) | 分层、技术选型对比、目录结构、完整 SQLite Schema、查重/校验算法、搜索方案 |
+| [docs/02-数据格式规范.md](docs/02-数据格式规范.md) | 6 个数据源的真实格式（部分在本机实测）、坑位、原生数据类型与统一 `SessionDocument` 行为接口规范 |
+| [docs/03-架构设计.md](docs/03-架构设计.md) | 分层、技术选型对比、目录结构、简化后 SQLite Schema、同源查重/校验算法、搜索方案 |
 | [docs/04-开发计划.md](docs/04-开发计划.md) | 里程碑、WBS 工时表、三种范围口径、风险登记表、路线图 |
 
 ---
@@ -95,7 +95,9 @@ node probe-formats.mjs --zip "D:\downloads\chatgpt-export.zip"
 
 ```
 SessionManager/
-├─ docs/                    # 设计文档（当前阶段产物）
+├─ docs/                    # 设计文档（多态原生会话架构）
 ├─ tools/probe-formats.mjs  # 格式探针（只读扫描，不上传任何数据）
-└─ （后续）packages/{oca,shared,store,adapters,core}  apps/{cli,server,ui-win}
+├─ scripts/                 # GitHub 计划同步等辅助脚本
+├─ packages/                # shared, store, adapters, core, fixtures
+└─ apps/                    # cli (`sm`), server (`sm serve`), ui-win (Flutter)
 ```

@@ -1,3 +1,7 @@
+export * from './types.js';
+export * from './normalize.js';
+export * from './hash.js';
+export * from './minhash.js';
 export * from './result.js';
 export * from './logger.js';
 export * from './zstd.js';

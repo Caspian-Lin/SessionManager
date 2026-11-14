@@ -27,8 +27,8 @@
 
 1. **Zero WebView2 / Electron Overhead**:
    By using Flutter's native Windows renderer (DirectX 12 / Skia / Impeller), `ui-win` maintains 60–120 FPS scrolling over 50,000+ sessions without host runtime version dependencies or memory bloat (~25 MB runtime memory).
-2. **Shares OCA Dart Codegen Models**:
-   Directly imports `packages/oca/codegen/dart/oca_models.dart` for strongly-typed `OcaConversation`, `OcaItem`, `OcaBlock`, and `OcaIntegrityReport` entities, guaranteeing 100% schema consistency between TypeScript and Dart.
+2. **Lightweight ViewModel DTO over `sm serve`**:
+   Consumes the unified `ConversationViewModel` JSON DTO (`ConversationSummary`, `ConversationDetail`, `MessageItem`, `SearchHit`, `BatchReport`) exposed by `sm serve`, decoupled from upstream provider raw formats.
 3. **Chatea Visual Shell Alignment**:
    Adheres to Chatea's design tokens: semi-transparent navigation sidebar, distinct role bubbles (`user`, `assistant`, `tool_call`, `reasoning`), subtle monospace code blocks, and collapsible synthetic logs.
 

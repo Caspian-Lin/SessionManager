@@ -1,4 +1,8 @@
-import { estimateMinHashSimilarity, type OcaConversation } from '@sm/oca';
+import type { SessionDocument } from '@sm/adapters';
+import {
+  estimateMinHashSimilarity,
+  type ConversationViewModel,
+} from '@sm/shared';
 
 export type DedupeDecision =
   | 'identical'
@@ -7,6 +11,12 @@ export type DedupeDecision =
   | 'auto_merge_fingerprint'
   | 'candidate_review'
   | 'new';
+
+export type DedupeComparable = SessionDocument | ConversationViewModel;
+
+function toViewModel(input: DedupeComparable): ConversationViewModel {
+  return 'toViewModel' in input ? input.toViewModel() : input;
+}
 
 /**
  * Checks whether sequence `sub` appears in `full` in the same relative order.
@@ -26,43 +36,65 @@ export function isSubsequence(sub: readonly string[], full: readonly string[]): 
 }
 
 /**
- * Estimates Jaccard similarity between two conversations using their MinHash fingerprints.
+ * Estimates Jaccard similarity between two same-provider sessions using their MinHash fingerprints.
  */
-export function estimateConversationSimilarity(a: OcaConversation, b: OcaConversation): number {
-  if (a.fingerprint === b.fingerprint) return 1.0;
-  if (!a.fingerprint || !b.fingerprint) return 0.0;
+export function estimateConversationSimilarity(a: DedupeComparable, b: DedupeComparable): number {
+  const metaA = toViewModel(a).meta;
+  const metaB = toViewModel(b).meta;
+  if (metaA.fingerprint === metaB.fingerprint) return 1.0;
+  if (!metaA.fingerprint || !metaB.fingerprint) return 0.0;
   try {
-    return estimateMinHashSimilarity(a.fingerprint, b.fingerprint);
+    return estimateMinHashSimilarity(metaA.fingerprint, metaB.fingerprint);
   } catch {
     return 0.0;
   }
 }
 
 /**
- * Multi-tier L0–L4 deduplication decision engine:
- * - L0: Identical content hash (exact duplicate) -> 'identical'
- * - L1: Superset append (incoming is pure forward extension of existing) -> 'superset_append'
- * - L2: External ID match with divergent content -> 'branch_revision'
- * - L3: MinHash similarity >= 0.90 -> 'auto_merge_fingerprint'
- * - L4: MinHash similarity >= 0.75 -> 'candidate_review'
- * - Default -> 'new'
+ * Same-provider L0–L4 deduplication decision engine.
+ * Cross-provider pairs are treated as distinct ('new') unless explicitly reconciled.
  */
 export function decideConversationMerge(
-  incoming: OcaConversation,
-  existing: OcaConversation | null
+  incomingInput: DedupeComparable,
+  existingInput: DedupeComparable | null
 ): DedupeDecision {
-  if (!existing) {
+  if (!existingInput) {
+    return 'new';
+  }
+
+  const incoming = toViewModel(incomingInput);
+  const existing = toViewModel(existingInput);
+
+  // Deduplication only runs within the same provider type
+  if (incoming.meta.provider !== existing.meta.provider) {
+    return 'new';
+  }
+
+  // If both are SessionDocument instances of the same provider, leverage polymorphic diffWith()
+  if ('diffWith' in incomingInput && 'diffWith' in existingInput) {
+    const diff = incomingInput.diffWith(existingInput);
+    if (diff.status === 'identical') return 'identical';
+    if (diff.status === 'superset_append') return 'superset_append';
+    if (
+      incoming.meta.external_id &&
+      existing.meta.external_id &&
+      incoming.meta.external_id === existing.meta.external_id
+    ) {
+      return 'branch_revision';
+    }
+    if (diff.similarity >= 0.9) return 'auto_merge_fingerprint';
+    if (diff.similarity >= 0.75) return 'candidate_review';
     return 'new';
   }
 
   // L0: Exact content hash match
-  if (incoming.content_hash === existing.content_hash) {
+  if (incoming.meta.content_hash === existing.meta.content_hash) {
     return 'identical';
   }
 
   // L1: Superset append check
-  const existingHashes = existing.items.map((it) => it.content_hash);
-  const incomingHashes = incoming.items.map((it) => it.content_hash);
+  const existingHashes = existing.nodes.map((it) => it.content_hash);
+  const incomingHashes = incoming.nodes.map((it) => it.content_hash);
 
   if (
     existingHashes.length > 0 &&
@@ -74,10 +106,9 @@ export function decideConversationMerge(
 
   // L2: Same provider external ID with divergence
   if (
-    incoming.external_id &&
-    existing.external_id &&
-    incoming.external_id === existing.external_id &&
-    incoming.provider === existing.provider
+    incoming.meta.external_id &&
+    existing.meta.external_id &&
+    incoming.meta.external_id === existing.meta.external_id
   ) {
     return 'branch_revision';
   }

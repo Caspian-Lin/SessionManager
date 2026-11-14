@@ -1,7 +1,7 @@
 /**
- * Deterministic, meaning-preserving text normalization for OCA semantic hashing.
+ * Deterministic, meaning-preserving text normalization for semantic hashing & deduplication.
  *
- * Rules (from 03-架构设计.md §6.2):
+ * Rules:
  * 1. \r\n and \r -> \n; strip trailing horizontal whitespace on each line
  * 2. Collapse consecutive blank lines (>=3 newlines -> 2 newlines)
  * 3. Strip ANSI escape sequences (terminal colors / cursor controls)

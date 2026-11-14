@@ -45,6 +45,8 @@ export interface ConversationSummaryRow {
   head_hash: string | null;
   content_hash: string | null;
   fingerprint: string | null;
+  raw_format?: string | null;
+  raw_blob_sha256?: string | null;
   starred: number;
   archived: number;
 }
@@ -67,21 +69,21 @@ export interface ItemRow {
   is_hidden: number;
   is_synthetic: number;
   status: string | null;
+  tool_name: string | null;
+  blocks_json: string | null;
   payload_ref: string | null;
 }
 
-export interface BlockRow {
-  id: number;
-  item_id: number;
+export interface BlockView {
   idx: number;
   type: string;
-  text: string | null;
-  lang: string | null;
-  tool_name: string | null;
-  tool_input: string | null;
-  status: string | null;
-  blob_id: number | null;
-  meta_json: string | null;
+  text?: string | null;
+  lang?: string | null;
+  tool_name?: string | null;
+  tool_input?: string | null;
+  status?: string | null;
+  blob_sha256?: string | null;
+  meta?: Record<string, unknown> | null;
 }
 
 export interface BlobRow {
@@ -202,6 +204,8 @@ export function initializeSchema(db: DatabaseSync): void {
       starred INTEGER NOT NULL DEFAULT 0,
       archived INTEGER NOT NULL DEFAULT 0,
       deleted_at INTEGER,
+      raw_format TEXT,
+      raw_blob_sha256 TEXT,
       flags_json TEXT
     );
 
@@ -223,22 +227,10 @@ export function initializeSchema(db: DatabaseSync): void {
       is_hidden INTEGER NOT NULL DEFAULT 0,
       is_synthetic INTEGER NOT NULL DEFAULT 0,
       status TEXT,
+      tool_name TEXT,
+      blocks_json TEXT,
       payload_ref TEXT,
       flags_json TEXT
-    );
-
-    CREATE TABLE IF NOT EXISTS block (
-      id INTEGER PRIMARY KEY,
-      item_id INTEGER NOT NULL REFERENCES item(id) ON DELETE CASCADE,
-      idx INTEGER NOT NULL,
-      type TEXT NOT NULL,
-      text TEXT,
-      lang TEXT,
-      tool_name TEXT,
-      tool_input TEXT,
-      status TEXT,
-      blob_id INTEGER REFERENCES blob(id),
-      meta_json TEXT
     );
 
     CREATE TABLE IF NOT EXISTS blob (
@@ -440,41 +432,24 @@ export async function startLocalServer(options: ServerOptions = {}): Promise<Run
       const itemsStmt = db.prepare(`
         SELECT id, conversation_id, parent_id, external_id, ordinal, depth,
                role, kind, created_at, model, text, text_len, content_hash,
-               is_active_branch, is_hidden, is_synthetic, status, payload_ref
+               is_active_branch, is_hidden, is_synthetic, status, tool_name,
+               blocks_json, payload_ref
         FROM item
         WHERE conversation_id = ?
         ORDER BY ordinal ASC
       `);
       const items = itemsStmt.all(convId) as unknown as ItemRow[];
 
-      const itemIds = items.map((it) => it.id);
-      let blocks: BlockRow[] = [];
-      if (itemIds.length > 0) {
-        const placeholders = itemIds.map(() => '?').join(',');
-        const blocksStmt = db.prepare(`
-          SELECT id, item_id, idx, type, text, lang, tool_name, tool_input, status, blob_id, meta_json
-          FROM block
-          WHERE item_id IN (${placeholders})
-          ORDER BY item_id ASC, idx ASC
-        `);
-        blocks = blocksStmt.all(...itemIds) as unknown as BlockRow[];
-      }
-
-      // Group blocks by item_id
-      const blocksByItem = new Map<number, BlockRow[]>();
-      for (const b of blocks) {
-        const list = blocksByItem.get(b.item_id) ?? [];
-        list.push(b);
-        blocksByItem.set(b.item_id, list);
-      }
-
-      const enrichedItems = items.map((item) => ({
-        ...item,
-        is_active_branch: Boolean(item.is_active_branch),
-        is_hidden: Boolean(item.is_hidden),
-        is_synthetic: Boolean(item.is_synthetic),
-        blocks: blocksByItem.get(item.id) ?? [],
-      }));
+      const enrichedItems = items.map((item) => {
+        const parsedBlocks = item.blocks_json ? safeJsonParse(item.blocks_json) : null;
+        return {
+          ...item,
+          is_active_branch: Boolean(item.is_active_branch),
+          is_hidden: Boolean(item.is_hidden),
+          is_synthetic: Boolean(item.is_synthetic),
+          blocks: Array.isArray(parsedBlocks) ? (parsedBlocks as BlockView[]) : [],
+        };
+      });
 
       sendJson(res, 200, {
         conversation: conv,

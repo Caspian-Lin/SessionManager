@@ -1,7 +1,6 @@
 {
   "files": [],
   "references": [
-    { "path": "packages/oca" },
     { "path": "packages/shared" },
     { "path": "packages/store" },
     { "path": "packages/adapters" },

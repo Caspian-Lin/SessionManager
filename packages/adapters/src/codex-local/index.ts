@@ -1,35 +1,50 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import zlib from 'node:zlib';
 import {
-  OCA_SPILL_THRESHOLD_BYTES,
+  SPILL_THRESHOLD_BYTES,
+  decompressZstd,
+  isZstdBuffer,
+  iterJsonLines,
   sha256Hex,
-  type OcaBlock,
-  type OcaConversationDraft,
-  type OcaItemDraft,
-  type OcaProviderId,
-  type OcaRole,
-} from '@sm/oca';
+  type IntegrityIssue,
+  type ProviderId,
+  type SessionRole,
+  type ViewBlock,
+} from '@sm/shared';
 import {
+  BaseSessionDocument,
   partitionVendorFields,
   type Adapter,
   type ImportTask,
   type ParseCtx,
   type ProbeResult,
+  type RawTurnProjection,
+  type SessionDocument,
   type SourceRef,
 } from '../contract.js';
 
-const ZSTD_MAGIC = 0xfd2fb528;
+export interface CodexRolloutRecord {
+  timestamp?: string;
+  ordinal?: number;
+  type?: string;
+  payload?: Record<string, unknown>;
+}
+
+export interface CodexNativeSession {
+  session_id: string;
+  source_file: string;
+  cwd?: string | null;
+  originator?: string | null;
+  cli_version?: string | null;
+  model_provider?: string | null;
+  base_instructions_sha256?: string | null;
+  records: CodexRolloutRecord[];
+}
 
 function readBufferMaybeZstd(filePath: string): Buffer {
   const buf = fs.readFileSync(filePath);
-  if (buf.length >= 4 && buf.readUInt32LE(0) === ZSTD_MAGIC) {
-    try {
-      return zlib.zstdDecompressSync(buf);
-    } catch {
-      // In case of multiple frames or external decoder requirement, return raw
-      return buf;
-    }
+  if (isZstdBuffer(buf)) {
+    return decompressZstd(buf);
   }
   return buf;
 }
@@ -45,8 +60,115 @@ const KNOWN_META_KEYS = [
   'history_mode',
 ] as const;
 
-export class CodexLocalAdapter implements Adapter {
-  readonly id: OcaProviderId = 'codex-local';
+export class CodexSessionDocument extends BaseSessionDocument<CodexNativeSession> {
+  constructor(
+    nativeData: CodexNativeSession,
+    createdAt: number | null,
+    updatedAt: number | null,
+    parseIssues: IntegrityIssue[] = []
+  ) {
+    super({
+      provider: 'codex-local',
+      rawFormat: 'codex-rollout/v1',
+      nativeData,
+      external_id: nativeData.session_id,
+      title: null,
+      title_source: null,
+      created_at: createdAt,
+      updated_at: updatedAt,
+      default_model: nativeData.model_provider ?? null,
+      cwd: nativeData.cwd ?? null,
+      parseIssues,
+    });
+  }
+
+  protected projectTurns(): RawTurnProjection[] {
+    const turns: RawTurnProjection[] = [];
+    let ordinal = 0;
+    let prevItemId: string | null = null;
+    const createdAt = this.init.created_at ?? null;
+
+    for (const record of this.nativeData.records) {
+      const recordType = typeof record.type === 'string' ? record.type : '';
+      const ts = typeof record.timestamp === 'string' ? Date.parse(record.timestamp) : null;
+      const payload = (record.payload ?? {}) as Record<string, unknown>;
+
+      if (recordType === 'turn_context') {
+        const turnId = typeof payload['turn_id'] === 'string' ? payload['turn_id'] : `turn-${ordinal}`;
+        const itemId = `tc-${turnId}-${ordinal}`;
+        turns.push({
+          external_id: itemId,
+          parent_external_id: prevItemId,
+          ordinal: ordinal++,
+          role: 'system',
+          kind: 'turn_context',
+          created_at: ts ?? createdAt,
+          text: `Turn context: ${turnId}`,
+          is_active_branch: true,
+          is_hidden: false,
+          is_synthetic: true,
+          blocks: [
+            {
+              idx: 0,
+              type: 'text',
+              text: `turn_id=${turnId}`,
+              meta: payload,
+            },
+          ],
+        });
+        prevItemId = itemId;
+      } else if (recordType === 'response_item') {
+        const rawRole = typeof payload['role'] === 'string' ? payload['role'].toLowerCase() : 'assistant';
+        const role: SessionRole = rawRole === 'user' ? 'user' : 'assistant';
+        const itemId = `item-${this.nativeData.session_id}-${ordinal}`;
+
+        const contentArr = Array.isArray(payload['content']) ? payload['content'] : [];
+        const blocks: ViewBlock[] = [];
+        let bIdx = 0;
+
+        for (const c of contentArr) {
+          if (!c || typeof c !== 'object') continue;
+          const cObj = c as Record<string, unknown>;
+          const text = typeof cObj['text'] === 'string' ? cObj['text'] : '';
+
+          let payloadRef: string | null = null;
+          if (Buffer.byteLength(text, 'utf8') > SPILL_THRESHOLD_BYTES) {
+            payloadRef = sha256Hex(text);
+          }
+
+          blocks.push({
+            idx: bIdx++,
+            type: 'text',
+            text,
+            blob_sha256: payloadRef,
+          });
+        }
+
+        const projectedText = blocks.map((b) => b.text ?? '').filter(Boolean).join('\n');
+
+        turns.push({
+          external_id: itemId,
+          parent_external_id: prevItemId,
+          ordinal: ordinal++,
+          role,
+          kind: 'message',
+          created_at: ts ?? createdAt,
+          text: projectedText,
+          is_active_branch: true,
+          is_hidden: false,
+          is_synthetic: false,
+          blocks,
+        });
+        prevItemId = itemId;
+      }
+    }
+
+    return turns;
+  }
+}
+
+export class CodexLocalAdapter implements Adapter<CodexNativeSession> {
+  readonly id: ProviderId = 'codex-local';
 
   async probe(src: SourceRef): Promise<ProbeResult | null> {
     const evidence: string[] = [];
@@ -65,9 +187,10 @@ export class CodexLocalAdapter implements Adapter {
 
         if (hasSessions || hasArchived || hasSqlite) {
           confidence = 0.98;
-          evidence.push(`Found Codex directory structure (sessions=${hasSessions}, sqlite=${hasSqlite}, index=${hasIndex})`);
+          evidence.push(
+            `Found Codex directory structure (sessions=${hasSessions}, sqlite=${hasSqlite}, index=${hasIndex})`
+          );
 
-          // Collect sample rollout files from sessions
           const sessionsDir = path.join(dir, 'sessions');
           if (fs.existsSync(sessionsDir)) {
             this.collectRolloutFiles(sessionsDir, entries, 50);
@@ -132,7 +255,7 @@ export class CodexLocalAdapter implements Adapter {
     }
   }
 
-  async parse(task: ImportTask, ctx: ParseCtx): Promise<OcaConversationDraft[]> {
+  async parse(task: ImportTask, ctx: ParseCtx): Promise<SessionDocument<CodexNativeSession>[]> {
     const filePath = task.entry ?? task.src.path;
     ctx.log('info', `CodexLocalAdapter parsing file: ${filePath}`);
 
@@ -144,8 +267,6 @@ export class CodexLocalAdapter implements Adapter {
       return [];
     }
 
-    const lines = buf.toString('utf8').split('\n');
-
     let sessionId: string | null = null;
     let cwd: string | null = null;
     let originator: string | null = null;
@@ -154,32 +275,31 @@ export class CodexLocalAdapter implements Adapter {
     let baseInstructionsSha: string | null = null;
     let createdAt: number | null = null;
     let updatedAt: number | null = null;
-    let unmappedMeta: Record<string, unknown> | undefined;
 
-    const items: OcaItemDraft[] = [];
-    let ordinal = 0;
-    let prevItemId: string | null = null;
+    const records: CodexRolloutRecord[] = [];
+    const parseIssues: IntegrityIssue[] = [];
 
-    for (const line of lines) {
-      if (!line.trim()) continue;
-      let record: Record<string, unknown>;
+    for (const line of iterJsonLines(buf)) {
+      let record: CodexRolloutRecord;
       try {
-        record = JSON.parse(line);
+        record = JSON.parse(line) as CodexRolloutRecord;
       } catch {
-        // Tolerant to truncated tail lines
+        parseIssues.push({
+          code: 'truncated_stream',
+          severity: 'warn',
+          message: `Malformed or truncated JSONL line skipped in ${path.basename(filePath)}`,
+        });
         continue;
       }
 
-      const recordType = typeof record['type'] === 'string' ? record['type'] : '';
-      const timestampStr = typeof record['timestamp'] === 'string' ? record['timestamp'] : null;
-      const ts = timestampStr ? Date.parse(timestampStr) : null;
+      const recordType = typeof record.type === 'string' ? record.type : '';
+      const ts = typeof record.timestamp === 'string' ? Date.parse(record.timestamp) : null;
       if (ts) {
         if (!createdAt) createdAt = ts;
         updatedAt = ts;
       }
 
-      const payload = (record['payload'] ?? {}) as Record<string, unknown>;
-
+      const payload = (record.payload ?? {}) as Record<string, unknown>;
       if (recordType === 'session_meta') {
         sessionId =
           typeof payload['session_id'] === 'string'
@@ -192,126 +312,34 @@ export class CodexLocalAdapter implements Adapter {
         cliVersion = typeof payload['cli_version'] === 'string' ? payload['cli_version'] : null;
         modelProvider = typeof payload['model_provider'] === 'string' ? payload['model_provider'] : null;
 
-        // Hash base instructions rather than storing giant prompt in body
         if (typeof payload['base_instructions'] === 'string') {
           baseInstructionsSha = sha256Hex(payload['base_instructions']);
+          // Strip huge base_instructions from native slice, keep sha256 reference
+          payload['base_instructions_sha256'] = baseInstructionsSha;
+          delete payload['base_instructions'];
         }
-
-        unmappedMeta = partitionVendorFields(payload, KNOWN_META_KEYS, ctx);
-      } else if (recordType === 'turn_context') {
-        const turnId = typeof payload['turn_id'] === 'string' ? payload['turn_id'] : `turn-${ordinal}`;
-        const itemId = `tc-${turnId}-${ordinal}`;
-        items.push({
-          external_id: itemId,
-          parent_external_id: prevItemId,
-          ordinal: ordinal++,
-          role: 'system',
-          kind: 'turn_context',
-          created_at: ts ?? createdAt,
-          text: `Turn context: ${turnId}`,
-          text_len: 20,
-          is_active_branch: true,
-          is_hidden: false,
-          is_synthetic: true,
-          blocks: [
-            {
-              idx: 0,
-              type: 'text',
-              text: `turn_id=${turnId}`,
-              meta: payload,
-            },
-          ],
-          ext: {
-            codex: {
-              turn_id: turnId,
-              collaboration_mode_kind:
-                typeof payload['collaboration_mode_kind'] === 'string' ? payload['collaboration_mode_kind'] : null,
-            },
-          },
-        });
-        prevItemId = itemId;
-      } else if (recordType === 'response_item') {
-        const rawRole = typeof payload['role'] === 'string' ? payload['role'].toLowerCase() : 'assistant';
-        const role: OcaRole = rawRole === 'user' ? 'user' : 'assistant';
-        const itemId = `item-${sessionId ?? 's'}-${ordinal}`;
-
-        const contentArr = Array.isArray(payload['content']) ? payload['content'] : [];
-        const blocks: OcaBlock[] = [];
-        let bIdx = 0;
-
-        for (const c of contentArr) {
-          if (!c || typeof c !== 'object') continue;
-          const cObj = c as Record<string, unknown>;
-          const text = typeof cObj['text'] === 'string' ? cObj['text'] : '';
-
-          let payloadRef: string | null = null;
-          if (Buffer.byteLength(text, 'utf8') > OCA_SPILL_THRESHOLD_BYTES) {
-            payloadRef = sha256Hex(text);
-          }
-
-          blocks.push({
-            idx: bIdx++,
-            type: 'text',
-            text,
-            blob_sha256: payloadRef,
-          });
-        }
-
-        const projectedText = blocks.map((b) => b.text ?? '').filter(Boolean).join('\n');
-
-        items.push({
-          external_id: itemId,
-          parent_external_id: prevItemId,
-          ordinal: ordinal++,
-          role,
-          kind: 'message',
-          created_at: ts ?? createdAt,
-          text: projectedText,
-          text_len: projectedText.length,
-          is_active_branch: true,
-          is_hidden: false,
-          is_synthetic: false,
-          blocks,
-          ext: {
-            codex: {
-              originator,
-              cli_version: cliVersion,
-              model_provider: modelProvider,
-              base_instructions_sha256: baseInstructionsSha,
-              rollout_ordinal: typeof record['ordinal'] === 'number' ? record['ordinal'] : ordinal,
-            },
-          },
-        });
-        prevItemId = itemId;
+        partitionVendorFields(payload, KNOWN_META_KEYS, ctx);
       }
+
+      records.push(record);
     }
 
-    if (!sessionId && items.length === 0) {
+    if (!sessionId && records.length === 0) {
       return [];
     }
 
-    return [
-      {
-        provider: this.id,
-        external_id: sessionId ?? path.basename(filePath, path.extname(filePath)),
-        title: null,
-        title_source: null,
-        cwd,
-        created_at: createdAt,
-        updated_at: updatedAt,
-        default_model: modelProvider,
-        items,
-        ext: {
-          codex: {
-            originator,
-            cli_version: cliVersion,
-            model_provider: modelProvider,
-            base_instructions_sha256: baseInstructionsSha,
-          },
-          ...(unmappedMeta ? { _unmapped: unmappedMeta } : {}),
-        },
-      },
-    ];
+    const nativeSession: CodexNativeSession = {
+      session_id: sessionId ?? path.basename(filePath, path.extname(filePath)),
+      source_file: filePath,
+      cwd,
+      originator,
+      cli_version: cliVersion,
+      model_provider: modelProvider,
+      base_instructions_sha256: baseInstructionsSha,
+      records,
+    };
+
+    return [new CodexSessionDocument(nativeSession, createdAt, updatedAt, parseIssues)];
   }
 }
 

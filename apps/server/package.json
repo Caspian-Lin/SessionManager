@@ -10,7 +10,6 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@sm/oca": "workspace:*",
     "@sm/shared": "workspace:*",
     "@sm/store": "workspace:*",
     "@sm/core": "workspace:*"

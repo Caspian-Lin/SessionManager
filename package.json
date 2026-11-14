@@ -2,7 +2,7 @@
   "name": "session-manager",
   "version": "0.1.0",
   "private": true,
-  "description": "Local AI conversation archive with OCA intermediate representation, deduplication, and integrity verification",
+  "description": "Local AI conversation archive with polymorphic session adapters, same-provider deduplication, and integrity verification",
   "type": "module",
   "engines": {
     "node": ">=24.0.0",
@@ -12,7 +12,6 @@
     "build": "pnpm -r --filter './packages/*' --filter './apps/*' run build",
     "typecheck": "pnpm -r --filter './packages/*' --filter './apps/*' run typecheck",
     "test": "vitest run",
-    "codegen:oca": "node scripts/codegen-oca.mjs",
     "probe": "node tools/probe-formats.mjs",
     "sm": "node apps/cli/dist/index.js"
   },

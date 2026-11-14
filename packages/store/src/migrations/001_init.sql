@@ -89,10 +89,12 @@ CREATE TABLE IF NOT EXISTS conversation (
   item_count     INTEGER NOT NULL DEFAULT 0,
   char_count     INTEGER NOT NULL DEFAULT 0,
   blob_count     INTEGER NOT NULL DEFAULT 0,
-  head_hash      TEXT,
-  content_hash   TEXT,
-  fingerprint    TEXT,
-  revision_count INTEGER NOT NULL DEFAULT 1,
+  head_hash       TEXT,
+  content_hash    TEXT,
+  fingerprint     TEXT,
+  raw_format      TEXT,
+  raw_blob_sha256 TEXT,
+  revision_count  INTEGER NOT NULL DEFAULT 1,
   first_batch_id INTEGER REFERENCES import_batch(id),
   last_batch_id  INTEGER REFERENCES import_batch(id),
   starred        INTEGER NOT NULL DEFAULT 0,
@@ -122,7 +124,7 @@ CREATE TABLE IF NOT EXISTS conversation_revision (
   UNIQUE(conversation_id, content_hash)
 );
 
--- ── 会话树节点 ────────────────────────────────────────────
+-- ── 轻量搜索与分支索引节点（正文与完整结构存原生切片） ──────
 CREATE TABLE IF NOT EXISTS item (
   id               INTEGER PRIMARY KEY,
   conversation_id  INTEGER NOT NULL REFERENCES conversation(id) ON DELETE CASCADE,
@@ -134,8 +136,10 @@ CREATE TABLE IF NOT EXISTS item (
   kind             TEXT NOT NULL,
   created_at       INTEGER,
   model            TEXT,
+  tool_name        TEXT,
   text             TEXT,
   text_len         INTEGER NOT NULL DEFAULT 0,
+  blocks_json      TEXT,
   content_hash     TEXT NOT NULL,
   is_active_branch INTEGER NOT NULL DEFAULT 1,
   is_hidden        INTEGER NOT NULL DEFAULT 0,
@@ -149,25 +153,9 @@ CREATE INDEX IF NOT EXISTS ix_item_conv ON item(conversation_id, ordinal);
 CREATE INDEX IF NOT EXISTS ix_item_cat  ON item(conversation_id, kind, ordinal);
 CREATE INDEX IF NOT EXISTS ix_item_hash ON item(content_hash);
 CREATE INDEX IF NOT EXISTS ix_item_role ON item(conversation_id, role) WHERE is_synthetic = 0;
+CREATE INDEX IF NOT EXISTS ix_item_tool ON item(tool_name) WHERE tool_name IS NOT NULL;
 
--- ── 内容块 ────────────────────────────────────────────────
-CREATE TABLE IF NOT EXISTS block (
-  id         INTEGER PRIMARY KEY,
-  item_id    INTEGER NOT NULL REFERENCES item(id) ON DELETE CASCADE,
-  idx        INTEGER NOT NULL,
-  type       TEXT NOT NULL,
-  text       TEXT,
-  lang       TEXT,
-  tool_name  TEXT,
-  tool_input TEXT,
-  status     TEXT,
-  blob_id    INTEGER REFERENCES blob(id),
-  meta_json  TEXT,
-  UNIQUE(item_id, idx)
-);
-CREATE INDEX IF NOT EXISTS ix_block_tool ON block(tool_name) WHERE tool_name IS NOT NULL;
-
--- ── 二进制（内容寻址 → 天然去重） ────────────────────────
+-- ── 二进制与原生切片（内容寻址 → 天然去重） ──────────────────
 CREATE TABLE IF NOT EXISTS blob (
   id          INTEGER PRIMARY KEY,
   sha256      TEXT NOT NULL UNIQUE,
@@ -182,13 +170,6 @@ CREATE TABLE IF NOT EXISTS blob (
   created_at  INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS ix_blob_mime ON blob(mime);
-
-CREATE TABLE IF NOT EXISTS item_blob (
-  item_id INTEGER NOT NULL REFERENCES item(id) ON DELETE CASCADE,
-  blob_id INTEGER NOT NULL REFERENCES blob(id) ON DELETE CASCADE,
-  role    TEXT NOT NULL,
-  PRIMARY KEY (item_id, blob_id, role)
-);
 
 -- ── 查重候选 ──────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS dedupe_candidate (
@@ -221,19 +202,19 @@ CREATE VIRTUAL TABLE IF NOT EXISTS conv_fts_tri USING fts5(
 -- ── FTS 同步触发器 ─────────────────────────────────────────
 CREATE TRIGGER IF NOT EXISTS item_fts_uni_ai AFTER INSERT ON item BEGIN
   INSERT INTO item_fts_uni(rowid, text, tool_name)
-    SELECT new.id, new.text, (SELECT tool_name FROM block WHERE item_id = new.id AND tool_name IS NOT NULL LIMIT 1);
+    VALUES (new.id, new.text, new.tool_name);
 END;
 
 CREATE TRIGGER IF NOT EXISTS item_fts_uni_ad AFTER DELETE ON item BEGIN
   INSERT INTO item_fts_uni(item_fts_uni, rowid, text, tool_name)
-    SELECT 'delete', old.id, old.text, (SELECT tool_name FROM block WHERE item_id = old.id AND tool_name IS NOT NULL LIMIT 1);
+    VALUES ('delete', old.id, old.text, old.tool_name);
 END;
 
 CREATE TRIGGER IF NOT EXISTS item_fts_uni_au AFTER UPDATE ON item BEGIN
   INSERT INTO item_fts_uni(item_fts_uni, rowid, text, tool_name)
-    SELECT 'delete', old.id, old.text, (SELECT tool_name FROM block WHERE item_id = old.id AND tool_name IS NOT NULL LIMIT 1);
+    VALUES ('delete', old.id, old.text, old.tool_name);
   INSERT INTO item_fts_uni(rowid, text, tool_name)
-    SELECT new.id, new.text, (SELECT tool_name FROM block WHERE item_id = new.id AND tool_name IS NOT NULL LIMIT 1);
+    VALUES (new.id, new.text, new.tool_name);
 END;
 
 CREATE TRIGGER IF NOT EXISTS item_fts_tri_ai AFTER INSERT ON item BEGIN
