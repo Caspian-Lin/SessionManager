@@ -9,12 +9,13 @@
     "pnpm": ">=9.0.0"
   },
   "scripts": {
-    "build": "pnpm -r --filter './packages/*' --filter './apps/*' run build",
-    "typecheck": "pnpm -r --filter './packages/*' --filter './apps/*' run typecheck",
+    "build": "pnpm -r run build",
+    "typecheck": "pnpm -r run typecheck",
     "test": "vitest run",
     "probe": "node tools/probe-formats.mjs",
     "sm": "node apps/cli/dist/index.js",
-    "package:win": "node scripts/build-win-portable.mjs"
+    "package:win": "node scripts/build-win-portable.mjs",
+    "package:msix": "node scripts/build-win-msix.mjs"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

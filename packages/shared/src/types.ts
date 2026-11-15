@@ -15,8 +15,11 @@ export type ProviderId =
   | 'codex-local'
   | 'claude-code-local'
   | 'dsh-local'
+  | 'zcode-local'
+  | 'opencode-local'
   | 'generic-json'
-  | 'generic-md';
+  | 'generic-md'
+  | 'sm-native';
 
 export type SessionRole = 'user' | 'assistant' | 'system' | 'tool' | 'developer';
 
@@ -134,6 +137,9 @@ export interface ViewNode {
 export interface SessionMeta {
   provider: ProviderId;
   external_id: string | null;
+  parent_external_id?: string | null;
+  is_subagent?: boolean;
+  subagent_name?: string | null;
   title: string | null;
   title_source: TitleSource | null;
   summary: string | null;

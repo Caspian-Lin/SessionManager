@@ -7,18 +7,24 @@ import { deepseekWebAdapter } from './deepseek-web/index.js';
 import { dshLocalAdapter } from './dsh-local/index.js';
 import { genericJsonAdapter, genericMdAdapter } from './generic/index.js';
 import { openaiWebAdapter } from './openai-web/index.js';
+import { opencodeLocalAdapter } from './opencode-local/index.js';
+import { smNativeAdapter } from './sm-native/index.js';
+import { zcodeLocalAdapter } from './zcode-local/index.js';
 
 export class AdapterRegistry {
   private readonly adapters = new Map<ProviderId, Adapter>();
 
   constructor(registerDefaults = true) {
     if (registerDefaults) {
+      this.register(smNativeAdapter);
       this.register(openaiWebAdapter);
       this.register(anthropicWebAdapter);
       this.register(deepseekWebAdapter);
       this.register(codexLocalAdapter);
       this.register(claudeCodeLocalAdapter);
       this.register(dshLocalAdapter);
+      this.register(zcodeLocalAdapter);
+      this.register(opencodeLocalAdapter);
       this.register(genericJsonAdapter);
       this.register(genericMdAdapter);
     }

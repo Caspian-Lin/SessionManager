@@ -13,6 +13,9 @@ import {
   type ImportBatchRow,
   type ItemRow,
   type ListConversationsOptions,
+  type ProjectRow,
+  type TagRow,
+  type VacuumReport,
 } from '@sm/store';
 import {
   formatIntegrityReportJson,
@@ -23,6 +26,11 @@ import {
   type PipelineOptions,
   type PipelineResult,
 } from './pipeline.js';
+import {
+  exportProviderRawArchive,
+  type ProviderRawExportOptions,
+  type ProviderRawExportReport,
+} from './raw-exporter.js';
 import {
   executeArchiveSearch,
   type ArchiveSearchOptions,
@@ -129,6 +137,47 @@ export class ArchiveService {
 
   listDedupeCandidates(status?: string): DedupeCandidateRow[] {
     return this.repository.listDedupeCandidates(status);
+  }
+
+  listProjects(): Array<ProjectRow & { conversation_count: number }> {
+    return this.repository.listProjects();
+  }
+
+  setStarred(convId: number, starred: boolean): boolean {
+    return this.repository.setConversationStarred(convId, starred);
+  }
+
+  addTag(convId: number, tagName: string, color?: string | null): TagRow {
+    return this.repository.addConversationTag(convId, tagName, color ?? null);
+  }
+
+  removeTag(convId: number, tagName: string): boolean {
+    return this.repository.removeConversationTag(convId, tagName);
+  }
+
+  listTags(convId?: number): Array<TagRow & { conversation_count?: number }> {
+    return convId !== undefined
+      ? this.repository.listConversationTags(convId)
+      : this.repository.listAllTags();
+  }
+
+  softDeleteConversation(convId: number): boolean {
+    return this.repository.softDeleteConversation(convId);
+  }
+
+  restoreConversation(convId: number): boolean {
+    return this.repository.restoreConversation(convId);
+  }
+
+  vacuum(opts: { olderThanMs?: number; dryRun?: boolean; purgeBlobs?: boolean } = {}): VacuumReport {
+    return this.repository.vacuumArchive(this.blobStore, opts);
+  }
+
+  async exportProviderRaw(
+    outTarget: string,
+    opts: ProviderRawExportOptions = {}
+  ): Promise<ProviderRawExportReport> {
+    return exportProviderRawArchive(this, outTarget, opts);
   }
 
   /**

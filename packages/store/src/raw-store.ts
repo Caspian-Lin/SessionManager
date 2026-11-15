@@ -16,9 +16,24 @@ export interface RawStorePersistResult {
  */
 export class RawStore {
   public readonly rootDir: string;
+  private readonly ensuredDirs = new Set<string>();
 
   constructor(rootDir: string) {
     this.rootDir = path.resolve(rootDir);
+  }
+
+  private async ensureDir(dir: string): Promise<void> {
+    if (this.ensuredDirs.has(dir)) return;
+    await fs.promises.mkdir(dir, { recursive: true });
+    this.ensuredDirs.add(dir);
+  }
+
+  private ensureDirSync(dir: string): void {
+    if (this.ensuredDirs.has(dir)) return;
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    this.ensuredDirs.add(dir);
   }
 
   /**
@@ -55,7 +70,7 @@ export class RawStore {
     const { relPath, absPath } = this.getRawPath(provider, entryName, sha256);
 
     const dir = path.dirname(absPath);
-    await fs.promises.mkdir(dir, { recursive: true });
+    await this.ensureDir(dir);
 
     try {
       await fs.promises.access(absPath, fs.constants.F_OK);
@@ -87,9 +102,7 @@ export class RawStore {
     const { relPath, absPath } = this.getRawPath(provider, entryName, sha256);
 
     const dir = path.dirname(absPath);
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
-    }
+    this.ensureDirSync(dir);
 
     if (!fs.existsSync(absPath)) {
       const tmpPath = `${absPath}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}.tmp`;

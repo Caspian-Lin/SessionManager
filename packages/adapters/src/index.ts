@@ -7,4 +7,8 @@ export * from './deepseek-web/index.js';
 export * from './codex-local/index.js';
 export * from './claude-code-local/index.js';
 export * from './dsh-local/index.js';
+export * from './zcode-local/index.js';
+export * from './opencode-local/index.js';
+export * from './opencode-common/index.js';
 export * from './generic/index.js';
+export * from './sm-native/index.js';

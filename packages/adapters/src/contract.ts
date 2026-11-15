@@ -43,6 +43,7 @@ export interface ImportTask {
   entry?: string;
   range?: [number, number];
   estimatedBytes: number;
+  payload?: unknown;
 }
 
 export interface ParseCtx {
@@ -51,6 +52,8 @@ export interface ParseCtx {
   spill(payload: unknown): Promise<string>;
   log(level: 'info' | 'warn' | 'error', msg: string, extra?: unknown): void;
   recordUnrecognizedField?(key: string): void;
+  skipIfUnchanged?(filePath: string): boolean;
+  recordSourceFile?(filePath: string): void;
 }
 
 /**
@@ -105,6 +108,9 @@ export interface BaseSessionInit<TRaw> {
   rawFormat: string;
   nativeData: TRaw;
   external_id: string | null;
+  parent_external_id?: string | null;
+  is_subagent?: boolean;
+  subagent_name?: string | null;
   title?: string | null;
   title_source?: TitleSource | null;
   summary?: string | null;
@@ -306,6 +312,9 @@ export abstract class BaseSessionDocument<TRaw> implements SessionDocument<TRaw>
     this.cachedMeta = {
       provider: this.provider,
       external_id: convExtId,
+      parent_external_id: this.init.parent_external_id ?? null,
+      is_subagent: Boolean(this.init.is_subagent || this.init.parent_external_id),
+      subagent_name: this.init.subagent_name ?? null,
       title,
       title_source: titleSource,
       summary,

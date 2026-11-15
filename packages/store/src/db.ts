@@ -41,6 +41,10 @@ export class ArchiveDatabase {
     db.exec('PRAGMA journal_mode = WAL;');
     db.exec('PRAGMA foreign_keys = ON;');
     db.exec('PRAGMA synchronous = NORMAL;');
+    db.exec('PRAGMA busy_timeout = 10000;');
+    db.exec('PRAGMA cache_size = -65536;');
+    db.exec('PRAGMA temp_store = MEMORY;');
+    db.exec('PRAGMA mmap_size = 268435456;');
 
     return new ArchiveDatabase(db, dbPath);
   }
@@ -64,6 +68,13 @@ export class ArchiveDatabase {
    * Executes the baseline schema (001_init.sql) and ensures metadata entries exist.
    */
   migrate(): void {
+    // Recreate column-scoped AFTER UPDATE FTS5 triggers on existing DBs so
+    // non-text updates (parent_id, is_active_branch, starred) never re-index FTS5.
+    this.rawDb.exec(`
+      DROP TRIGGER IF EXISTS item_fts_uni_au;
+      DROP TRIGGER IF EXISTS item_fts_tri_au;
+      DROP TRIGGER IF EXISTS conv_fts_tri_au;
+    `);
     this.rawDb.exec(SCHEMA_001_SQL);
 
     const now = Date.now().toString();

@@ -6,6 +6,8 @@ import '../data/sm_cli_runner.dart';
 import '../l10n/app_strings.dart';
 import '../models.dart';
 import '../theme.dart';
+import '../widgets/gm3_surface.dart';
+import '../widgets/reset_archive_dialog.dart';
 
 class IntegrityReportView extends StatefulWidget {
   final ArchiveDirectStore store;
@@ -105,44 +107,75 @@ class _IntegrityReportViewState extends State<IntegrityReportView> {
       controller: _scrollCtrl,
       child: SingleChildScrollView(
         controller: _scrollCtrl,
-        padding: const EdgeInsets.all(20),
+        padding: const EdgeInsets.fromLTRB(24, 20, 24, 24),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Row(
+            Wrap(
+              spacing: 12,
+              runSpacing: 10,
+              crossAxisAlignment: WrapCrossAlignment.center,
+              alignment: WrapAlignment.spaceBetween,
               children: [
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        AppStringsScope.of(context).integrityTitle,
-                        style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w600),
+                Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      AppStringsScope.of(context).integrityTitle,
+                      style: theme.textTheme.titleLarge,
+                    ),
+                    const SizedBox(height: 3),
+                    Text(
+                      '${AppStringsScope.of(context).integritySubtitle} (${widget.store.dbPath})',
+                      style: theme.textTheme.bodySmall,
+                    ),
+                  ],
+                ),
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: [
+                    OutlinedButton.icon(
+                      onPressed: _runningCli ? null : () => _runCliAction('sm verify', widget.cliRunner.verify),
+                      icon: const Icon(Icons.verified_outlined, size: 16),
+                      label: Text(AppStringsScope.of(context).runVerify),
+                    ),
+                    OutlinedButton.icon(
+                      onPressed: _runningCli ? null : () => _runCliAction('sm dedupe', widget.cliRunner.dedupe),
+                      icon: const Icon(Icons.compare_arrows, size: 16),
+                      label: Text(AppStringsScope.of(context).isZh ? '执行查重' : 'Dedupe'),
+                    ),
+                    FilledButton.tonalIcon(
+                      onPressed: _runningCli ? null : () => _runCliAction('sm reindex', widget.cliRunner.reindex),
+                      icon: const Icon(Icons.manage_search, size: 16),
+                      label: Text(AppStringsScope.of(context).runReindex),
+                    ),
+                    OutlinedButton.icon(
+                      style: OutlinedButton.styleFrom(
+                        foregroundColor: cs.error,
+                        side: BorderSide(color: cs.error.withOpacity(0.5)),
                       ),
-                      const SizedBox(height: 2),
-                      Text(
-                        '${AppStringsScope.of(context).integritySubtitle} (${widget.store.dbPath})',
-                        style: TextStyle(color: cs.onSurfaceVariant, fontSize: 12),
-                      ),
-                    ],
-                  ),
-                ),
-                OutlinedButton.icon(
-                  onPressed: _runningCli ? null : () => _runCliAction('sm verify', widget.cliRunner.verify),
-                  icon: const Icon(Icons.verified_outlined, size: 16),
-                  label: Text(AppStringsScope.of(context).runVerify),
-                ),
-                const SizedBox(width: 8),
-                OutlinedButton.icon(
-                  onPressed: _runningCli ? null : () => _runCliAction('sm dedupe', widget.cliRunner.dedupe),
-                  icon: const Icon(Icons.compare_arrows, size: 16),
-                  label: Text(AppStringsScope.of(context).isZh ? '执行查重' : 'Dedupe'),
-                ),
-                const SizedBox(width: 8),
-                FilledButton.tonalIcon(
-                  onPressed: _runningCli ? null : () => _runCliAction('sm reindex', widget.cliRunner.reindex),
-                  icon: const Icon(Icons.manage_search, size: 16),
-                  label: Text(AppStringsScope.of(context).runReindex),
+                      onPressed: _runningCli
+                          ? null
+                          : () async {
+                              final s = AppStringsScope.of(context);
+                              final res = await showResetArchiveDialog(
+                                context: context,
+                                store: widget.store,
+                                onDataChanged: widget.onDataChanged,
+                              );
+                              if (res != null && res.ok && mounted) {
+                                setState(() {
+                                  _cliStatusMessage = s.resetArchiveDone(
+                                    formatArchiveBytes(res.freedBytes),
+                                  );
+                                });
+                              }
+                            },
+                      icon: const Icon(Icons.delete_forever_outlined, size: 16),
+                      label: Text(AppStringsScope.of(context).resetArchiveAction),
+                    ),
+                  ],
                 ),
               ],
             ),
@@ -150,13 +183,18 @@ class _IntegrityReportViewState extends State<IntegrityReportView> {
               const SizedBox(height: 12),
               Container(
                 width: double.infinity,
-                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 11),
                 decoration: BoxDecoration(
-                  color: cs.surfaceContainerLow,
-                  borderRadius: BorderRadius.circular(12),
-                  border: Border.all(color: cs.outlineVariant.withOpacity(0.45)),
+                  color: Gm3Surfaces.of(context).card,
+                  borderRadius: BorderRadius.circular(Gm3.radiusMd),
                 ),
-                child: Text(_cliStatusMessage!, style: GoogleMaterialTheme.monoTextStyle(fontSize: 11.5)),
+                child: Text(
+                  _cliStatusMessage!,
+                  style: GoogleMaterialTheme.monoTextStyle(
+                    fontSize: Gm3.monoSm,
+                    color: cs.onSurface,
+                  ),
+                ),
               ),
             ],
             const SizedBox(height: 16),
@@ -165,12 +203,13 @@ class _IntegrityReportViewState extends State<IntegrityReportView> {
             if (totalShrunk > 0)
               Container(
                 width: double.infinity,
-                padding: const EdgeInsets.all(14),
+                padding: const EdgeInsets.all(16),
                 margin: const EdgeInsets.only(bottom: 16),
                 decoration: BoxDecoration(
-                  color: Colors.amber.withOpacity(0.12),
-                  borderRadius: BorderRadius.circular(6),
-                  border: Border.all(color: const Color(0xFFD97706)),
+                  color: theme.brightness == Brightness.dark
+                      ? const Color(0xFF3A3122)
+                      : const Color(0xFFFFF7E6),
+                  borderRadius: BorderRadius.circular(Gm3.radiusMd),
                 ),
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
@@ -182,7 +221,7 @@ class _IntegrityReportViewState extends State<IntegrityReportView> {
                         Expanded(
                           child: Text(
                             AppStringsScope.of(context).shrunkAlertTitle(totalShrunk),
-                            style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13.5),
+                            style: theme.textTheme.titleSmall,
                           ),
                         ),
                       ],
@@ -190,7 +229,7 @@ class _IntegrityReportViewState extends State<IntegrityReportView> {
                     const SizedBox(height: 6),
                     Text(
                       AppStringsScope.of(context).shrunkAlertDesc,
-                      style: const TextStyle(fontSize: 12),
+                      style: theme.textTheme.bodySmall,
                     ),
                     if (allShrunkIds.isNotEmpty) ...[
                       const SizedBox(height: 8),
@@ -200,7 +239,7 @@ class _IntegrityReportViewState extends State<IntegrityReportView> {
                         children: allShrunkIds
                             .map((id) => ActionChip(
                                   avatar: const Icon(Icons.open_in_new, size: 13),
-                                  label: Text(id, style: GoogleMaterialTheme.monoTextStyle(fontSize: 11)),
+                                  label: Text(id, style: GoogleMaterialTheme.monoTextStyle(fontSize: Gm3.monoSm)),
                                   onPressed: () => _jumpToShrunkId(id),
                                 ))
                             .toList(),
@@ -240,13 +279,14 @@ class _IntegrityReportViewState extends State<IntegrityReportView> {
             // Side-by-Side Dedupe Candidate Comparison
             Text(
               AppStringsScope.of(context).dedupePairsTitle,
-              style: const TextStyle(fontSize: 15.5, fontWeight: FontWeight.w600),
+              style: theme.textTheme.titleMedium,
             ),
             const SizedBox(height: 8),
             if (_candidates.isEmpty)
               Padding(
                 padding: const EdgeInsets.only(bottom: 16),
-                child: Text(AppStringsScope.of(context).noDedupePairs, style: TextStyle(color: cs.onSurfaceVariant)),
+                child: Text(AppStringsScope.of(context).noDedupePairs,
+                    style: theme.textTheme.bodySmall),
               )
             else
               for (final pair in _candidates)
@@ -258,45 +298,50 @@ class _IntegrityReportViewState extends State<IntegrityReportView> {
             const SizedBox(height: 16),
             Text(
               AppStringsScope.of(context).batchLedgerTitle,
-              style: const TextStyle(fontSize: 15.5, fontWeight: FontWeight.w600),
+              style: theme.textTheme.titleMedium,
             ),
             const SizedBox(height: 8),
             for (final b in _batches)
-              Card(
-                margin: const EdgeInsets.only(bottom: 10),
-                child: Padding(
-                  padding: const EdgeInsets.all(14),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Row(
-                        children: [
-                          Text('Batch #${b.id}', style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 14)),
-                          const SizedBox(width: 8),
-                          Chip(label: Text('${b.provider} (${b.kind})', style: const TextStyle(fontSize: 10.5))),
-                          const Spacer(),
-                          Text(
-                            DateFormat('yyyy-MM-dd HH:mm').format(DateTime.fromMillisecondsSinceEpoch(b.importedAt)),
-                            style: TextStyle(color: cs.onSurfaceVariant, fontSize: 11.5),
-                          ),
-                        ],
-                      ),
-                      const SizedBox(height: 8),
-                      Wrap(
-                        spacing: 8,
-                        runSpacing: 6,
-                        children: [
-                          _DiffPill(label: '+ ${b.addedConversations} Added', color: const Color(0xFF10B981)),
-                          _DiffPill(label: '~ ${b.grownConversations} Grown', color: cs.primary),
-                          _DiffPill(
-                            label: '! ${b.shrunkConversations} Shrunk',
-                            color: b.shrunkConversations > 0 ? const Color(0xFFD97706) : cs.onSurfaceVariant,
-                          ),
-                          _DiffPill(label: '= ${b.identicalConversations} Identical', color: cs.onSurfaceVariant),
-                        ],
-                      ),
-                    ],
-                  ),
+              Gm3Card(
+                margin: const EdgeInsets.only(bottom: 8),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Text('Batch #${b.id}', style: theme.textTheme.titleSmall),
+                        const SizedBox(width: 8),
+                        Gm3Pill(
+                          label: '${b.provider} (${b.kind})',
+                          color: cs.onSurfaceVariant,
+                          background: cs.surfaceContainerHigh,
+                          fontSize: Gm3.fontSizeLabelSmall,
+                          fontWeight: FontWeight.w500,
+                          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                        ),
+                        const Spacer(),
+                        Text(
+                          DateFormat('yyyy-MM-dd HH:mm').format(
+                              DateTime.fromMillisecondsSinceEpoch(b.importedAt)),
+                          style: theme.textTheme.labelSmall,
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 10),
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 6,
+                      children: [
+                        _DiffPill(label: '+ ${b.addedConversations} Added', color: const Color(0xFF10B981)),
+                        _DiffPill(label: '~ ${b.grownConversations} Grown', color: cs.primary),
+                        _DiffPill(
+                          label: '! ${b.shrunkConversations} Shrunk',
+                          color: b.shrunkConversations > 0 ? const Color(0xFFD97706) : cs.onSurfaceVariant,
+                        ),
+                        _DiffPill(label: '= ${b.identicalConversations} Identical', color: cs.onSurfaceVariant),
+                      ],
+                    ),
+                  ],
                 ),
               ),
           ],
@@ -318,66 +363,64 @@ class DedupeDoubleColumnComparison extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final cs = Theme.of(context).colorScheme;
+    final theme = Theme.of(context);
+    final cs = theme.colorScheme;
     final pct = (pair.similarity * 100).toStringAsFixed(1);
 
-    return Card(
-      margin: const EdgeInsets.only(bottom: 12),
-      child: Padding(
-        padding: const EdgeInsets.all(14),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              children: [
-                Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-                  decoration: BoxDecoration(
-                    color: const Color(0xFF7C3AED).withOpacity(0.14),
-                    borderRadius: BorderRadius.circular(4),
-                  ),
-                  child: Text(
-                    '$pct% Similarity',
-                    style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Color(0xFF7C3AED)),
-                  ),
+    return Gm3Card(
+      margin: const EdgeInsets.only(bottom: 10),
+      padding: const EdgeInsets.all(16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Gm3Pill(
+                label: '$pct% Similarity',
+                color: Gm3.adaptiveTint(const Color(0xFF7C3AED), theme.brightness),
+                background: Gm3.adaptiveTint(const Color(0xFF7C3AED), theme.brightness)
+                    .withOpacity(0.12),
+                fontSize: Gm3.fontSizeLabelSmall,
+                padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 2),
+              ),
+              const SizedBox(width: 8),
+              Text(pair.reason,
+                  style: GoogleMaterialTheme.monoTextStyle(
+                      fontSize: Gm3.monoSm, color: cs.onSurfaceVariant)),
+              const Spacer(),
+              Text('status: ${pair.status}', style: theme.textTheme.labelSmall),
+            ],
+          ),
+          const SizedBox(height: 12),
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Expanded(
+                child: _CandidateColumn(
+                  sideLabel: 'Conversation A (#${pair.aId})',
+                  title: pair.aTitle,
+                  provider: pair.aProvider,
+                  headHash: pair.aHeadHash,
+                  itemCount: pair.aItemCount,
+                  previewTurns: pair.aPreviewTurns,
+                  onOpen: () => onOpenConversation(pair.aId),
                 ),
-                const SizedBox(width: 8),
-                Text(pair.reason, style: GoogleMaterialTheme.monoTextStyle(fontSize: 11, color: cs.onSurfaceVariant)),
-                const Spacer(),
-                Text('status: ${pair.status}', style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant)),
-              ],
-            ),
-            const SizedBox(height: 10),
-            Row(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Expanded(
-                  child: _CandidateColumn(
-                    sideLabel: 'Conversation A (#${pair.aId})',
-                    title: pair.aTitle,
-                    provider: pair.aProvider,
-                    headHash: pair.aHeadHash,
-                    itemCount: pair.aItemCount,
-                    previewTurns: pair.aPreviewTurns,
-                    onOpen: () => onOpenConversation(pair.aId),
-                  ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: _CandidateColumn(
+                  sideLabel: 'Conversation B (#${pair.bId})',
+                  title: pair.bTitle,
+                  provider: pair.bProvider,
+                  headHash: pair.bHeadHash,
+                  itemCount: pair.bItemCount,
+                  previewTurns: pair.bPreviewTurns,
+                  onOpen: () => onOpenConversation(pair.bId),
                 ),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: _CandidateColumn(
-                    sideLabel: 'Conversation B (#${pair.bId})',
-                    title: pair.bTitle,
-                    provider: pair.bProvider,
-                    headHash: pair.bHeadHash,
-                    itemCount: pair.bItemCount,
-                    previewTurns: pair.bPreviewTurns,
-                    onOpen: () => onOpenConversation(pair.bId),
-                  ),
-                ),
-              ],
-            ),
-          ],
-        ),
+              ),
+            ],
+          ),
+        ],
       ),
     );
   }
@@ -411,33 +454,46 @@ class _CandidateColumn extends StatelessWidget {
         : (headHash!.length > 10 ? headHash!.substring(0, 10) : headHash!);
 
     return Container(
-      padding: const EdgeInsets.all(12),
+      padding: const EdgeInsets.all(14),
       decoration: BoxDecoration(
-        color: cs.surfaceContainerLowest,
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: cs.outlineVariant.withOpacity(0.45)),
+        color: Gm3Surfaces.of(context).card,
+        borderRadius: BorderRadius.circular(Gm3.radiusMd),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Row(
             children: [
-              Text(sideLabel, style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w600, color: cs.primary)),
+              Text(sideLabel,
+                  style: theme.textTheme.labelSmall?.copyWith(
+                    fontWeight: FontWeight.w600,
+                    color: cs.primary,
+                  )),
               const Spacer(),
               TextButton(
                 onPressed: onOpen,
-                child: Text(AppStringsScope.of(context).openInReader, style: const TextStyle(fontSize: 11.5)),
+                style: TextButton.styleFrom(
+                  padding: const EdgeInsets.symmetric(horizontal: 8),
+                  minimumSize: const Size(0, 28),
+                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                ),
+                child: Text(AppStringsScope.of(context).openInReader,
+                    style: theme.textTheme.labelSmall),
               ),
             ],
           ),
-          Text(title, style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 13), maxLines: 1, overflow: TextOverflow.ellipsis),
+          Text(title,
+              style: theme.textTheme.titleSmall,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis),
           const SizedBox(height: 3),
           Text(
             '$provider · $itemCount items · hash:$hashPrefix',
-            style: GoogleMaterialTheme.monoTextStyle(fontSize: 10.5, color: cs.onSurfaceVariant),
+            style: GoogleMaterialTheme.monoTextStyle(
+                fontSize: Gm3.monoSm, color: cs.onSurfaceVariant),
           ),
           if (previewTurns.isNotEmpty) ...[
-            const SizedBox(height: 6),
+            const SizedBox(height: 8),
             for (final t in previewTurns)
               Padding(
                 padding: const EdgeInsets.only(bottom: 3),
@@ -445,7 +501,7 @@ class _CandidateColumn extends StatelessWidget {
                   t,
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
-                  style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
+                  style: theme.textTheme.bodySmall,
                 ),
               ),
           ],
@@ -470,33 +526,40 @@ class _MetricCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final theme = Theme.of(context);
     return Expanded(
-      child: Card(
-        child: Padding(
-          padding: const EdgeInsets.all(12),
-          child: Row(
-            children: [
-              CircleAvatar(
-                radius: 16,
-                backgroundColor: color.withOpacity(0.14),
-                child: Icon(icon, color: color, size: 17),
-              ),
-              const SizedBox(width: 10),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      label,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(fontSize: 11, color: Theme.of(context).colorScheme.onSurfaceVariant),
+      child: Gm3Surface.rounded(
+        radius: Gm3.radiusMd,
+        padding: const EdgeInsets.all(14),
+        child: Row(
+          children: [
+            CircleAvatar(
+              radius: 16,
+              backgroundColor: color.withOpacity(0.14),
+              child: Icon(icon, color: color, size: 17),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    label,
+                    overflow: TextOverflow.ellipsis,
+                    style: theme.textTheme.labelSmall,
+                  ),
+                  Text(
+                    value,
+                    style: theme.textTheme.titleLarge?.copyWith(
+                      fontWeight: FontWeight.w600,
+                      color: color,
+                      height: 1.2,
                     ),
-                    Text(value, style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold, color: color)),
-                  ],
-                ),
+                  ),
+                ],
               ),
-            ],
-          ),
+            ),
+          ],
         ),
       ),
     );
@@ -511,13 +574,21 @@ class _DiffPill extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final tint = Gm3.adaptiveTint(color, Theme.of(context).brightness);
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+      padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 3),
       decoration: BoxDecoration(
-        color: color.withOpacity(0.12),
-        borderRadius: BorderRadius.circular(4),
+        color: tint.withOpacity(0.12),
+        borderRadius: BorderRadius.circular(Gm3.radiusPill),
       ),
-      child: Text(label, style: TextStyle(fontSize: 11, color: color, fontWeight: FontWeight.w600)),
+      child: Text(
+        label,
+        style: Gm3.text(
+          fontSize: Gm3.fontSizeLabelSmall,
+          color: tint,
+          fontWeight: FontWeight.w600,
+        ),
+      ),
     );
   }
 }

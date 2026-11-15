@@ -26,10 +26,15 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
 
   FlutterWindow window(project);
   Win32Window::Point origin(10, 10);
-  Win32Window::Size size(1280, 720);
+  // Fits every 1080p work area at 100-150% scaling; the layout is responsive
+  // down to the 960x620 minimum enforced by the runner.
+  Win32Window::Size size(1440, 920);
   if (!window.Create(L"Session Manager", origin, size)) {
     return EXIT_FAILURE;
   }
+  // The app draws its own title bar, so the window opens centered instead of
+  // at the legacy top-left cascade position.
+  window.CenterOnWorkArea();
   window.SetQuitOnClose(true);
 
   ::MSG msg;

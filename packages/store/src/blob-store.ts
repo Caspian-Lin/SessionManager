@@ -120,9 +120,25 @@ export function sniffMimeAndExt(buf: Buffer): SniffedMime {
  */
 export class BlobStore {
   public readonly rootDir: string;
+  private readonly ensuredDirs = new Set<string>();
+  private readonly inflightWrites = new Map<string, Promise<void>>();
 
   constructor(rootDir: string) {
     this.rootDir = path.resolve(rootDir);
+  }
+
+  private async ensureDir(dir: string): Promise<void> {
+    if (this.ensuredDirs.has(dir)) return;
+    await fs.promises.mkdir(dir, { recursive: true });
+    this.ensuredDirs.add(dir);
+  }
+
+  private ensureDirSync(dir: string): void {
+    if (this.ensuredDirs.has(dir)) return;
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    this.ensuredDirs.add(dir);
   }
 
   /**
@@ -163,24 +179,43 @@ export class BlobStore {
     overrideExt?: string
   ): Promise<BlobAsset> {
     const sha256 = createHash('sha256').update(buf).digest('hex');
-    const sniffed = sniffMimeAndExt(buf);
-    const mime = overrideMime ?? sniffed.mime;
-    const ext = overrideExt ?? sniffed.ext;
+    const needsSniff = overrideMime === undefined || overrideExt === undefined;
+    const sniffed = needsSniff ? sniffMimeAndExt(buf) : null;
+    const mime = overrideMime ?? sniffed!.mime;
+    const ext = overrideExt ?? sniffed!.ext;
 
     const prefix2 = sha256.slice(0, 2);
     const rel_path = path.posix.join('blobs', prefix2, `${sha256}${ext}`);
     const absPath = this.getBlobAbsPath(rel_path);
 
     const dir = path.dirname(absPath);
-    await fs.promises.mkdir(dir, { recursive: true });
+    await this.ensureDir(dir);
 
-    try {
-      await fs.promises.access(absPath, fs.constants.F_OK);
-    } catch {
-      const tmpPath = `${absPath}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}.tmp`;
-      await fs.promises.writeFile(tmpPath, buf);
-      await fs.promises.rename(tmpPath, absPath);
+    let pending = this.inflightWrites.get(absPath);
+    if (!pending) {
+      pending = (async () => {
+        try {
+          await fs.promises.access(absPath, fs.constants.F_OK);
+          return;
+        } catch {
+          // Proceed to write
+        }
+        const tmpPath = `${absPath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}.tmp`;
+        try {
+          await fs.promises.writeFile(tmpPath, buf);
+          await fs.promises.rename(tmpPath, absPath);
+        } catch (err) {
+          await fs.promises.unlink(tmpPath).catch(() => {});
+          if (!fs.existsSync(absPath)) {
+            throw err;
+          }
+        }
+      })().finally(() => {
+        this.inflightWrites.delete(absPath);
+      });
+      this.inflightWrites.set(absPath, pending);
     }
+    await pending;
 
     return {
       sha256,
@@ -203,18 +238,17 @@ export class BlobStore {
     overrideExt?: string
   ): BlobAsset {
     const sha256 = createHash('sha256').update(buf).digest('hex');
-    const sniffed = sniffMimeAndExt(buf);
-    const mime = overrideMime ?? sniffed.mime;
-    const ext = overrideExt ?? sniffed.ext;
+    const needsSniff = overrideMime === undefined || overrideExt === undefined;
+    const sniffed = needsSniff ? sniffMimeAndExt(buf) : null;
+    const mime = overrideMime ?? sniffed!.mime;
+    const ext = overrideExt ?? sniffed!.ext;
 
     const prefix2 = sha256.slice(0, 2);
     const rel_path = path.posix.join('blobs', prefix2, `${sha256}${ext}`);
     const absPath = this.getBlobAbsPath(rel_path);
 
     const dir = path.dirname(absPath);
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
-    }
+    this.ensureDirSync(dir);
 
     if (!fs.existsSync(absPath)) {
       const tmpPath = `${absPath}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}.tmp`;

@@ -65,6 +65,9 @@ export interface CodexNativeSession {
   source_file: string;
   title?: string | null;
   cwd?: string | null;
+  parent_session_id?: string | null;
+  is_subagent?: boolean;
+  subagent_name?: string | null;
   originator?: string | null;
   cli_version?: string | null;
   model_provider?: string | null;
@@ -169,6 +172,11 @@ const KNOWN_META_KEYS = [
   'session_id',
   'id',
   'cwd',
+  'parent_thread_id',
+  'parent_session_id',
+  'source',
+  'agent_role',
+  'agent_nickname',
   'originator',
   'cli_version',
   'model_provider',
@@ -176,6 +184,18 @@ const KNOWN_META_KEYS = [
   'history_mode',
   'timestamp',
 ] as const;
+
+function inferCodexSqliteCwd(items: readonly CodexSqliteItem[] | undefined): string | null {
+  if (!items || items.length === 0) return null;
+  for (const item of items) {
+    if (!item.item_json) continue;
+    const data = safeJsonParse(item.item_json);
+    if (typeof data['cwd'] === 'string' && data['cwd'].trim().length > 0) {
+      return data['cwd'].trim();
+    }
+  }
+  return null;
+}
 
 export class CodexSessionDocument extends BaseSessionDocument<CodexNativeSession> {
   private readonly spillByContentHash: ReadonlyMap<string, SpillRefInfo>;
@@ -191,18 +211,22 @@ export class CodexSessionDocument extends BaseSessionDocument<CodexNativeSession
     const title = typeof nativeData.title === 'string' && nativeData.title.trim().length > 0
       ? nativeData.title.trim()
       : null;
+    const effectiveCwd = nativeData.cwd ?? inferCodexSqliteCwd(nativeData.sqlite_items);
 
     super({
       provider: 'codex-local',
       rawFormat: 'codex-rollout/v1',
       nativeData,
       external_id: nativeData.session_id,
+      parent_external_id: nativeData.parent_session_id ?? null,
+      is_subagent: Boolean(nativeData.is_subagent || nativeData.parent_session_id),
+      subagent_name: nativeData.subagent_name ?? null,
       title,
       title_source: title ? 'provider' : null,
       created_at: createdAt,
       updated_at: updatedAt,
       default_model: nativeData.model_provider ?? null,
-      cwd: nativeData.cwd ?? null,
+      cwd: effectiveCwd,
       blobs,
       parseIssues,
     });
@@ -896,6 +920,9 @@ interface ParsedRolloutFile {
   filePath: string;
   isArchived: boolean;
   cwd: string | null;
+  parentSessionId: string | null;
+  isSubagent: boolean;
+  subagentName: string | null;
   originator: string | null;
   cliVersion: string | null;
   modelProvider: string | null;
@@ -957,7 +984,7 @@ function getTableColumns(db: DatabaseSync, tableName: string): Set<string> {
 
 function loadSqliteHistory(
   sqlitePaths: readonly string[],
-  ctx: ParseCtx
+  ctx?: ParseCtx
 ): Map<string, { turns: CodexSqliteTurn[]; items: CodexSqliteItem[] }> {
   const byThread = new Map<string, { turns: CodexSqliteTurn[]; items: CodexSqliteItem[] }>();
   const ensureThread = (threadId: string) => {
@@ -1043,7 +1070,7 @@ function loadSqliteHistory(
         }
       }
     } catch (err) {
-      ctx.log('warn', `Failed reading Codex SQLite ${sqlitePath}: ${(err as Error).message}`);
+      ctx?.log('warn', `Failed reading Codex SQLite ${sqlitePath}: ${(err as Error).message}`);
     } finally {
       db?.close();
     }
@@ -1052,17 +1079,20 @@ function loadSqliteHistory(
   return byThread;
 }
 
-function parseRolloutFile(filePath: string, isArchived: boolean, ctx: ParseCtx): ParsedRolloutFile | null {
+function parseRolloutFile(filePath: string, isArchived: boolean, ctx?: ParseCtx): ParsedRolloutFile | null {
   let buf: Buffer;
   try {
     buf = readBufferMaybeZstd(filePath);
   } catch (err) {
-    ctx.log('error', `Failed reading Codex rollout ${filePath}: ${(err as Error).message}`);
+    ctx?.log('error', `Failed reading Codex rollout ${filePath}: ${(err as Error).message}`);
     return null;
   }
 
   let sessionId: string | null = null;
   let cwd: string | null = null;
+  let parentSessionId: string | null = null;
+  let isSubagent = false;
+  let subagentName: string | null = null;
   let originator: string | null = null;
   let cliVersion: string | null = null;
   let modelProvider: string | null = null;
@@ -1102,6 +1132,40 @@ function parseRolloutFile(filePath: string, isArchived: boolean, ctx: ParseCtx):
             ? payload['id']
             : sessionId;
       cwd = typeof payload['cwd'] === 'string' ? payload['cwd'] : cwd;
+      const srcVal = payload['source'];
+      const srcObj =
+        srcVal && typeof srcVal === 'object' && !Array.isArray(srcVal)
+          ? (srcVal as Record<string, unknown>)
+          : null;
+      const srcSubagent =
+        srcObj?.['subagent'] && typeof srcObj['subagent'] === 'object'
+          ? (srcObj['subagent'] as Record<string, unknown>)
+          : null;
+      const threadSpawn =
+        srcSubagent?.['thread_spawn'] && typeof srcSubagent['thread_spawn'] === 'object'
+          ? (srcSubagent['thread_spawn'] as Record<string, unknown>)
+          : null;
+
+      const metaParent =
+        (typeof payload['parent_thread_id'] === 'string' && payload['parent_thread_id']) ||
+        (typeof payload['parent_session_id'] === 'string' && payload['parent_session_id']) ||
+        (typeof threadSpawn?.['parent_thread_id'] === 'string' &&
+          (threadSpawn['parent_thread_id'] as string)) ||
+        null;
+      if (metaParent) parentSessionId = metaParent;
+
+      const metaRole =
+        (typeof payload['agent_nickname'] === 'string' && payload['agent_nickname']) ||
+        (typeof payload['agent_role'] === 'string' && payload['agent_role']) ||
+        (typeof threadSpawn?.['agent_role'] === 'string' &&
+          (threadSpawn['agent_role'] as string)) ||
+        null;
+      if (metaRole) subagentName = metaRole;
+
+      if (metaParent || srcVal === 'subagent' || Boolean(srcSubagent) || Boolean(metaRole)) {
+        isSubagent = true;
+      }
+
       originator = typeof payload['originator'] === 'string' ? payload['originator'] : originator;
       cliVersion = typeof payload['cli_version'] === 'string' ? payload['cli_version'] : cliVersion;
       modelProvider = typeof payload['model_provider'] === 'string' ? payload['model_provider'] : modelProvider;
@@ -1127,6 +1191,9 @@ function parseRolloutFile(filePath: string, isArchived: boolean, ctx: ParseCtx):
     filePath,
     isArchived,
     cwd,
+    parentSessionId,
+    isSubagent,
+    subagentName,
     originator,
     cliVersion,
     modelProvider,
@@ -1424,20 +1491,100 @@ export class CodexLocalAdapter implements Adapter<CodexNativeSession> {
 
   async *plan(src: SourceRef, probe: ProbeResult): AsyncIterable<ImportTask> {
     if (src.kind === 'dir') {
-      let totalBytes = 0;
-      for (const entry of probe.entries) {
-        try {
-          totalBytes += fs.statSync(entry).size;
-        } catch {
-          // ignore
+      const dir = src.path;
+      const titleIndex = loadSessionIndex(dir);
+      const activeRollouts: string[] = [];
+      const archivedRollouts: string[] = [];
+      const sessionsDir = path.join(dir, 'sessions');
+      const archivedDir = path.join(dir, 'archived_sessions');
+      if (fs.existsSync(sessionsDir)) {
+        this.collectRolloutFiles(sessionsDir, activeRollouts);
+      }
+      if (fs.existsSync(archivedDir)) {
+        this.collectRolloutFiles(archivedDir, archivedRollouts);
+      }
+
+      const sqliteFiles = fs
+        .readdirSync(dir)
+        .filter((f) => /^thread_history_\d+\.sqlite$/i.test(f))
+        .sort()
+        .map((f) => path.join(dir, f));
+
+      // Fast path when there are no archived duplicates and no legacy thread_history sqlite:
+      // yield one ImportTask per active rollout file for parallel parsing & fine-grained progress.
+      if (archivedRollouts.length === 0 && sqliteFiles.length === 0) {
+        for (const entry of activeRollouts) {
+          let size = 0;
+          try {
+            size = fs.statSync(entry).size;
+          } catch {
+            // ignore
+          }
+          yield {
+            id: sha256Hex(`${src.path}#${entry}#0`),
+            src,
+            entry,
+            estimatedBytes: size,
+            payload: { titleIndex },
+          };
+        }
+        return;
+      }
+
+      // When archived_sessions or thread_history SQLite are present, pre-deduplicate rollouts
+      // and pre-load SQLite threads once, then yield one task per unique session.
+      const sqliteMap = sqliteFiles.length > 0 ? loadSqliteHistory(sqliteFiles) : new Map();
+      const rolloutBySession = new Map<string, ParsedRolloutFile>();
+      const allRollouts: { filePath: string; isArchived: boolean }[] = [
+        ...activeRollouts.map((filePath) => ({ filePath, isArchived: false })),
+        ...archivedRollouts.map((filePath) => ({ filePath, isArchived: true })),
+      ];
+
+      for (const item of allRollouts) {
+        const parsed = parseRolloutFile(item.filePath, item.isArchived);
+        if (!parsed) continue;
+        const existing = rolloutBySession.get(parsed.sessionId);
+        if (!existing) {
+          rolloutBySession.set(parsed.sessionId, parsed);
+        } else {
+          const takeNew =
+            parsed.records.length > existing.records.length ||
+            (parsed.records.length === existing.records.length && !parsed.isArchived && existing.isArchived);
+          if (takeNew) {
+            rolloutBySession.set(parsed.sessionId, parsed);
+          }
         }
       }
-      yield {
-        id: sha256Hex(`${src.path}#dir#0`),
-        src,
-        entry: src.path,
-        estimatedBytes: totalBytes,
-      };
+
+      const allSessionIds = new Set<string>([...rolloutBySession.keys(), ...sqliteMap.keys()]);
+      for (const sessionId of allSessionIds) {
+        const rollout = rolloutBySession.get(sessionId);
+        const sq = sqliteMap.get(sessionId);
+        let size = 512;
+        if (rollout) {
+          try {
+            size = fs.statSync(rollout.filePath).size;
+          } catch {
+            // ignore
+          }
+        }
+        yield {
+          id: sha256Hex(`${src.path}#codex#${sessionId}`),
+          src,
+          entry: rollout
+            ? (sq ? `${rollout.filePath}#${sessionId}` : rollout.filePath)
+            : `${sqliteFiles[0] ?? dir}#${sessionId}`,
+          estimatedBytes: size,
+          payload: {
+            kind: 'codex_preplanned',
+            sessionId,
+            rollout,
+            sq,
+            title: titleIndex.get(sessionId) ?? null,
+            sourceFile: rollout?.filePath ?? sqliteFiles[0] ?? dir,
+          },
+        };
+      }
       return;
     }
 
@@ -1458,6 +1605,71 @@ export class CodexLocalAdapter implements Adapter<CodexNativeSession> {
   }
 
   async parse(task: ImportTask, ctx: ParseCtx): Promise<SessionDocument<CodexNativeSession>[]> {
+    const taskPayload = task.payload as
+      | {
+          kind?: string;
+          sessionId?: string;
+          rollout?: ParsedRolloutFile;
+          sq?: { turns: CodexSqliteTurn[]; items: CodexSqliteItem[] };
+          title?: string | null;
+          sourceFile?: string;
+          titleIndex?: Map<string, string>;
+        }
+      | undefined;
+
+    if (taskPayload?.kind === 'codex_preplanned' && taskPayload.sessionId) {
+      const { sessionId, rollout, sq, title, sourceFile } = taskPayload;
+      if (rollout) {
+        for (const issue of rollout.parseIssues) {
+          ctx.log('warn', issue.message);
+        }
+        ctx.recordSourceFile?.(rollout.filePath);
+      }
+      const sqTimestamps = [
+        ...(sq?.turns.map((t) => t.started_at) ?? []),
+        ...(sq?.turns.map((t) => t.completed_at) ?? []),
+        ...(sq?.items.map((i) => i.created_at_ms ?? i.started_at_ms) ?? []),
+      ].filter((v): v is number => typeof v === 'number' && Number.isFinite(v));
+      const minSqTs = sqTimestamps.length > 0 ? Math.min(...sqTimestamps) : null;
+      const maxSqTs = sqTimestamps.length > 0 ? Math.max(...sqTimestamps) : null;
+      const createdAt =
+        rollout?.createdAt != null && minSqTs != null
+          ? Math.min(rollout.createdAt, minSqTs)
+          : (rollout?.createdAt ?? minSqTs);
+      const updatedAt =
+        rollout?.updatedAt != null && maxSqTs != null
+          ? Math.max(rollout.updatedAt, maxSqTs)
+          : (rollout?.updatedAt ?? maxSqTs);
+
+      const nativeSession: CodexNativeSession = {
+        session_id: sessionId,
+        source_file: sourceFile ?? task.src.path,
+        title: title ?? null,
+        cwd: rollout?.cwd ?? null,
+        parent_session_id: rollout?.parentSessionId ?? null,
+        is_subagent: rollout?.isSubagent ?? false,
+        subagent_name: rollout?.subagentName ?? null,
+        originator: rollout?.originator ?? null,
+        cli_version: rollout?.cliVersion ?? null,
+        model_provider: rollout?.modelProvider ?? null,
+        base_instructions_sha256: rollout?.baseInstructionsSha ?? null,
+        records: rollout?.records ?? [],
+        sqlite_turns: sq?.turns,
+        sqlite_items: sq?.items,
+      };
+      const { blobs, spillByContentHash } = await prepareSpillsAndBlobs(nativeSession, createdAt, ctx);
+      return [
+        new CodexSessionDocument(
+          nativeSession,
+          createdAt,
+          updatedAt,
+          rollout?.parseIssues ?? [],
+          blobs,
+          spillByContentHash
+        ),
+      ];
+    }
+
     const targetPath = task.entry ?? task.src.path;
     ctx.log('info', `CodexLocalAdapter parsing: ${targetPath}`);
 
@@ -1475,7 +1687,7 @@ export class CodexLocalAdapter implements Adapter<CodexNativeSession> {
 
     // Single file or SQLite source
     const rootDir = findCodexRootDir(targetPath);
-    const titleIndex = loadSessionIndex(rootDir);
+    const titleIndex = taskPayload?.titleIndex ?? loadSessionIndex(rootDir);
 
     if (/\.sqlite$/i.test(targetPath) || task.src.kind === 'sqlite') {
       const sqliteMap = loadSqliteHistory([targetPath], ctx);
@@ -1522,6 +1734,9 @@ export class CodexLocalAdapter implements Adapter<CodexNativeSession> {
       source_file: parsed.filePath,
       title: titleIndex.get(parsed.sessionId) ?? null,
       cwd: parsed.cwd,
+      parent_session_id: parsed.parentSessionId,
+      is_subagent: parsed.isSubagent,
+      subagent_name: parsed.subagentName,
       originator: parsed.originator,
       cli_version: parsed.cliVersion,
       model_provider: parsed.modelProvider,
@@ -1573,6 +1788,10 @@ export class CodexLocalAdapter implements Adapter<CodexNativeSession> {
     ];
 
     for (const item of allRollouts) {
+      if (sqliteMap.size === 0 && ctx.skipIfUnchanged?.(item.filePath)) {
+        continue;
+      }
+      ctx.recordSourceFile?.(item.filePath);
       const parsed = parseRolloutFile(item.filePath, item.isArchived, ctx);
       if (!parsed) continue;
       const existing = rolloutBySession.get(parsed.sessionId);
@@ -1619,6 +1838,9 @@ export class CodexLocalAdapter implements Adapter<CodexNativeSession> {
         source_file: rollout?.filePath ?? sqliteFiles[0] ?? dir,
         title: titleIndex.get(sessionId) ?? null,
         cwd: rollout?.cwd ?? null,
+        parent_session_id: rollout?.parentSessionId ?? null,
+        is_subagent: rollout?.isSubagent ?? false,
+        subagent_name: rollout?.subagentName ?? null,
         originator: rollout?.originator ?? null,
         cli_version: rollout?.cliVersion ?? null,
         model_provider: rollout?.modelProvider ?? null,
