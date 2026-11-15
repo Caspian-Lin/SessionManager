@@ -1,0 +1,1574 @@
+import 'dart:io';
+import 'dart:math' as math;
+import 'dart:ui' as ui;
+
+import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
+import 'package:flutter/scheduler.dart';
+import 'package:intl/intl.dart';
+import 'package:path/path.dart' as p;
+
+import '../data/app_settings.dart';
+import '../data/archive_direct_store.dart';
+import '../l10n/app_strings.dart';
+import '../models.dart';
+import '../theme.dart';
+import 'gm3_surface.dart';
+import 'markdown_prose.dart';
+
+enum ShareScopeMode { fullConversation, singleTurn }
+
+class ShareSegment {
+  final String role;
+  final String? model;
+  final String? toolName;
+  final String text;
+  final List<ViewBlock> blocks;
+  final double estimatedHeight;
+
+  const ShareSegment({
+    required this.role,
+    this.model,
+    this.toolName,
+    required this.text,
+    this.blocks = const [],
+    required this.estimatedHeight,
+  });
+}
+
+class ShareSlice {
+  final int index;
+  final int total;
+  final List<ShareSegment> segments;
+  final double estimatedHeight;
+
+  const ShareSlice({
+    required this.index,
+    required this.total,
+    required this.segments,
+    required this.estimatedHeight,
+  });
+}
+
+bool _isToolLikeBlock(ViewBlock b) {
+  return b.type == 'thinking' ||
+      b.type == 'tool_use' ||
+      b.type == 'tool_call' ||
+      b.type == 'tool_result' ||
+      b.type == 'file_diff';
+}
+
+bool _isToolLikeItem(MessageItem item) {
+  return item.role == 'tool' ||
+      item.kind == 'tool_call' ||
+      item.kind == 'tool_result' ||
+      item.kind == 'thinking' ||
+      item.isSynthetic;
+}
+
+/// Filters active branch items by share scope (`fullConversation` vs `singleTurn`)
+/// and whether thinking/tool call details should be included.
+List<MessageItem> filterShareMessages(
+  List<MessageItem> activeItems, {
+  required ShareScopeMode scope,
+  int? targetAssistantId,
+  required bool includeToolDetails,
+}) {
+  final candidates = <MessageItem>[];
+  for (final item in activeItems) {
+    if (item.isHidden) continue;
+    if (!includeToolDetails && _isToolLikeItem(item)) continue;
+    final filteredBlocks = includeToolDetails
+        ? item.blocks
+        : item.blocks.where((b) => !_isToolLikeBlock(b)).toList();
+
+    final hasVisibleText = item.text.trim().isNotEmpty;
+    if (!hasVisibleText && filteredBlocks.isEmpty) continue;
+
+    candidates.add(MessageItem(
+      id: item.id,
+      parentId: item.parentId,
+      ordinal: item.ordinal,
+      depth: item.depth,
+      role: item.role,
+      kind: item.kind,
+      model: item.model,
+      toolName: item.toolName,
+      createdAt: item.createdAt,
+      text: item.text,
+      payloadRef: item.payloadRef,
+      blocks: filteredBlocks,
+      isActiveBranch: item.isActiveBranch,
+      isSynthetic: item.isSynthetic,
+      supersededBy: item.supersededBy,
+    ));
+  }
+
+  if (scope == ShareScopeMode.fullConversation || targetAssistantId == null) {
+    return candidates;
+  }
+
+  final targetIdx = candidates.indexWhere((m) => m.id == targetAssistantId);
+  if (targetIdx < 0) return candidates;
+
+  final startIdx =
+      (targetIdx > 0 && candidates[targetIdx - 1].role == 'user')
+          ? targetIdx - 1
+          : targetIdx;
+
+  var endIdx = targetIdx;
+  if (includeToolDetails) {
+    while (endIdx + 1 < candidates.length &&
+        candidates[endIdx + 1].role != 'user') {
+      endIdx++;
+    }
+  }
+  return candidates.sublist(startIdx, endIdx + 1);
+}
+
+double _estimateTextHeight(String text,
+    {double widthChars = 66, double lineHeight = 25.5}) {
+  if (text.trim().isEmpty) return 0;
+  var totalLines = 0;
+  for (final line in text.split('\n')) {
+    final weightedLen = line.runes.fold<int>(
+      0,
+      (acc, r) => acc + (r > 0x2E7F ? 2 : 1),
+    );
+    totalLines += math.max(1, (weightedLen / widthChars).ceil());
+  }
+  return totalLines * lineHeight + 18;
+}
+
+double _estimateBlockHeight(ViewBlock b) {
+  if (b.type == 'image') return 260;
+  if (b.type == 'code' || _isToolLikeBlock(b)) {
+    final content = (b.toolInput ?? b.text ?? '').trim();
+    return 48 + _estimateTextHeight(content, widthChars: 74, lineHeight: 21);
+  }
+  return _estimateTextHeight(b.text ?? '');
+}
+
+List<ShareSegment> _splitMessageIfOversized(
+    MessageItem item, double maxBodyHeight) {
+  final singleHeight = 46 +
+      (item.blocks.isNotEmpty
+          ? item.blocks.fold<double>(0, (s, b) => s + _estimateBlockHeight(b))
+          : _estimateTextHeight(item.text));
+
+  if (singleHeight <= maxBodyHeight) {
+    return [
+      ShareSegment(
+        role: item.role,
+        model: item.model,
+        toolName: item.toolName,
+        text: item.text,
+        blocks: item.blocks,
+        estimatedHeight: singleHeight,
+      ),
+    ];
+  }
+
+  final out = <ShareSegment>[];
+  if (item.blocks.length > 1) {
+    var accBlocks = <ViewBlock>[];
+    var accHeight = 40.0;
+    for (final b in item.blocks) {
+      final bh = _estimateBlockHeight(b);
+      if (accBlocks.isNotEmpty && accHeight + bh > maxBodyHeight) {
+        out.add(ShareSegment(
+          role: item.role,
+          model: item.model,
+          toolName: item.toolName,
+          text: '',
+          blocks: accBlocks,
+          estimatedHeight: accHeight,
+        ));
+        accBlocks = [];
+        accHeight = 40.0;
+      }
+      accBlocks.add(b);
+      accHeight += bh;
+    }
+    if (accBlocks.isNotEmpty) {
+      out.add(ShareSegment(
+        role: item.role,
+        model: item.model,
+        toolName: item.toolName,
+        text: '',
+        blocks: accBlocks,
+        estimatedHeight: accHeight,
+      ));
+    }
+    return out;
+  }
+
+  final rawText = item.blocks.length == 1
+      ? (item.blocks.first.text ?? item.text)
+      : item.text;
+  final paragraphs = rawText.split(RegExp(r'\r?\n\r?\n'));
+  var buf = <String>[];
+  var accHeight = 40.0;
+
+  void flushChunk() {
+    if (buf.isEmpty) return;
+    final joined = buf.join('\n\n');
+    out.add(ShareSegment(
+      role: item.role,
+      model: item.model,
+      toolName: item.toolName,
+      text: joined,
+      estimatedHeight: accHeight,
+    ));
+    buf = [];
+    accHeight = 40.0;
+  }
+
+  for (final para in paragraphs) {
+    final ph = _estimateTextHeight(para);
+    if (ph > maxBodyHeight) {
+      flushChunk();
+      final lines = para.split('\n');
+      for (final line in lines) {
+        final lh = _estimateTextHeight(line);
+        if (buf.isNotEmpty && accHeight + lh > maxBodyHeight) {
+          flushChunk();
+        }
+        buf.add(line);
+        accHeight += lh;
+      }
+      flushChunk();
+      continue;
+    }
+    if (buf.isNotEmpty && accHeight + ph > maxBodyHeight) {
+      flushChunk();
+    }
+    buf.add(para);
+    accHeight += ph;
+  }
+  flushChunk();
+
+  if (out.isEmpty) {
+    out.add(ShareSegment(
+      role: item.role,
+      model: item.model,
+      toolName: item.toolName,
+      text: rawText,
+      blocks: item.blocks,
+      estimatedHeight: singleHeight,
+    ));
+  }
+  return out;
+}
+
+/// Splits [messages] into ordered slices whose rendered heights stay below GPU limits.
+List<ShareSlice> buildShareSlices(
+  List<MessageItem> messages, {
+  double maxBodyHeight = 3200.0,
+}) {
+  final allSegments = <ShareSegment>[];
+  for (final m in messages) {
+    allSegments.addAll(_splitMessageIfOversized(m, maxBodyHeight));
+  }
+  if (allSegments.isEmpty) return const [];
+
+  final grouped = <List<ShareSegment>>[];
+  final heights = <double>[];
+  var current = <ShareSegment>[];
+  var currentHeight = 0.0;
+
+  for (final seg in allSegments) {
+    if (current.isNotEmpty &&
+        currentHeight + seg.estimatedHeight > maxBodyHeight) {
+      grouped.add(current);
+      heights.add(currentHeight);
+      current = [];
+      currentHeight = 0.0;
+    }
+    current.add(seg);
+    currentHeight += seg.estimatedHeight;
+  }
+  if (current.isNotEmpty) {
+    grouped.add(current);
+    heights.add(currentHeight);
+  }
+
+  return [
+    for (var i = 0; i < grouped.length; i++)
+      ShareSlice(
+        index: i,
+        total: grouped.length,
+        segments: grouped[i],
+        estimatedHeight: heights[i],
+      ),
+  ];
+}
+
+class ShareImageDialog extends StatefulWidget {
+  final ConversationDetail detail;
+  final List<MessageItem> activeItems;
+  final ArchiveDirectStore store;
+  final AppSettingsController? settings;
+  final int? initialAssistantItemId;
+  final String? initialOutputDir;
+
+  const ShareImageDialog({
+    super.key,
+    required this.detail,
+    required this.activeItems,
+    required this.store,
+    this.settings,
+    this.initialAssistantItemId,
+    this.initialOutputDir,
+  });
+
+  @override
+  State<ShareImageDialog> createState() => _ShareImageDialogState();
+}
+
+class _ShareImageDialogState extends State<ShareImageDialog> {
+  late ShareScopeMode _scopeMode;
+  late bool _includeToolDetails;
+  int? _selectedAssistantId;
+  int _previewSliceIdx = 0;
+
+  late ShareColorStyle _colorStyle;
+  late bool _showAuthor;
+  late bool _enableWatermark;
+  late bool _showBrandText;
+  late final TextEditingController _authorCtrl;
+  late final TextEditingController _watermarkCtrl;
+  late final TextEditingController _brandTextCtrl;
+  late final TextEditingController _outputDirCtrl;
+
+  bool _generating = false;
+  int _currentSliceIdx = 0;
+  int _totalSlices = 0;
+  List<File> _savedFiles = [];
+  String? _errorMsg;
+
+  List<MessageItem> get _assistantTurns => widget.activeItems
+      .where((m) =>
+          m.role == 'assistant' &&
+          !m.isHidden &&
+          !m.isSynthetic &&
+          (m.text.trim().isNotEmpty ||
+              m.blocks.any((b) => !_isToolLikeBlock(b))))
+      .toList();
+
+  @override
+  void initState() {
+    super.initState();
+    final assistants = _assistantTurns;
+    _scopeMode = widget.initialAssistantItemId != null
+        ? ShareScopeMode.singleTurn
+        : ShareScopeMode.fullConversation;
+    _includeToolDetails = false;
+    _selectedAssistantId = widget.initialAssistantItemId ??
+        (assistants.isNotEmpty ? assistants.last.id : null);
+
+    final cfg = widget.settings;
+    final defaultAuthor =
+        cfg?.authorName ?? AppSettingsController.defaultSystemAuthorName();
+    _colorStyle = cfg?.shareColorStyle ?? ShareColorStyle.paperLight;
+    _showAuthor = cfg?.shareShowAuthor ?? true;
+    _enableWatermark = cfg?.shareEnableWatermark ?? true;
+    _showBrandText = cfg?.shareShowBrandText ?? true;
+
+    _authorCtrl = TextEditingController(text: defaultAuthor)
+      ..addListener(_onPreviewTextEdited);
+    _watermarkCtrl = TextEditingController(
+      text: cfg?.effectiveWatermarkText ?? '@$defaultAuthor · SessionManager',
+    )..addListener(_onPreviewTextEdited);
+    _brandTextCtrl = TextEditingController(
+      text: cfg?.shareBrandText ?? '由 SessionManager 分享',
+    )..addListener(_onPreviewTextEdited);
+    _outputDirCtrl = TextEditingController(
+      text: widget.initialOutputDir ?? _defaultShareDir(),
+    );
+  }
+
+  void _onPreviewTextEdited() {
+    if (mounted) setState(() {});
+  }
+
+  @override
+  void dispose() {
+    _authorCtrl.dispose();
+    _watermarkCtrl.dispose();
+    _brandTextCtrl.dispose();
+    _outputDirCtrl.dispose();
+    super.dispose();
+  }
+
+  String _defaultShareDir() {
+    final home = (Platform.environment['USERPROFILE'] ??
+            Platform.environment['HOME'] ??
+            '')
+        .trim();
+    if (home.isNotEmpty) {
+      return p.join(home, 'Pictures', 'SessionManager Shares');
+    }
+    return p.join(p.dirname(widget.store.dbPath), 'shares');
+  }
+
+  List<ShareSlice> _computeCurrentSlices() {
+    final filtered = filterShareMessages(
+      widget.activeItems,
+      scope: _scopeMode,
+      targetAssistantId: _selectedAssistantId,
+      includeToolDetails: _includeToolDetails,
+    );
+    return buildShareSlices(filtered);
+  }
+
+  String _safeSlug(String raw) {
+    final cleaned = raw
+        .replaceAll(RegExp(r'[\\/:*?"<>|\s]+'), '_')
+        .replaceAll(RegExp(r'_+'), '_')
+        .replaceAll(RegExp(r'^_|_$'), '');
+    if (cleaned.isEmpty) return 'session';
+    return cleaned.length > 36 ? cleaned.substring(0, 36) : cleaned;
+  }
+
+  Future<void> _pickOutputFolder() async {
+    if (!Platform.isWindows) return;
+    final res = await Process.run('powershell', [
+      '-NoProfile',
+      '-STA',
+      '-Command',
+      '''
+Add-Type -AssemblyName System.Windows.Forms
+\$dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+\$dlg.Description = 'Select Share Image Output Folder'
+if (\$dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output \$dlg.SelectedPath }
+''',
+    ]);
+    final out = res.stdout.toString().trim();
+    if (out.isNotEmpty && mounted) {
+      setState(() => _outputDirCtrl.text = out);
+    }
+  }
+
+  ShareRenderOptions _currentRenderOptions() {
+    return ShareRenderOptions(
+      style: _colorStyle,
+      showAuthor: _showAuthor,
+      authorName: _authorCtrl.text.trim(),
+      enableWatermark: _enableWatermark,
+      watermarkText: _watermarkCtrl.text.trim(),
+      showBrandText: _showBrandText,
+      brandText: _brandTextCtrl.text.trim(),
+    );
+  }
+
+  Future<void> _generatePngs() async {
+    final slices = _computeCurrentSlices();
+    if (slices.isEmpty) return;
+
+    final outDirPath = _outputDirCtrl.text.trim();
+    if (outDirPath.isEmpty) return;
+
+    setState(() {
+      _generating = true;
+      _errorMsg = null;
+      _savedFiles = [];
+      _currentSliceIdx = 0;
+      _totalSlices = slices.length;
+    });
+
+    try {
+      final outDir = Directory(outDirPath);
+      if (!outDir.existsSync()) {
+        outDir.createSync(recursive: true);
+      }
+      final stamp = DateFormat('yyyyMMdd_HHmmss').format(DateTime.now());
+      final slug = _safeSlug(widget.detail.title);
+      final files = <File>[];
+      final renderOpts = _currentRenderOptions();
+
+      for (var i = 0; i < slices.length; i++) {
+        if (!mounted) return;
+        setState(() => _currentSliceIdx = i + 1);
+        final bytes = await _captureSlicePng(slices[i], renderOpts);
+        final suffix =
+            slices.length > 1 ? '_part${i + 1}of${slices.length}' : '';
+        final file =
+            File(p.join(outDir.path, 'share_${slug}_$stamp$suffix.png'));
+        await file.writeAsBytes(bytes, flush: true);
+        files.add(file);
+      }
+
+      if (!mounted) return;
+      setState(() {
+        _generating = false;
+        _savedFiles = files;
+      });
+    } catch (err) {
+      if (!mounted) return;
+      setState(() {
+        _generating = false;
+        _errorMsg = err.toString();
+      });
+    }
+  }
+
+  Future<List<int>> _captureSlicePng(
+    ShareSlice slice,
+    ShareRenderOptions renderOptions,
+  ) async {
+    final key = GlobalKey();
+    final palette = SharePalette.forStyle(renderOptions.style);
+    final cardTheme = palette.isDark ? Gm3.dark() : Gm3.light();
+    final strings = AppStringsScope.of(context);
+    final overlay = Overlay.of(context, rootOverlay: true);
+
+    final entry = OverlayEntry(
+      builder: (_) => Positioned(
+        left: -12000,
+        top: 0,
+        width: 780,
+        child: OverflowBox(
+          alignment: Alignment.topLeft,
+          minWidth: 780,
+          maxWidth: 780,
+          minHeight: 0,
+          maxHeight: double.infinity,
+          child: Material(
+            color: Colors.transparent,
+            child: Theme(
+              data: cardTheme,
+              child: AppStringsScope(
+                notifier: AppStringsScope.notifierOf(context) ??
+                    ValueNotifier<AppLocale>(strings.locale),
+                child: RepaintBoundary(
+                  key: key,
+                  child: _ShareCardCanvas(
+                    detail: widget.detail,
+                    slice: slice,
+                    includeToolDetails: _includeToolDetails,
+                    options: renderOptions,
+                    resolveBlobFile: widget.store.resolveBlobFile,
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+
+    overlay.insert(entry);
+    try {
+      await SchedulerBinding.instance.endOfFrame;
+      await Future<void>.delayed(const Duration(milliseconds: 24));
+      final ro = key.currentContext?.findRenderObject();
+      if (ro is! RenderRepaintBoundary) {
+        throw StateError(
+            'RepaintBoundary failed to mount for slice ${slice.index + 1}');
+      }
+      final image = await ro.toImage(pixelRatio: 2.0);
+      try {
+        final byteData =
+            await image.toByteData(format: ui.ImageByteFormat.png);
+        if (byteData == null) {
+          throw StateError(
+              'Failed to encode PNG bytes for slice ${slice.index + 1}');
+        }
+        return byteData.buffer.asUint8List();
+      } finally {
+        image.dispose();
+      }
+    } finally {
+      entry.remove();
+    }
+  }
+
+  String _turnPreview(MessageItem item) {
+    final clean = item.text.replaceAll(RegExp(r'\s+'), ' ').trim();
+    if (clean.isEmpty) return '#${item.id} (${item.blocks.length} blocks)';
+    return clean.length > 56 ? '${clean.substring(0, 53)}...' : clean;
+  }
+
+  String _styleLabel(AppStrings s, ShareColorStyle style) {
+    return switch (style) {
+      ShareColorStyle.paperLight => s.isZh ? '素雅浅纸' : 'Paper',
+      ShareColorStyle.obsidianDark => s.isZh ? '极夜深黑' : 'Obsidian',
+      ShareColorStyle.auroraBlue => s.isZh ? '晴空澄蓝' : 'Aurora',
+      ShareColorStyle.warmSand => s.isZh ? '暖阳米沙' : 'Warm Sand',
+      ShareColorStyle.forestMint => s.isZh ? '薄荷青瓷' : 'Forest Mint',
+    };
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final s = AppStringsScope.of(context);
+    final theme = Theme.of(context);
+    final cs = theme.colorScheme;
+    final surfaces = Gm3Surfaces.of(context);
+    final assistants = _assistantTurns;
+    final slices = _computeCurrentSlices();
+    final safeSliceIdx =
+        slices.isEmpty ? 0 : _previewSliceIdx.clamp(0, slices.length - 1);
+    final renderOpts = _currentRenderOptions();
+    final previewPalette = SharePalette.forStyle(_colorStyle);
+
+    return Dialog(
+      backgroundColor: surfaces.card,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(Gm3.radiusLg),
+      ),
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 1080, maxHeight: 740),
+        child: Padding(
+          padding: const EdgeInsets.all(22),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              // Header
+              Row(
+                children: [
+                  Icon(Icons.image_outlined, color: cs.primary, size: 22),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Text(
+                      s.shareSheetTitle,
+                      style: theme.textTheme.titleMedium,
+                    ),
+                  ),
+                  if (slices.isNotEmpty)
+                    Gm3Pill(
+                      label:
+                          '${slices.length} ${s.isZh ? "张 PNG 图片" : "PNG slice(s)"}',
+                      color: cs.primary,
+                      background: surfaces.chipFill,
+                    ),
+                  const SizedBox(width: 8),
+                  IconButton(
+                    icon: const Icon(Icons.close, size: 18),
+                    onPressed:
+                        _generating ? null : () => Navigator.of(context).pop(),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 14),
+
+              // Two-Column Body: Left Preview + Right Controls
+              Expanded(
+                child: LayoutBuilder(
+                  builder: (ctx, constraints) {
+                    final previewPane = _buildPreviewPane(
+                      context,
+                      s: s,
+                      slices: slices,
+                      activeIdx: safeSliceIdx,
+                      renderOpts: renderOpts,
+                      previewPalette: previewPalette,
+                    );
+                    final controlsPane = _buildControlsPane(
+                      context,
+                      s: s,
+                      assistants: assistants,
+                      slices: slices,
+                    );
+
+                    if (constraints.maxWidth < 740) {
+                      return Column(
+                        children: [
+                          SizedBox(height: 280, child: previewPane),
+                          const SizedBox(height: 12),
+                          Expanded(child: controlsPane),
+                        ],
+                      );
+                    }
+
+                    return Row(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        Expanded(flex: 11, child: previewPane),
+                        const SizedBox(width: 18),
+                        Expanded(flex: 9, child: controlsPane),
+                      ],
+                    );
+                  },
+                ),
+              ),
+
+              const SizedBox(height: 14),
+              // Footer Action Row
+              Row(
+                children: [
+                  if (_savedFiles.isNotEmpty && Platform.isWindows)
+                    TextButton.icon(
+                      onPressed: () => Process.run(
+                        'explorer.exe',
+                        [_savedFiles.first.parent.path],
+                      ),
+                      icon: const Icon(Icons.folder_outlined, size: 17),
+                      label: Text(s.shareOpenFolder),
+                    ),
+                  const Spacer(),
+                  FilledButton.icon(
+                    onPressed:
+                        _generating || slices.isEmpty ? null : _generatePngs,
+                    icon: const Icon(Icons.download_outlined, size: 17),
+                    label: Text(s.shareGenerateBtn),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildPreviewPane(
+    BuildContext context, {
+    required AppStrings s,
+    required List<ShareSlice> slices,
+    required int activeIdx,
+    required ShareRenderOptions renderOpts,
+    required SharePalette previewPalette,
+  }) {
+    final theme = Theme.of(context);
+    final cs = theme.colorScheme;
+    final surfaces = Gm3Surfaces.of(context);
+
+    return Container(
+      decoration: BoxDecoration(
+        color: surfaces.inset,
+        borderRadius: BorderRadius.circular(Gm3.radiusMd),
+        border: Border.all(color: surfaces.hairline.withOpacity(0.5)),
+      ),
+      child: Column(
+        children: [
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+            decoration: BoxDecoration(
+              color: surfaces.panel,
+              borderRadius: const BorderRadius.vertical(
+                top: Radius.circular(Gm3.radiusMd),
+              ),
+            ),
+            child: Row(
+              children: [
+                Icon(Icons.visibility_outlined, size: 15, color: cs.primary),
+                const SizedBox(width: 6),
+                Text(
+                  s.sharePreviewTitle,
+                  style: theme.textTheme.labelMedium?.copyWith(
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                const Spacer(),
+                if (slices.length > 1) ...[
+                  IconButton(
+                    visualDensity: VisualDensity.compact,
+                    icon: const Icon(Icons.chevron_left, size: 18),
+                    onPressed: activeIdx > 0
+                        ? () => setState(() => _previewSliceIdx = activeIdx - 1)
+                        : null,
+                  ),
+                  Text(
+                    '${activeIdx + 1} / ${slices.length}',
+                    style: GoogleMaterialTheme.monoTextStyle(
+                      fontSize: Gm3.monoSm,
+                      color: cs.primary,
+                    ),
+                  ),
+                  IconButton(
+                    visualDensity: VisualDensity.compact,
+                    icon: const Icon(Icons.chevron_right, size: 18),
+                    onPressed: activeIdx < slices.length - 1
+                        ? () => setState(() => _previewSliceIdx = activeIdx + 1)
+                        : null,
+                  ),
+                ],
+              ],
+            ),
+          ),
+          Divider(color: surfaces.hairline.withOpacity(0.4), height: 1),
+          Expanded(
+            child: slices.isEmpty
+                ? Center(
+                    child: Text(
+                      s.shareNoTurns,
+                      style: theme.textTheme.bodyMedium?.copyWith(
+                        color: cs.error,
+                      ),
+                    ),
+                  )
+                : SingleChildScrollView(
+                    padding: const EdgeInsets.all(14),
+                    child: Center(
+                      child: FittedBox(
+                        fit: BoxFit.scaleDown,
+                        alignment: Alignment.topCenter,
+                        child: Theme(
+                          data: previewPalette.isDark
+                              ? Gm3.dark()
+                              : Gm3.light(),
+                          child: Container(
+                            decoration: BoxDecoration(
+                              borderRadius:
+                                  BorderRadius.circular(Gm3.radiusMd),
+                              boxShadow: [
+                                BoxShadow(
+                                  color: Colors.black.withOpacity(0.14),
+                                  blurRadius: 16,
+                                  offset: const Offset(0, 6),
+                                ),
+                              ],
+                            ),
+                            child: ClipRRect(
+                              borderRadius:
+                                  BorderRadius.circular(Gm3.radiusMd),
+                              child: _ShareCardCanvas(
+                                detail: widget.detail,
+                                slice: slices[activeIdx],
+                                includeToolDetails: _includeToolDetails,
+                                options: renderOpts,
+                                resolveBlobFile: widget.store.resolveBlobFile,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildControlsPane(
+    BuildContext context, {
+    required AppStrings s,
+    required List<MessageItem> assistants,
+    required List<ShareSlice> slices,
+  }) {
+    final theme = Theme.of(context);
+    final cs = theme.colorScheme;
+    final surfaces = Gm3Surfaces.of(context);
+
+    return SingleChildScrollView(
+      padding: const EdgeInsets.only(right: 4),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // Scope Mode Selector
+          SizedBox(
+            width: double.infinity,
+            child: Gm3SegmentedTrack(
+              height: 36,
+              child: SegmentedButton<ShareScopeMode>(
+                segments: [
+                  ButtonSegment(
+                    value: ShareScopeMode.fullConversation,
+                    label: Text(s.shareModeFull),
+                    icon: const Icon(Icons.forum_outlined, size: 15),
+                  ),
+                  ButtonSegment(
+                    value: ShareScopeMode.singleTurn,
+                    label: Text(s.shareModeSingleTurn),
+                    icon: const Icon(Icons.chat_bubble_outline, size: 15),
+                  ),
+                ],
+                selected: {_scopeMode},
+                onSelectionChanged: _generating
+                    ? null
+                    : (val) => setState(() {
+                          _scopeMode = val.first;
+                          _previewSliceIdx = 0;
+                          if (_selectedAssistantId == null &&
+                              assistants.isNotEmpty) {
+                            _selectedAssistantId = assistants.last.id;
+                          }
+                        }),
+              ),
+            ),
+          ),
+
+          if (_scopeMode == ShareScopeMode.singleTurn &&
+              assistants.isNotEmpty) ...[
+            const SizedBox(height: 12),
+            Text(s.shareSelectTurn, style: theme.textTheme.labelMedium),
+            const SizedBox(height: 6),
+            DropdownButtonFormField<int>(
+              value: assistants.any((a) => a.id == _selectedAssistantId)
+                  ? _selectedAssistantId
+                  : assistants.last.id,
+              isExpanded: true,
+              decoration: InputDecoration(
+                filled: true,
+                fillColor: surfaces.inset,
+                contentPadding:
+                    const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(Gm3.radiusMd),
+                  borderSide: BorderSide.none,
+                ),
+              ),
+              items: [
+                for (var i = 0; i < assistants.length; i++)
+                  DropdownMenuItem(
+                    value: assistants[i].id,
+                    child: Text(
+                      'Reply #${i + 1}: ${_turnPreview(assistants[i])}',
+                      overflow: TextOverflow.ellipsis,
+                      style: theme.textTheme.bodyMedium,
+                    ),
+                  ),
+              ],
+              onChanged: _generating
+                  ? null
+                  : (v) => setState(() {
+                        _selectedAssistantId = v;
+                        _previewSliceIdx = 0;
+                      }),
+            ),
+          ],
+
+          const SizedBox(height: 8),
+          SwitchListTile.adaptive(
+            value: _includeToolDetails,
+            contentPadding: EdgeInsets.zero,
+            title: Text(s.shareIncludeToolDetails,
+                style: theme.textTheme.bodyMedium),
+            onChanged: _generating
+                ? null
+                : (v) => setState(() {
+                      _includeToolDetails = v;
+                      _previewSliceIdx = 0;
+                    }),
+          ),
+
+          const Divider(height: 16),
+
+          // Color Style Swatches
+          Text(s.shareColorStyleLabel, style: theme.textTheme.labelMedium),
+          const SizedBox(height: 8),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              for (final style in ShareColorStyle.values)
+                Builder(
+                  builder: (_) {
+                    final pal = SharePalette.forStyle(style);
+                    final selected = _colorStyle == style;
+                    return InkWell(
+                      onTap: _generating
+                          ? null
+                          : () => setState(() => _colorStyle = style),
+                      borderRadius: BorderRadius.circular(Gm3.radiusMd),
+                      child: AnimatedContainer(
+                        duration: const Duration(milliseconds: 120),
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 10, vertical: 6),
+                        decoration: BoxDecoration(
+                          color: selected
+                              ? cs.primaryContainer.withOpacity(0.65)
+                              : surfaces.inset,
+                          borderRadius: BorderRadius.circular(Gm3.radiusMd),
+                          border: Border.all(
+                            color: selected
+                                ? cs.primary
+                                : surfaces.hairline.withOpacity(0.5),
+                            width: selected ? 1.5 : 1,
+                          ),
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Container(
+                              width: 14,
+                              height: 14,
+                              decoration: BoxDecoration(
+                                color: pal.canvasBg,
+                                shape: BoxShape.circle,
+                                border: Border.all(color: pal.accent, width: 2),
+                              ),
+                            ),
+                            const SizedBox(width: 6),
+                            Text(
+                              _styleLabel(s, style),
+                              style: theme.textTheme.labelMedium?.copyWith(
+                                fontWeight: selected
+                                    ? FontWeight.w700
+                                    : FontWeight.w500,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    );
+                  },
+                ),
+            ],
+          ),
+
+          const SizedBox(height: 12),
+
+          // Signature Toggle & Text
+          SwitchListTile.adaptive(
+            value: _showAuthor,
+            dense: true,
+            contentPadding: EdgeInsets.zero,
+            title: Text(s.shareShowAuthorLabel,
+                style: theme.textTheme.bodyMedium),
+            onChanged: _generating
+                ? null
+                : (v) => setState(() => _showAuthor = v),
+          ),
+          if (_showAuthor) ...[
+            TextField(
+              controller: _authorCtrl,
+              enabled: !_generating,
+              decoration: InputDecoration(
+                isDense: true,
+                labelText: s.shareAuthorInputLabel,
+                prefixText: '@',
+              ),
+            ),
+            const SizedBox(height: 8),
+          ],
+
+          // "由 SessionManager 分享" Brand Text Toggle & Input
+          SwitchListTile.adaptive(
+            value: _showBrandText,
+            dense: true,
+            contentPadding: EdgeInsets.zero,
+            title: Text(s.shareBrandToggle, style: theme.textTheme.bodyMedium),
+            onChanged: _generating
+                ? null
+                : (v) => setState(() => _showBrandText = v),
+          ),
+          if (_showBrandText) ...[
+            TextField(
+              controller: _brandTextCtrl,
+              enabled: !_generating,
+              decoration: InputDecoration(
+                isDense: true,
+                labelText: s.shareBrandTextLabel,
+              ),
+            ),
+            const SizedBox(height: 8),
+          ],
+
+          // Diagonal Watermark Toggle & Input
+          SwitchListTile.adaptive(
+            value: _enableWatermark,
+            dense: true,
+            contentPadding: EdgeInsets.zero,
+            title: Text(s.shareWatermarkToggle,
+                style: theme.textTheme.bodyMedium),
+            onChanged: _generating
+                ? null
+                : (v) => setState(() => _enableWatermark = v),
+          ),
+          if (_enableWatermark) ...[
+            TextField(
+              controller: _watermarkCtrl,
+              enabled: !_generating,
+              decoration: InputDecoration(
+                isDense: true,
+                labelText: s.shareWatermarkTextLabel,
+              ),
+            ),
+            const SizedBox(height: 10),
+          ],
+
+          const Divider(height: 16),
+
+          // Output Folder
+          Row(
+            children: [
+              Expanded(
+                child: TextField(
+                  controller: _outputDirCtrl,
+                  enabled: !_generating,
+                  decoration: InputDecoration(
+                    isDense: true,
+                    labelText: s.shareOutputDirLabel,
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
+              OutlinedButton.icon(
+                onPressed: _generating ? null : _pickOutputFolder,
+                icon: const Icon(Icons.folder_open, size: 16),
+                label: Text(s.browseFolder),
+              ),
+            ],
+          ),
+
+          if (_generating) ...[
+            const SizedBox(height: 12),
+            LinearProgressIndicator(
+              value: _totalSlices > 0 ? _currentSliceIdx / _totalSlices : null,
+            ),
+            const SizedBox(height: 6),
+            Text(
+              '${s.shareGenerating} ($_currentSliceIdx / $_totalSlices)',
+              style: theme.textTheme.labelSmall,
+            ),
+          ],
+
+          if (_errorMsg != null) ...[
+            const SizedBox(height: 10),
+            Text(
+              _errorMsg!,
+              style: theme.textTheme.bodySmall?.copyWith(color: cs.error),
+            ),
+          ],
+
+          if (_savedFiles.isNotEmpty) ...[
+            const SizedBox(height: 12),
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(10),
+              decoration: BoxDecoration(
+                color: surfaces.inset,
+                borderRadius: BorderRadius.circular(Gm3.radiusMd),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    s.shareSavedCount(
+                        _savedFiles.length, _outputDirCtrl.text.trim()),
+                    style: theme.textTheme.labelMedium?.copyWith(
+                      color: const Color(0xFF137333),
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  for (final f in _savedFiles)
+                    Text(
+                      '• ${p.basename(f.path)} (${(f.lengthSync() / 1024).toStringAsFixed(0)} KB)',
+                      style: GoogleMaterialTheme.monoTextStyle(
+                        fontSize: Gm3.monoSm,
+                        color: cs.onSurfaceVariant,
+                      ),
+                    ),
+                ],
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+class ShareRenderOptions {
+  final ShareColorStyle style;
+  final bool showAuthor;
+  final String authorName;
+  final bool enableWatermark;
+  final String watermarkText;
+  final bool showBrandText;
+  final String brandText;
+
+  const ShareRenderOptions({
+    required this.style,
+    required this.showAuthor,
+    required this.authorName,
+    required this.enableWatermark,
+    required this.watermarkText,
+    required this.showBrandText,
+    required this.brandText,
+  });
+}
+
+class _ShareCardCanvas extends StatelessWidget {
+  final ConversationDetail detail;
+  final ShareSlice slice;
+  final bool includeToolDetails;
+  final ShareRenderOptions options;
+  final File? Function(String sha) resolveBlobFile;
+
+  const _ShareCardCanvas({
+    required this.detail,
+    required this.slice,
+    required this.includeToolDetails,
+    required this.options,
+    required this.resolveBlobFile,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final palette = SharePalette.forStyle(options.style);
+    final watermark = options.watermarkText;
+    final hasWatermark =
+        options.enableWatermark && watermark.trim().isNotEmpty;
+
+    return Container(
+      width: 780,
+      color: palette.canvasBg,
+      padding: const EdgeInsets.all(24),
+      child: CustomPaint(
+        foregroundPainter: hasWatermark
+            ? _DiagonalWatermarkPainter(
+                text: watermark,
+                color: palette.watermarkColor.withOpacity(0.075),
+              )
+            : null,
+        child: Container(
+          decoration: BoxDecoration(
+            color: palette.cardBg,
+            borderRadius: BorderRadius.circular(Gm3.radiusLg),
+            border: Border.all(color: palette.cardBorder),
+          ),
+          clipBehavior: Clip.antiAlias,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              // Styled Header Band
+              Container(
+                color: palette.headerBg,
+                padding: const EdgeInsets.fromLTRB(32, 24, 32, 20),
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            detail.title,
+                            style: TextStyle(
+                              fontFamily: Gm3.uiFontFamily,
+                              fontFamilyFallback: Gm3.uiFontFallback,
+                              fontSize: 20,
+                              fontWeight: FontWeight.w700,
+                              color: palette.assistantText,
+                            ),
+                          ),
+                          const SizedBox(height: 6),
+                          Text(
+                            '${detail.provider}'
+                            '${detail.defaultModel != null ? ' · ${detail.defaultModel}' : ''}'
+                            '${detail.cwd != null ? ' · ${detail.cwd}' : ''}',
+                            style: GoogleMaterialTheme.monoTextStyle(
+                              fontSize: Gm3.monoSm,
+                              color: palette.metaText,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    if (slice.total > 1)
+                      Gm3Pill(
+                        label: '${slice.index + 1} / ${slice.total}',
+                        color: palette.accent,
+                        background: palette.cardBg.withOpacity(0.9),
+                      ),
+                  ],
+                ),
+              ),
+
+              // Conversation Body
+              Padding(
+                padding: const EdgeInsets.fromLTRB(32, 24, 32, 16),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    for (final seg in slice.segments)
+                      _buildSegment(context, seg, palette),
+                  ],
+                ),
+              ),
+
+              // Attribution Footer (Signature + "由 SessionManager 分享")
+              Container(
+                color: palette.headerBg.withOpacity(0.65),
+                padding: const EdgeInsets.fromLTRB(32, 14, 32, 16),
+                child: Row(
+                  children: [
+                    if (options.showBrandText &&
+                        options.brandText.isNotEmpty) ...[
+                      Icon(Icons.auto_awesome, size: 14, color: palette.accent),
+                      const SizedBox(width: 6),
+                      Text(
+                        options.brandText,
+                        style: TextStyle(
+                          fontFamily: Gm3.uiFontFamily,
+                          fontFamilyFallback: Gm3.uiFontFallback,
+                          fontSize: 12,
+                          fontWeight: FontWeight.w600,
+                          color: palette.accent,
+                        ),
+                      ),
+                    ] else
+                      Text(
+                        'SessionManager',
+                        style: GoogleMaterialTheme.monoTextStyle(
+                          fontSize: Gm3.monoSm,
+                          color: palette.metaText,
+                        ),
+                      ),
+                    const Spacer(),
+                    if (options.showAuthor && options.authorName.isNotEmpty)
+                      Text(
+                        '@${options.authorName}',
+                        style: GoogleMaterialTheme.monoTextStyle(
+                          fontSize: Gm3.monoSm,
+                          fontWeight: FontWeight.w600,
+                          color: palette.assistantText,
+                        ),
+                      ),
+                    if (slice.total > 1) ...[
+                      const SizedBox(width: 12),
+                      Text(
+                        '${slice.index + 1}/${slice.total}',
+                        style: GoogleMaterialTheme.monoTextStyle(
+                          fontSize: Gm3.monoSm,
+                          color: palette.metaText,
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildSegment(
+    BuildContext context,
+    ShareSegment seg,
+    SharePalette palette,
+  ) {
+    if (seg.role == 'user') {
+      return Padding(
+        padding: const EdgeInsets.only(bottom: 22),
+        child: Align(
+          alignment: Alignment.centerRight,
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 500),
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 12),
+              decoration: BoxDecoration(
+                color: palette.userBubbleBg,
+                borderRadius: BorderRadius.circular(20),
+              ),
+              child: DefaultTextStyle.merge(
+                style: TextStyle(color: palette.userBubbleText),
+                child: MarkdownProse(
+                  text: seg.text.isNotEmpty
+                      ? seg.text
+                      : seg.blocks.map((b) => b.text ?? '').join('\n'),
+                  selectable: false,
+                  showCopyButtons: false,
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+    }
+
+    if (seg.role == 'tool' || seg.role == 'system') {
+      final raw = (seg.text.isNotEmpty
+              ? seg.text
+              : seg.blocks.map((b) => b.toolInput ?? b.text ?? '').join('\n'))
+          .trim();
+      final preview =
+          raw.length > 1400 ? '${raw.substring(0, 1400)}\n...(truncated)' : raw;
+      return Container(
+        margin: const EdgeInsets.only(bottom: 16),
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: palette.assistantCardBg,
+          borderRadius: BorderRadius.circular(Gm3.radiusMd),
+          border: Border.all(color: palette.cardBorder),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              '${seg.role.toUpperCase()}${seg.toolName != null ? ' · ${seg.toolName}' : ''}',
+              style: GoogleMaterialTheme.monoTextStyle(
+                fontSize: Gm3.monoSm,
+                fontWeight: FontWeight.w700,
+                color: palette.accent,
+              ),
+            ),
+            const SizedBox(height: 6),
+            Text(
+              preview,
+              style: GoogleMaterialTheme.monoTextStyle(
+                fontSize: Gm3.monoSm,
+                color: palette.metaText,
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+
+    // Assistant reply
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 22),
+      child: DefaultTextStyle.merge(
+        style: TextStyle(color: palette.assistantText),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            if (seg.blocks.isNotEmpty)
+              for (final block in seg.blocks)
+                _buildAssistantBlock(context, block, palette)
+            else
+              MarkdownProse(
+                text: seg.text,
+                selectable: false,
+                showCopyButtons: false,
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildAssistantBlock(
+    BuildContext context,
+    ViewBlock block,
+    SharePalette palette,
+  ) {
+    if (block.type == 'code') {
+      return MarkdownCodeBlock(
+        code: block.text ?? '',
+        lang: block.lang,
+        selectable: false,
+        showCopyButton: false,
+      );
+    }
+    if (block.type == 'image') {
+      final file =
+          block.blobSha256 != null ? resolveBlobFile(block.blobSha256!) : null;
+      if (file != null && file.existsSync()) {
+        return Padding(
+          padding: const EdgeInsets.only(bottom: 10),
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(Gm3.radiusMd),
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxHeight: 280),
+              child: Image.file(file, fit: BoxFit.contain),
+            ),
+          ),
+        );
+      }
+      return const SizedBox.shrink();
+    }
+    if (_isToolLikeBlock(block)) {
+      if (!includeToolDetails) return const SizedBox.shrink();
+      final body = (block.toolInput ?? block.text ?? '').trim();
+      final capped =
+          body.length > 900 ? '${body.substring(0, 900)}\n...' : body;
+      return Container(
+        margin: const EdgeInsets.only(bottom: 10),
+        padding: const EdgeInsets.all(10),
+        decoration: BoxDecoration(
+          color: palette.assistantCardBg,
+          borderRadius: BorderRadius.circular(Gm3.radiusMd),
+          border: Border.all(color: palette.cardBorder),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              '${block.type}${block.toolName != null ? ': ${block.toolName}' : ''}',
+              style: GoogleMaterialTheme.monoTextStyle(
+                fontSize: Gm3.monoSm,
+                fontWeight: FontWeight.w700,
+                color: palette.accent,
+              ),
+            ),
+            if (capped.isNotEmpty) ...[
+              const SizedBox(height: 4),
+              Text(
+                capped,
+                style: GoogleMaterialTheme.monoTextStyle(
+                  fontSize: Gm3.monoSm,
+                  color: palette.metaText,
+                ),
+              ),
+            ],
+          ],
+        ),
+      );
+    }
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 6),
+      child: MarkdownProse(
+        text: block.text ?? '',
+        selectable: false,
+        showCopyButtons: false,
+      ),
+    );
+  }
+}
+
+class _DiagonalWatermarkPainter extends CustomPainter {
+  final String text;
+  final Color color;
+
+  const _DiagonalWatermarkPainter({
+    required this.text,
+    required this.color,
+  });
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (text.trim().isEmpty || size.isEmpty) return;
+
+    canvas.save();
+    canvas.clipRect(Offset.zero & size);
+
+    final tp = TextPainter(
+      text: TextSpan(
+        text: text,
+        style: TextStyle(
+          fontFamily: Gm3.uiFontFamily,
+          fontFamilyFallback: Gm3.uiFontFallback,
+          fontSize: 15,
+          fontWeight: FontWeight.w600,
+          color: color,
+          letterSpacing: 0.6,
+        ),
+      ),
+      textDirection: ui.TextDirection.ltr,
+      maxLines: 1,
+    )..layout(maxWidth: 340);
+
+    const angle = -0.45; // ~ -26 deg
+    final stepX = math.max(tp.width + 90, 240.0);
+    final stepY = 140.0;
+
+    canvas.translate(size.width / 2, size.height / 2);
+    canvas.rotate(angle);
+    final diag = math.sqrt(size.width * size.width + size.height * size.height);
+
+    for (double y = -diag / 2; y <= diag / 2; y += stepY) {
+      final rowShift = ((y ~/ stepY).isOdd) ? stepX * 0.5 : 0.0;
+      for (double x = -diag / 2 - rowShift; x <= diag / 2; x += stepX) {
+        tp.paint(canvas, Offset(x, y));
+      }
+    }
+
+    canvas.restore();
+  }
+
+  @override
+  bool shouldRepaint(covariant _DiagonalWatermarkPainter oldDelegate) {
+    return oldDelegate.text != text || oldDelegate.color != color;
+  }
+}
