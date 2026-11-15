@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 enum SmSortBy {
   updatedDesc('Latest Updated'),
   itemsDesc('Most Items'),
@@ -25,9 +27,15 @@ class ConversationSummary {
   final int id;
   final String provider;
   final String? externalId;
+  final String? parentExternalId;
+  final int? parentConversationId;
+  final bool isSubagent;
+  final String? subagentName;
+  final List<ConversationSummary> subagents;
   final String title;
   final String? summary;
   final String? cwd;
+  final String? defaultModel;
   final int? projectId;
   final String? projectName;
   final int itemCount;
@@ -44,9 +52,15 @@ class ConversationSummary {
     required this.id,
     required this.provider,
     this.externalId,
+    this.parentExternalId,
+    this.parentConversationId,
+    this.isSubagent = false,
+    this.subagentName,
+    this.subagents = const [],
     required this.title,
     this.summary,
     this.cwd,
+    this.defaultModel,
     this.projectId,
     this.projectName,
     required this.itemCount,
@@ -59,6 +73,40 @@ class ConversationSummary {
     this.supersededBy,
     this.isShrunk = false,
   });
+
+  ConversationSummary copyWith({
+    String? parentExternalId,
+    int? parentConversationId,
+    bool? isSubagent,
+    String? subagentName,
+    List<ConversationSummary>? subagents,
+  }) {
+    return ConversationSummary(
+      id: id,
+      provider: provider,
+      externalId: externalId,
+      parentExternalId: parentExternalId ?? this.parentExternalId,
+      parentConversationId: parentConversationId ?? this.parentConversationId,
+      isSubagent: isSubagent ?? this.isSubagent,
+      subagentName: subagentName ?? this.subagentName,
+      subagents: subagents ?? this.subagents,
+      title: title,
+      summary: summary,
+      cwd: cwd,
+      defaultModel: defaultModel,
+      projectId: projectId,
+      projectName: projectName,
+      itemCount: itemCount,
+      charCount: charCount,
+      blobCount: blobCount,
+      revisionCount: revisionCount,
+      starred: starred,
+      updatedAt: updatedAt,
+      headHash: headHash,
+      supersededBy: supersededBy,
+      isShrunk: isShrunk,
+    );
+  }
 }
 
 class ConversationRevisionInfo {
@@ -135,7 +183,8 @@ class MessageItem {
   final String? model;
   final String? toolName;
   final String text;
-  final List<ViewBlock> blocks;
+  final String? rawBlocksJson;
+  List<ViewBlock>? _blocks;
   final String? payloadRef;
   final int? createdAt;
   final bool isActiveBranch;
@@ -144,7 +193,7 @@ class MessageItem {
   final String? status;
   final String? supersededBy;
 
-  const MessageItem({
+  MessageItem({
     required this.id,
     this.parentId,
     this.ordinal = 0,
@@ -154,7 +203,8 @@ class MessageItem {
     this.model,
     this.toolName,
     required this.text,
-    this.blocks = const [],
+    List<ViewBlock>? blocks,
+    this.rawBlocksJson,
     this.payloadRef,
     this.createdAt,
     required this.isActiveBranch,
@@ -162,17 +212,41 @@ class MessageItem {
     required this.isSynthetic,
     this.status,
     this.supersededBy,
-  });
+  }) : _blocks = blocks;
+
+  List<ViewBlock> get blocks => _blocks ??= _decodeBlocks(rawBlocksJson);
+
+  static List<ViewBlock> _decodeBlocks(String? rawBlocks) {
+    if (rawBlocks == null || rawBlocks.isEmpty) return const [];
+    try {
+      final parsed = jsonDecode(rawBlocks);
+      if (parsed is List) {
+        var idx = 0;
+        return parsed
+            .whereType<Map<String, dynamic>>()
+            .map((m) => ViewBlock.fromJson(m, fallbackIdx: idx++))
+            .toList(growable: false);
+      }
+    } catch (_) {}
+    return const [];
+  }
 }
 
 class ConversationDetail {
   final int id;
   final String provider;
   final String? externalId;
+  final String? parentExternalId;
+  final int? parentConversationId;
+  final bool isSubagent;
+  final String? subagentName;
+  final List<ConversationSummary> subagents;
   final String title;
   final String? headHash;
   final String? defaultModel;
   final String? cwd;
+  final bool starred;
+  final List<String> tags;
   final int revisionCount;
   final String? supersededBy;
   final List<ConversationRevisionInfo> revisions;
@@ -183,10 +257,17 @@ class ConversationDetail {
     required this.id,
     required this.provider,
     this.externalId,
+    this.parentExternalId,
+    this.parentConversationId,
+    this.isSubagent = false,
+    this.subagentName,
+    this.subagents = const [],
     required this.title,
     this.headHash,
     this.defaultModel,
     this.cwd,
+    this.starred = false,
+    this.tags = const [],
     this.revisionCount = 1,
     this.supersededBy,
     this.revisions = const [],
@@ -335,4 +416,139 @@ class SmCliResult {
     }
     return 'ok';
   }
+}
+
+class ImportProgressUpdate {
+  final String stage;
+  final String? adapterId;
+  final int completed;
+  final int total;
+  final int skipped;
+  final int bytesProcessed;
+  final int totalBytes;
+  final String? currentEntry;
+  final Duration elapsed;
+
+  const ImportProgressUpdate({
+    required this.stage,
+    this.adapterId,
+    required this.completed,
+    required this.total,
+    required this.skipped,
+    required this.bytesProcessed,
+    required this.totalBytes,
+    this.currentEntry,
+    required this.elapsed,
+  });
+
+  factory ImportProgressUpdate.fromJson(
+    Map<String, dynamic> json, {
+    required Duration elapsed,
+  }) {
+    return ImportProgressUpdate(
+      stage: json['stage']?.toString() ?? 'parse',
+      adapterId: json['adapterId']?.toString(),
+      completed: (json['completed'] as num?)?.toInt() ?? 0,
+      total: (json['total'] as num?)?.toInt() ?? 0,
+      skipped: (json['skipped'] as num?)?.toInt() ?? 0,
+      bytesProcessed: (json['bytesProcessed'] as num?)?.toInt() ?? 0,
+      totalBytes: (json['totalBytes'] as num?)?.toInt() ?? 0,
+      currentEntry: json['currentEntry']?.toString(),
+      elapsed: elapsed,
+    );
+  }
+
+  double? get fraction {
+    if (stage == 'done') return 1.0;
+    if (stage == 'probe' || stage == 'plan') return null;
+    if (total <= 0) {
+      if (totalBytes > 0) {
+        return (bytesProcessed / totalBytes).clamp(0.0, 1.0);
+      }
+      return null;
+    }
+    return (completed / total).clamp(0.0, 1.0);
+  }
+
+  double get elapsedSeconds => elapsed.inMilliseconds / 1000.0;
+
+  double get itemsPerSec {
+    final sec = elapsedSeconds;
+    if (sec < 0.05 || completed <= 0) return 0;
+    return completed / sec;
+  }
+
+  double get bytesPerSec {
+    final sec = elapsedSeconds;
+    if (sec < 0.05 || bytesProcessed <= 0) return 0;
+    return bytesProcessed / sec;
+  }
+
+  Duration? get eta {
+    if (stage == 'done') return Duration.zero;
+    if (stage != 'parse' || total <= 0 || completed <= 0 || completed >= total) {
+      return null;
+    }
+    final sec = elapsedSeconds;
+    if (sec < 0.1) return null;
+    final remainingItems = total - completed;
+    final estRemSeconds = remainingItems / (completed / sec);
+    if (!estRemSeconds.isFinite || estRemSeconds < 0) return null;
+    return Duration(milliseconds: (estRemSeconds * 1000).round());
+  }
+
+  String get formattedBytesSpeed {
+    final bps = bytesPerSec;
+    if (bps <= 0) return '--';
+    if (bps < 1024) return '${bps.toStringAsFixed(0)} B/s';
+    if (bps < 1024 * 1024) return '${(bps / 1024).toStringAsFixed(1)} KB/s';
+    return '${(bps / (1024 * 1024)).toStringAsFixed(1)} MB/s';
+  }
+
+  static String formatDuration(Duration d) {
+    final totalSec = d.inSeconds;
+    if (totalSec < 60) return '${totalSec}s';
+    final min = totalSec ~/ 60;
+    final rem = totalSec % 60;
+    return '${min}m ${rem.toString().padLeft(2, '0')}s';
+  }
+}
+
+class ArchiveDiskStats {
+  final String dbPath;
+  final String archiveRoot;
+  final bool dbExists;
+  final int dbBytes;
+  final int cacheBytes;
+  final int conversationCount;
+  final int batchCount;
+
+  const ArchiveDiskStats({
+    required this.dbPath,
+    required this.archiveRoot,
+    required this.dbExists,
+    required this.dbBytes,
+    required this.cacheBytes,
+    required this.conversationCount,
+    required this.batchCount,
+  });
+
+  int get totalBytes => dbBytes + cacheBytes;
+  bool get hasAnyData => dbExists || dbBytes > 0 || cacheBytes > 0;
+}
+
+class ArchiveResetResult {
+  final bool ok;
+  final int deletedFiles;
+  final int deletedDirs;
+  final int freedBytes;
+  final String? errorMessage;
+
+  const ArchiveResetResult({
+    required this.ok,
+    required this.deletedFiles,
+    required this.deletedDirs,
+    required this.freedBytes,
+    this.errorMessage,
+  });
 }

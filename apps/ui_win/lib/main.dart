@@ -1,19 +1,27 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import 'data/app_settings.dart';
 import 'data/archive_direct_store.dart';
 import 'data/local_agent_discovery.dart';
+import 'data/perf_logger.dart';
 import 'data/sm_cli_runner.dart';
 import 'l10n/app_strings.dart';
 import 'models.dart';
+import 'platform/window_chrome.dart';
 import 'theme.dart';
 import 'views/branch_reader_view.dart';
 import 'views/import_view.dart';
 import 'views/integrity_view.dart';
 import 'views/search_view.dart';
 import 'views/session_list_view.dart';
+import 'views/settings_view.dart';
+import 'widgets/app_title_bar.dart';
+import 'widgets/gm3_surface.dart';
 
 void main() {
+  WidgetsFlutterBinding.ensureInitialized();
+  WindowChrome.attach();
   runApp(const SessionManagerApp());
 }
 
@@ -21,6 +29,7 @@ class SessionManagerApp extends StatefulWidget {
   final ArchiveDirectStore? storeOverride;
   final SmCliRunner? cliRunnerOverride;
   final LocalAgentDiscoveryService? discoveryOverride;
+  final AppSettingsController? settingsOverride;
   final AppLocale initialLocale;
   final ThemeMode initialThemeMode;
   final int initialTabIndex;
@@ -30,6 +39,7 @@ class SessionManagerApp extends StatefulWidget {
     this.storeOverride,
     this.cliRunnerOverride,
     this.discoveryOverride,
+    this.settingsOverride,
     this.initialLocale = AppLocale.zh,
     this.initialThemeMode = ThemeMode.light,
     this.initialTabIndex = 0,
@@ -40,20 +50,59 @@ class SessionManagerApp extends StatefulWidget {
 }
 
 class _SessionManagerAppState extends State<SessionManagerApp> {
+  late final AppSettingsController _settings;
+  late final bool _ownsSettings;
   late final ValueNotifier<ThemeMode> _themeMode;
   late final ValueNotifier<AppLocale> _locale;
 
   @override
   void initState() {
     super.initState();
-    _themeMode = ValueNotifier<ThemeMode>(widget.initialThemeMode);
-    _locale = ValueNotifier<AppLocale>(widget.initialLocale);
+    _ownsSettings = widget.settingsOverride == null;
+    _settings = widget.settingsOverride ??
+        AppSettingsController(
+          locale: widget.initialLocale,
+          themeMode: widget.initialThemeMode,
+        );
+    _themeMode = ValueNotifier<ThemeMode>(_settings.themeMode);
+    _locale = ValueNotifier<AppLocale>(_settings.locale);
+
+    _settings.addListener(_syncFromSettings);
+    _themeMode.addListener(_syncThemeToSettings);
+    _locale.addListener(_syncLocaleToSettings);
+  }
+
+  void _syncFromSettings() {
+    if (_themeMode.value != _settings.themeMode) {
+      _themeMode.value = _settings.themeMode;
+    }
+    if (_locale.value != _settings.locale) {
+      _locale.value = _settings.locale;
+    }
+  }
+
+  void _syncThemeToSettings() {
+    if (_settings.themeMode != _themeMode.value) {
+      _settings.setThemeMode(_themeMode.value);
+    }
+  }
+
+  void _syncLocaleToSettings() {
+    if (_settings.locale != _locale.value) {
+      _settings.setLocale(_locale.value);
+    }
   }
 
   @override
   void dispose() {
+    _settings.removeListener(_syncFromSettings);
+    _themeMode.removeListener(_syncThemeToSettings);
+    _locale.removeListener(_syncLocaleToSettings);
     _themeMode.dispose();
     _locale.dispose();
+    if (_ownsSettings) {
+      _settings.dispose();
+    }
     super.dispose();
   }
 
@@ -73,6 +122,7 @@ class _SessionManagerAppState extends State<SessionManagerApp> {
             home: MainShell(
               themeModeNotifier: _themeMode,
               localeNotifier: _locale,
+              settings: _settings,
               storeOverride: widget.storeOverride,
               cliRunnerOverride: widget.cliRunnerOverride,
               discoveryOverride: widget.discoveryOverride,
@@ -88,6 +138,7 @@ class _SessionManagerAppState extends State<SessionManagerApp> {
 class MainShell extends StatefulWidget {
   final ValueNotifier<ThemeMode> themeModeNotifier;
   final ValueNotifier<AppLocale> localeNotifier;
+  final AppSettingsController settings;
   final ArchiveDirectStore? storeOverride;
   final SmCliRunner? cliRunnerOverride;
   final LocalAgentDiscoveryService? discoveryOverride;
@@ -97,6 +148,7 @@ class MainShell extends StatefulWidget {
     super.key,
     required this.themeModeNotifier,
     required this.localeNotifier,
+    required this.settings,
     this.storeOverride,
     this.cliRunnerOverride,
     this.discoveryOverride,
@@ -108,6 +160,8 @@ class MainShell extends StatefulWidget {
 }
 
 class _MainShellState extends State<MainShell> {
+  static const double _wideBreakpoint = 1100;
+
   late int _selectedIndex;
   late final ArchiveDirectStore _store;
   late final SmCliRunner _cliRunner;
@@ -125,6 +179,12 @@ class _MainShellState extends State<MainShell> {
     _store = widget.storeOverride ?? ArchiveDirectStore();
     _cliRunner = widget.cliRunnerOverride ?? SmCliRunner(store: _store);
     _discovery = widget.discoveryOverride ?? const LocalAgentDiscoveryService();
+
+    if (widget.storeOverride == null) {
+      widget.settings.attachSettingsDir(_store.archiveRoot);
+    } else {
+      PerfLogger.instance.archiveRoot = _store.archiveRoot;
+    }
   }
 
   @override
@@ -139,16 +199,24 @@ class _MainShellState extends State<MainShell> {
   }
 
   void _triggerReload() {
-    _store.checkConnection();
+    final connected = _store.checkConnection();
+    if (widget.storeOverride == null) {
+      widget.settings.attachSettingsDir(_store.archiveRoot);
+    } else {
+      PerfLogger.instance.archiveRoot = _store.archiveRoot;
+    }
+    if (!connected && _selectedConversationId != null) {
+      setState(() => _selectedConversationId = null);
+    }
     _refreshTick.value++;
   }
 
   void _navigateToConversation(int id) {
     setState(() {
       _selectedConversationId = id;
-      final wide = MediaQuery.sizeOf(context).width >= 1100;
+      final wide = MediaQuery.sizeOf(context).width >= _wideBreakpoint;
       if (!wide || _selectedIndex != 0) {
-        _selectedIndex = 2; // Reader tab on narrow screens or when jumping from Search/Integrity
+        _selectedIndex = 2;
       }
     });
   }
@@ -165,9 +233,8 @@ class _MainShellState extends State<MainShell> {
   @override
   Widget build(BuildContext context) {
     final s = AppStringsScope.of(context);
-    final theme = Theme.of(context);
-    final cs = theme.colorScheme;
-    final isWide = MediaQuery.sizeOf(context).width >= 1100;
+    final surfaces = Gm3Surfaces.of(context);
+    final isWide = MediaQuery.sizeOf(context).width >= _wideBreakpoint;
 
     return CallbackShortcuts(
       bindings: <ShortcutActivator, VoidCallback>{
@@ -178,251 +245,283 @@ class _MainShellState extends State<MainShell> {
         const SingleActivator(LogicalKeyboardKey.keyO, control: true): () {
           setState(() => _selectedIndex = 1);
         },
-        const SingleActivator(LogicalKeyboardKey.keyR, control: true): _triggerReload,
+        const SingleActivator(LogicalKeyboardKey.keyR, control: true):
+            _triggerReload,
         const SingleActivator(LogicalKeyboardKey.f5): _triggerReload,
       },
       child: Focus(
         autofocus: true,
         child: Scaffold(
-          body: Column(
-            children: [
-              // Google Material 3 Clean Top App Bar
-              Container(
-                height: 56,
-                padding: const EdgeInsets.symmetric(horizontal: 18),
-                decoration: BoxDecoration(
-                  color: cs.surfaceContainerLow,
-                  border: Border(bottom: BorderSide(color: theme.dividerColor)),
-                ),
-                child: Row(
-                  children: [
-                    Container(
-                      width: 34,
-                      height: 34,
-                      decoration: BoxDecoration(
-                        color: cs.primaryContainer,
-                        borderRadius: BorderRadius.circular(10),
-                      ),
-                      child: Icon(Icons.archive_outlined, size: 19, color: cs.onPrimaryContainer),
-                    ),
-                    const SizedBox(width: 12),
-                    Text(s.appTitle, style: theme.textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w600)),
-                    const SizedBox(width: 12),
-                    ValueListenableBuilder<bool>(
-                      valueListenable: _store.isConnectedNotifier,
-                      builder: (context, connected, _) {
-                        final badgeColor = connected ? const Color(0xFF137333) : const Color(0xFFB06000);
-                        return Tooltip(
-                          message: _store.dbPath,
-                          child: Container(
-                            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                            decoration: BoxDecoration(
-                              color: badgeColor.withOpacity(0.12),
-                              borderRadius: BorderRadius.circular(20),
-                            ),
-                            child: Row(
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                Icon(Icons.circle, size: 8, color: badgeColor),
-                                const SizedBox(width: 6),
-                                Text(
-                                  connected ? s.statusDirectConnected : s.statusDemoMode,
-                                  style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: badgeColor),
-                                ),
-                              ],
-                            ),
-                          ),
+          backgroundColor: surfaces.canvas,
+          body: ColoredBox(
+            color: surfaces.canvas,
+            child: Column(
+              children: <Widget>[
+                ValueListenableBuilder<bool>(
+                  valueListenable: _store.isConnectedNotifier,
+                  builder: (context, connected, _) {
+                    return ValueListenableBuilder<String>(
+                      valueListenable: _store.dbPathNotifier,
+                      builder: (context, dbPath, __) {
+                        return AppTitleBar(
+                          appTitle: s.appTitle,
+                          statusLabel: connected
+                              ? s.statusDirectConnected
+                              : s.statusNotInitialized,
+                          statusConnected: connected,
+                          dbPath: dbPath,
+                          localeNotifier: widget.localeNotifier,
+                          themeModeNotifier: widget.themeModeNotifier,
+                          onReload: _triggerReload,
+                          onCycleTheme: _cycleThemeMode,
+                          trailingBadge: _CliBadge(runner: _cliRunner),
                         );
                       },
-                    ),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: ValueListenableBuilder<String>(
-                        valueListenable: _store.dbPathNotifier,
-                        builder: (context, path, _) {
-                          return Text(
-                            path,
-                            style: GoogleMaterialTheme.monoTextStyle(fontSize: 11.5, color: cs.onSurfaceVariant),
-                            overflow: TextOverflow.ellipsis,
-                          );
-                        },
+                    );
+                  },
+                ),
+                Expanded(
+                  child: Row(
+                    children: <Widget>[
+                      _NavigationRailPane(
+                        selectedIndex: _selectedIndex,
+                        onDestinationSelected: (index) =>
+                            setState(() => _selectedIndex = index),
+                        strings: s,
                       ),
-                    ),
-                    ValueListenableBuilder<SmCliResult?>(
-                      valueListenable: _cliRunner.lastResultNotifier,
-                      builder: (context, last, _) {
-                        if (last == null) return const SizedBox.shrink();
-                        return Padding(
-                          padding: const EdgeInsets.only(right: 12),
-                          child: Container(
-                            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                            decoration: BoxDecoration(
-                              color: last.ok ? cs.surfaceContainerHigh : cs.errorContainer,
-                              borderRadius: BorderRadius.circular(20),
-                            ),
-                            child: Text(
-                              '${last.command}: ${last.ok ? last.summary : 'err'}',
-                              style: TextStyle(
-                                fontSize: 11.5,
-                                color: last.ok ? cs.onSurfaceVariant : cs.onErrorContainer,
+                      Expanded(
+                        child: _ContentSheet(
+                          child: IndexedStack(
+                            index: _selectedIndex,
+                            children: <Widget>[
+                              isWide
+                                  ? _WideSessionsPane(
+                                      store: _store,
+                                      cliRunner: _cliRunner,
+                                      settings: widget.settings,
+                                      refreshTick: _refreshTick,
+                                      isActiveTab: _selectedIndex == 0,
+                                      selectedConversationId:
+                                          _selectedConversationId,
+                                      onSelectSession: _navigateToConversation,
+                                      onDataChanged: _triggerReload,
+                                      onGoToImport: () =>
+                                          setState(() => _selectedIndex = 1),
+                                    )
+                                  : SessionListView(
+                                      store: _store,
+                                      cliRunner: _cliRunner,
+                                      refreshTick: _refreshTick,
+                                      selectedConversationId:
+                                          _selectedConversationId,
+                                      onSelectSession: _navigateToConversation,
+                                      onDataChanged: _triggerReload,
+                                      onGoToImport: () =>
+                                          setState(() => _selectedIndex = 1),
+                                    ),
+                              ImportView(
+                                store: _store,
+                                cliRunner: _cliRunner,
+                                discoveryService: _discovery,
+                                onDataChanged: _triggerReload,
                               ),
-                            ),
+                              BranchTreeReaderView(
+                                store: _store,
+                                cliRunner: _cliRunner,
+                                settings: widget.settings,
+                                refreshTick: _refreshTick,
+                                conversationId: (!isWide || _selectedIndex == 2)
+                                    ? _selectedConversationId
+                                    : null,
+                                onSelectOtherSession: _navigateToConversation,
+                                onDataChanged: _triggerReload,
+                              ),
+                              FullTextSearchView(
+                                store: _store,
+                                searchFocusNode: _searchFocusNode,
+                                onSelectSession: _navigateToConversation,
+                              ),
+                              IntegrityReportView(
+                                store: _store,
+                                cliRunner: _cliRunner,
+                                refreshTick: _refreshTick,
+                                onDataChanged: _triggerReload,
+                                onOpenConversation: _navigateToConversation,
+                              ),
+                              SettingsView(
+                                settings: widget.settings,
+                                store: _store,
+                              ),
+                            ],
                           ),
-                        );
-                      },
-                    ),
-                    // Bilingual 中文 / EN Switcher
-                    ValueListenableBuilder<AppLocale>(
-                      valueListenable: widget.localeNotifier,
-                      builder: (context, loc, _) {
-                        return SegmentedButton<AppLocale>(
-                          showSelectedIcon: false,
-                          style: SegmentedButton.styleFrom(
-                            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 0),
-                            visualDensity: VisualDensity.compact,
-                            textStyle: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
-                          ),
-                          segments: const [
-                            ButtonSegment(value: AppLocale.zh, label: Text('中文')),
-                            ButtonSegment(value: AppLocale.en, label: Text('EN')),
-                          ],
-                          selected: {loc},
-                          onSelectionChanged: (val) {
-                            widget.localeNotifier.value = val.first;
-                          },
-                        );
-                      },
-                    ),
-                    const SizedBox(width: 8),
-                    IconButton(
-                      tooltip: s.reloadTooltip,
-                      icon: const Icon(Icons.refresh, size: 20),
-                      onPressed: _triggerReload,
-                    ),
-                    ValueListenableBuilder<ThemeMode>(
-                      valueListenable: widget.themeModeNotifier,
-                      builder: (context, mode, _) {
-                        final icon = switch (mode) {
-                          ThemeMode.system => Icons.brightness_auto_outlined,
-                          ThemeMode.light => Icons.light_mode_outlined,
-                          ThemeMode.dark => Icons.dark_mode_outlined,
-                        };
-                        return IconButton(
-                          tooltip: s.themeTooltip(mode),
-                          icon: Icon(icon, size: 20),
-                          onPressed: _cycleThemeMode,
-                        );
-                      },
-                    ),
-                  ],
-                ),
-              ),
-              Expanded(
-                child: Row(
-                  children: [
-                    NavigationRail(
-                      selectedIndex: _selectedIndex,
-                      onDestinationSelected: (index) => setState(() => _selectedIndex = index),
-                      labelType: NavigationRailLabelType.all,
-                      minWidth: 76,
-                      destinations: [
-                        NavigationRailDestination(
-                          icon: const Icon(Icons.forum_outlined),
-                          selectedIcon: const Icon(Icons.forum),
-                          label: Text(s.navSessions),
                         ),
-                        NavigationRailDestination(
-                          icon: const Icon(Icons.cloud_download_outlined),
-                          selectedIcon: const Icon(Icons.cloud_download),
-                          label: Text(s.navImport),
-                        ),
-                        NavigationRailDestination(
-                          icon: const Icon(Icons.alt_route_outlined),
-                          selectedIcon: const Icon(Icons.alt_route),
-                          label: Text(s.navReader),
-                        ),
-                        NavigationRailDestination(
-                          icon: const Icon(Icons.search_outlined),
-                          selectedIcon: const Icon(Icons.search),
-                          label: Text(s.navSearch),
-                        ),
-                        NavigationRailDestination(
-                          icon: const Icon(Icons.fact_check_outlined),
-                          selectedIcon: const Icon(Icons.fact_check),
-                          label: Text(s.navIntegrity),
-                        ),
-                      ],
-                    ),
-                    VerticalDivider(width: 1, thickness: 1, color: theme.dividerColor),
-                    Expanded(
-                      child: IndexedStack(
-                        index: _selectedIndex,
-                        children: [
-                          isWide
-                              ? Row(
-                                  children: [
-                                    SizedBox(
-                                      width: 420,
-                                      child: SessionListView(
-                                        store: _store,
-                                        refreshTick: _refreshTick,
-                                        selectedConversationId: _selectedConversationId,
-                                        onSelectSession: _navigateToConversation,
-                                        onGoToImport: () => setState(() => _selectedIndex = 1),
-                                      ),
-                                    ),
-                                    VerticalDivider(width: 1, thickness: 1, color: theme.dividerColor),
-                                    Expanded(
-                                      child: BranchTreeReaderView(
-                                        store: _store,
-                                        refreshTick: _refreshTick,
-                                        conversationId: _selectedConversationId,
-                                        onSelectOtherSession: _navigateToConversation,
-                                      ),
-                                    ),
-                                  ],
-                                )
-                              : SessionListView(
-                                  store: _store,
-                                  refreshTick: _refreshTick,
-                                  selectedConversationId: _selectedConversationId,
-                                  onSelectSession: _navigateToConversation,
-                                  onGoToImport: () => setState(() => _selectedIndex = 1),
-                                ),
-                          ImportView(
-                            store: _store,
-                            cliRunner: _cliRunner,
-                            discoveryService: _discovery,
-                            onDataChanged: _triggerReload,
-                          ),
-                          BranchTreeReaderView(
-                            store: _store,
-                            refreshTick: _refreshTick,
-                            conversationId: _selectedConversationId,
-                            onSelectOtherSession: _navigateToConversation,
-                          ),
-                          FullTextSearchView(
-                            store: _store,
-                            searchFocusNode: _searchFocusNode,
-                            onSelectSession: _navigateToConversation,
-                          ),
-                          IntegrityReportView(
-                            store: _store,
-                            cliRunner: _cliRunner,
-                            refreshTick: _refreshTick,
-                            onDataChanged: _triggerReload,
-                            onOpenConversation: _navigateToConversation,
-                          ),
-                        ],
                       ),
-                    ),
-                  ],
+                    ],
+                  ),
                 ),
-              ),
-            ],
+              ],
+            ),
           ),
         ),
       ),
+    );
+  }
+}
+
+class _ContentSheet extends StatelessWidget {
+  const _ContentSheet({required this.child});
+
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    final surfaces = Gm3Surfaces.of(context);
+    return ClipRRect(
+      borderRadius: const BorderRadius.only(
+        topLeft: Radius.circular(Gm3.radiusLg),
+        topRight: Radius.circular(Gm3.radiusLg),
+      ),
+      child: ColoredBox(
+        color: surfaces.panel,
+        child: child,
+      ),
+    );
+  }
+}
+
+class _NavigationRailPane extends StatelessWidget {
+  const _NavigationRailPane({
+    required this.selectedIndex,
+    required this.onDestinationSelected,
+    required this.strings,
+  });
+
+  final int selectedIndex;
+  final ValueChanged<int> onDestinationSelected;
+  final AppStrings strings;
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      width: Gm3.railWidth,
+      child: NavigationRail(
+        selectedIndex: selectedIndex,
+        onDestinationSelected: onDestinationSelected,
+        labelType: NavigationRailLabelType.all,
+        groupAlignment: -1,
+        minWidth: Gm3.railWidth,
+        minExtendedWidth: 256,
+        leading: const SizedBox(height: 8),
+        destinations: <NavigationRailDestination>[
+          NavigationRailDestination(
+            icon: const Icon(Icons.forum_outlined),
+            selectedIcon: const Icon(Icons.forum),
+            label: Text(strings.navSessions),
+          ),
+          NavigationRailDestination(
+            icon: const Icon(Icons.cloud_download_outlined),
+            selectedIcon: const Icon(Icons.cloud_download),
+            label: Text(strings.navImport),
+          ),
+          NavigationRailDestination(
+            icon: const Icon(Icons.alt_route_outlined),
+            selectedIcon: const Icon(Icons.alt_route),
+            label: Text(strings.navReader),
+          ),
+          NavigationRailDestination(
+            icon: const Icon(Icons.search_outlined),
+            selectedIcon: const Icon(Icons.search),
+            label: Text(strings.navSearch),
+          ),
+          NavigationRailDestination(
+            icon: const Icon(Icons.fact_check_outlined),
+            selectedIcon: const Icon(Icons.fact_check),
+            label: Text(strings.navIntegrity),
+          ),
+          NavigationRailDestination(
+            icon: const Icon(Icons.settings_outlined),
+            selectedIcon: const Icon(Icons.settings),
+            label: Text(strings.navSettings),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Session list + branch reader inside one sheet, split by a single hairline.
+class _WideSessionsPane extends StatelessWidget {
+  const _WideSessionsPane({
+    required this.store,
+    required this.cliRunner,
+    required this.settings,
+    required this.refreshTick,
+    required this.isActiveTab,
+    required this.selectedConversationId,
+    required this.onSelectSession,
+    required this.onDataChanged,
+    required this.onGoToImport,
+  });
+
+  final ArchiveDirectStore store;
+  final SmCliRunner cliRunner;
+  final AppSettingsController settings;
+  final ValueNotifier<int> refreshTick;
+  final bool isActiveTab;
+  final int? selectedConversationId;
+  final ValueChanged<int> onSelectSession;
+  final VoidCallback onDataChanged;
+  final VoidCallback onGoToImport;
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      children: <Widget>[
+        SizedBox(
+          width: Gm3.listPaneWidth,
+          child: SessionListView(
+            store: store,
+            cliRunner: cliRunner,
+            refreshTick: refreshTick,
+            selectedConversationId: selectedConversationId,
+            onSelectSession: onSelectSession,
+            onDataChanged: onDataChanged,
+            onGoToImport: onGoToImport,
+          ),
+        ),
+        const Gm3Hairline(axis: Axis.vertical),
+        Expanded(
+          child: BranchTreeReaderView(
+            store: store,
+            cliRunner: cliRunner,
+            settings: settings,
+            refreshTick: refreshTick,
+            conversationId: isActiveTab ? selectedConversationId : null,
+            onSelectOtherSession: onSelectSession,
+            onDataChanged: onDataChanged,
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _CliBadge extends StatelessWidget {
+  const _CliBadge({required this.runner});
+
+  final SmCliRunner runner;
+
+  @override
+  Widget build(BuildContext context) {
+    return ValueListenableBuilder<SmCliResult?>(
+      valueListenable: runner.lastResultNotifier,
+      builder: (context, last, _) {
+        if (last == null) return const SizedBox.shrink();
+        return HeaderBadge(
+          label: '${last.command}: ${last.ok ? last.summary : 'err'}',
+          emphasized: !last.ok,
+        );
+      },
     );
   }
 }

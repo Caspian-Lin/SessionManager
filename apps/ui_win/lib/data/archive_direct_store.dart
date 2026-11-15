@@ -5,6 +5,19 @@ import 'package:path/path.dart' as p;
 import 'package:sqlite3/sqlite3.dart' as sq;
 
 import '../models.dart';
+import 'perf_logger.dart';
+
+class _SubagentMeta {
+  final String? parentExternalId;
+  final bool isSubagent;
+  final String? subagentName;
+
+  const _SubagentMeta({
+    this.parentExternalId,
+    this.isSubagent = false,
+    this.subagentName,
+  });
+}
 
 /// CQRS Read Path: Direct SQLite WAL read-only access (`OpenMode.readOnly`)
 /// plus zero-copy local `blobs/` file resolution.
@@ -13,6 +26,10 @@ class ArchiveDirectStore {
 
   late String _dbPath;
   late String _archiveRoot;
+  sq.Database? _cachedReadDb;
+  String? _cachedReadDbPath;
+  Set<String>? _cachedShrunkIds;
+  final Map<int, _SubagentMeta> _subagentBackfillCache = <int, _SubagentMeta>{};
   final ValueNotifier<bool> isConnectedNotifier = ValueNotifier<bool>(false);
   final ValueNotifier<String> dbPathNotifier = ValueNotifier<String>('');
 
@@ -27,8 +44,12 @@ class ArchiveDirectStore {
   }
 
   void _applyPath(String resolvedDbPath) {
+    _closeReadDb();
+    _cachedShrunkIds = null;
+    _subagentBackfillCache.clear();
     _dbPath = resolvedDbPath;
     _archiveRoot = p.dirname(resolvedDbPath);
+    PerfLogger.instance.archiveRoot = _archiveRoot;
     dbPathNotifier.value = resolvedDbPath;
     isConnectedNotifier.value = File(resolvedDbPath).existsSync();
   }
@@ -44,46 +65,92 @@ class ArchiveDirectStore {
       if (norm.endsWith('.db')) return norm;
       return p.join(norm, 'archive.db');
     }
-    final candidates = [
-      p.join(Directory.current.path, 'archive', 'archive.db'),
-      p.join(Directory.current.path, 'archive.db'),
-    ];
-    for (final c in candidates) {
-      if (File(c).existsSync()) return c;
+    final cwd = Directory.current.path;
+    final cwdLower = cwd.toLowerCase();
+    final isSystemDir = cwdLower.contains(r'\windows\system32') ||
+        cwdLower.contains(r'\windowsapps\') ||
+        cwdLower.contains(r'\program files');
+    if (!isSystemDir) {
+      final candidates = [
+        p.join(cwd, 'archive', 'archive.db'),
+        p.join(cwd, 'archive.db'),
+      ];
+      for (final c in candidates) {
+        if (File(c).existsSync()) return c;
+      }
     }
-    return candidates.last;
+    final localAppData = (Platform.environment['LOCALAPPDATA'] ?? '').trim();
+    if (localAppData.isNotEmpty) {
+      return p.join(localAppData, 'SessionManager', 'archive', 'archive.db');
+    }
+    final home = (Platform.environment['USERPROFILE'] ??
+            Platform.environment['HOME'] ??
+            '')
+        .trim();
+    if (home.isNotEmpty) {
+      return p.join(home, '.session-manager', 'archive', 'archive.db');
+    }
+    return p.join(cwd, 'archive', 'archive.db');
+  }
+
+  void _closeReadDb() {
+    try {
+      _cachedReadDb?.dispose();
+    } catch (_) {}
+    _cachedReadDb = null;
+    _cachedReadDbPath = null;
   }
 
   void dispose() {
+    _closeReadDb();
     isConnectedNotifier.dispose();
     dbPathNotifier.dispose();
   }
 
-  sq.Database? _openReadOnlyDb() {
+  /// Persistent read-only SQLite connection reused across fast UI queries.
+  /// Do NOT dispose inside individual read methods; closed on path switch,
+  /// archive reset, or store dispose.
+  sq.Database? _getReadDb() {
     if (!File(_dbPath).existsSync()) {
+      _closeReadDb();
       isConnectedNotifier.value = false;
       return null;
     }
+    if (_cachedReadDb != null && _cachedReadDbPath == _dbPath) {
+      return _cachedReadDb;
+    }
+    _closeReadDb();
+    sq.Database? opened;
     try {
-      final db = sq.sqlite3.open(_dbPath, mode: sq.OpenMode.readOnly);
-      db.execute('PRAGMA busy_timeout = 3000;');
-      db.execute('PRAGMA query_only = ON;');
+      opened = sq.sqlite3.open(_dbPath, mode: sq.OpenMode.readOnly);
+      opened.execute('PRAGMA busy_timeout = 3000;');
+      opened.execute('PRAGMA query_only = ON;');
+      opened.execute('PRAGMA cache_size = -16000;');
+      opened.execute('PRAGMA temp_store = MEMORY;');
+      _cachedReadDb = opened;
+      _cachedReadDbPath = _dbPath;
       isConnectedNotifier.value = true;
-      return db;
+      return opened;
     } catch (_) {
+      try {
+        opened?.dispose();
+      } catch (_) {}
       isConnectedNotifier.value = false;
       return null;
     }
   }
 
   bool checkConnection() {
-    final db = _openReadOnlyDb();
-    if (db == null) return false;
-    db.dispose();
-    return true;
+    _closeReadDb();
+    _cachedShrunkIds = null;
+    _subagentBackfillCache.clear();
+    return _getReadDb() != null;
   }
 
-  Set<String> _loadShrunkIdSet(sq.Database db) {
+  Set<String> _loadShrunkIdSet(sq.Database db, {bool forceRefresh = false}) {
+    if (!forceRefresh && _cachedShrunkIds != null) {
+      return _cachedShrunkIds!;
+    }
     final shrunkIds = <String>{};
     try {
       final rows = db.select('SELECT report_json FROM import_batch WHERE report_json IS NOT NULL');
@@ -104,6 +171,7 @@ class ArchiveDirectStore {
         }
       }
     } catch (_) {}
+    _cachedShrunkIds = shrunkIds;
     return shrunkIds;
   }
 
@@ -120,7 +188,7 @@ class ArchiveDirectStore {
 
     String resolvedExt = ext ?? '';
     if (resolvedExt.isEmpty) {
-      final db = _openReadOnlyDb();
+      final db = _getReadDb();
       if (db != null) {
         try {
           final rows = db.select(
@@ -134,9 +202,7 @@ class ArchiveDirectStore {
             }
             resolvedExt = (rows.first['ext'] as String?) ?? '';
           }
-        } finally {
-          db.dispose();
-        }
+        } catch (_) {}
       }
     }
 
@@ -200,7 +266,7 @@ class ArchiveDirectStore {
   }
 
   Future<List<ProjectInfo>> getProjects() async {
-    final db = _openReadOnlyDb();
+    final db = _getReadDb();
     if (db != null) {
       try {
         final rows = db.select(
@@ -220,11 +286,103 @@ class ArchiveDirectStore {
                   ))
               .toList();
         }
-      } finally {
-        db.dispose();
-      }
+      } catch (_) {}
     }
     return const [];
+  }
+
+  static final RegExp _subagentTitleRe = RegExp(
+    r'\(@([^\s)]+)\s+subagent\)',
+    caseSensitive: false,
+  );
+  static final RegExp _jsonParentSessRe = RegExp(
+    r'"parent_session(?:_id)?"\s*:\s*"([^"]+)"',
+  );
+  static final RegExp _jsonParentThreadRe = RegExp(
+    r'"parent_thread_id"\s*:\s*"([^"]+)"',
+  );
+  static final RegExp _jsonTaskTypeSubRe = RegExp(
+    r'"task_type"\s*:\s*"subagent"|"origin"\s*:\s*"subagent"',
+  );
+  static final RegExp _jsonAgentPresetRe = RegExp(
+    r'"(?:agent_preset|agent_role|agent_nickname)"\s*:\s*"([^"]+)"',
+  );
+
+  _SubagentMeta _resolveSubagentMeta({
+    required int convId,
+    required String provider,
+    required String title,
+    required Map<String, dynamic>? flagsMap,
+    required String? rawBlobSha256,
+  }) {
+    final flagParent = flagsMap?['parent_external_id']?.toString();
+    final flagIsSub = flagsMap?['is_subagent'] == true;
+    final flagName = flagsMap?['subagent_name']?.toString();
+    if (flagParent != null || flagIsSub || flagName != null) {
+      return _SubagentMeta(
+        parentExternalId: flagParent,
+        isSubagent: flagIsSub || (flagParent != null && flagParent.isNotEmpty),
+        subagentName: flagName,
+      );
+    }
+
+    final cached = _subagentBackfillCache[convId];
+    if (cached != null) return cached;
+
+    var parentExt = flagParent;
+    var isSub = flagIsSub;
+    var subName = flagName;
+
+    final titleMatch = _subagentTitleRe.firstMatch(title);
+    if (titleMatch != null) {
+      isSub = true;
+      subName ??= titleMatch.group(1);
+    }
+
+    // Best-effort lightweight header inspect (< 1.5 KB) for legacy archives without flags_json linkage
+    if (!isSub &&
+        rawBlobSha256 != null &&
+        rawBlobSha256.length >= 2 &&
+        (provider == 'dsh-local' ||
+            provider == 'opencode-local' ||
+            provider == 'zcode-local' ||
+            provider == 'codex-local' ||
+            provider == 'claude-code-local')) {
+      try {
+        final prefix = rawBlobSha256.substring(0, 2);
+        final blobFile = File(p.join(_archiveRoot, 'blobs', prefix, '$rawBlobSha256.json'));
+        if (blobFile.existsSync()) {
+          final raf = blobFile.openSync(mode: FileMode.read);
+          try {
+            final head = utf8.decode(raf.readSync(1536), allowMalformed: true);
+            final pSess = _jsonParentSessRe.firstMatch(head)?.group(1) ??
+                _jsonParentThreadRe.firstMatch(head)?.group(1);
+            if (pSess != null && pSess.isNotEmpty) {
+              parentExt = pSess;
+              isSub = true;
+            }
+            if (_jsonTaskTypeSubRe.hasMatch(head)) {
+              isSub = true;
+            }
+            subName ??= _jsonAgentPresetRe.firstMatch(head)?.group(1);
+            if (provider == 'claude-code-local' &&
+                (head.contains('subagents/') || head.contains('subagents\\\\') || head.contains('/agent-'))) {
+              isSub = true;
+            }
+          } finally {
+            raf.closeSync();
+          }
+        }
+      } catch (_) {}
+    }
+
+    final resolved = _SubagentMeta(
+      parentExternalId: parentExt,
+      isSubagent: isSub,
+      subagentName: subName,
+    );
+    _subagentBackfillCache[convId] = resolved;
+    return resolved;
   }
 
   Future<List<ConversationSummary>> getConversations({
@@ -234,13 +392,15 @@ class ArchiveDirectStore {
     bool shrunkOnly = false,
     String? searchFilter,
     SmSortBy sortBy = SmSortBy.updatedDesc,
-    int limit = 200,
+    int limit = 2000,
     int offset = 0,
   }) async {
-    final db = _openReadOnlyDb();
+    final trace = PerfLogger.instance.startTrace('get_conversations');
+    final db = _getReadDb();
     if (db != null) {
       try {
         final shrunkIds = _loadShrunkIdSet(db);
+        trace.markPhase('shrunk_cache');
         final where = <String>['c.deleted_at IS NULL'];
         final params = <Object?>[];
 
@@ -270,9 +430,9 @@ class ArchiveDirectStore {
 
         final sql = '''
           SELECT c.id, c.provider, c.external_id, c.title, c.summary, c.cwd,
-                 c.project_id, p.name AS project_name,
+                 c.default_model, c.project_id, p.name AS project_name,
                  c.item_count, c.char_count, c.blob_count, c.revision_count,
-                 c.starred, c.updated_at, c.head_hash, c.flags_json
+                 c.starred, c.updated_at, c.head_hash, c.raw_blob_sha256, c.flags_json
           FROM conversation c
           LEFT JOIN project p ON c.project_id = p.id
           WHERE ${where.join(' AND ')}
@@ -283,27 +443,44 @@ class ArchiveDirectStore {
         params.add(offset);
 
         final rows = db.select(sql, params);
-        final list = rows.map((r) {
+        trace.markPhase('sql_query');
+
+        final rawList = rows.map((r) {
           final id = r['id'] as int;
+          final prov = r['provider'] as String;
           final extId = r['external_id'] as String?;
+          final title = (r['title'] as String?) ?? 'Untitled';
           String? supersededBy;
+          Map<String, dynamic>? flagsMap;
           final flagsRaw = r['flags_json'] as String?;
           if (flagsRaw != null && flagsRaw.isNotEmpty) {
             try {
               final decoded = jsonDecode(flagsRaw);
               if (decoded is Map<String, dynamic>) {
+                flagsMap = decoded;
                 supersededBy = decoded['superseded_by']?.toString();
               }
             } catch (_) {}
           }
+          final subMeta = _resolveSubagentMeta(
+            convId: id,
+            provider: prov,
+            title: title,
+            flagsMap: flagsMap,
+            rawBlobSha256: r['raw_blob_sha256'] as String?,
+          );
           final isShrunk = shrunkIds.contains(id.toString()) || (extId != null && shrunkIds.contains(extId));
           return ConversationSummary(
             id: id,
-            provider: r['provider'] as String,
+            provider: prov,
             externalId: extId,
-            title: (r['title'] as String?) ?? 'Untitled',
+            parentExternalId: subMeta.parentExternalId,
+            isSubagent: subMeta.isSubagent,
+            subagentName: subMeta.subagentName,
+            title: title,
             summary: r['summary'] as String?,
             cwd: r['cwd'] as String?,
+            defaultModel: r['default_model'] as String?,
             projectId: r['project_id'] as int?,
             projectName: r['project_name'] as String?,
             itemCount: (r['item_count'] as int?) ?? 0,
@@ -318,77 +495,91 @@ class ArchiveDirectStore {
           );
         }).toList();
 
-        if (shrunkOnly) {
-          return list.where((c) => c.isShrunk).toList();
+        // Build parent -> children map using provider + externalId
+        final byProvExt = <String, int>{};
+        for (var i = 0; i < rawList.length; i++) {
+          final c = rawList[i];
+          if (c.externalId != null && c.externalId!.isNotEmpty) {
+            byProvExt['${c.provider}::${c.externalId}'] = i;
+          }
         }
-        return list;
-      } finally {
-        db.dispose();
+
+        final childrenByParentIdx = <int, List<ConversationSummary>>{};
+        final attachedChildIndices = <int>{};
+        for (var i = 0; i < rawList.length; i++) {
+          final c = rawList[i];
+          if (!c.isSubagent) continue;
+          int? parentIdx;
+          if (c.parentExternalId != null && c.parentExternalId!.isNotEmpty) {
+            parentIdx = byProvExt['${c.provider}::${c.parentExternalId}'];
+          }
+          // Fallback: if marked isSubagent without parentExternalId in DB, attach to
+          // nearest non-subagent session with same provider + cwd/project if unique/close.
+          if (parentIdx == null && c.cwd != null && c.cwd!.isNotEmpty) {
+            final cNormCwd = c.cwd!.toLowerCase();
+            int? bestIdx;
+            int bestDist = 1 << 60;
+            for (var j = 0; j < rawList.length; j++) {
+              if (i == j) continue;
+              final cand = rawList[j];
+              if (cand.isSubagent || cand.provider != c.provider) continue;
+              if ((cand.cwd ?? '').toLowerCase() != cNormCwd) continue;
+              final dist = ((cand.updatedAt ?? 0) - (c.updatedAt ?? 0)).abs();
+              if (dist < bestDist) {
+                bestDist = dist;
+                bestIdx = j;
+              }
+            }
+            // Only heuristic-attach within 6 hours in same cwd
+            if (bestIdx != null && bestDist <= 6 * 3600 * 1000) {
+              parentIdx = bestIdx;
+            }
+          }
+
+          if (parentIdx != null && parentIdx != i) {
+            final parent = rawList[parentIdx];
+            attachedChildIndices.add(i);
+            childrenByParentIdx.putIfAbsent(parentIdx, () => []).add(
+                  c.copyWith(parentConversationId: parent.id),
+                );
+          }
+        }
+
+        final hierarchical = <ConversationSummary>[];
+        for (var i = 0; i < rawList.length; i++) {
+          if (attachedChildIndices.contains(i)) continue;
+          final c = rawList[i];
+          final kids = childrenByParentIdx[i];
+          if (kids != null && kids.isNotEmpty) {
+            hierarchical.add(c.copyWith(subagents: kids));
+          } else {
+            hierarchical.add(c);
+          }
+        }
+
+        final result = shrunkOnly
+            ? hierarchical.where((c) => c.isShrunk).toList()
+            : hierarchical;
+        trace.markPhase('hierarchy_link');
+        trace.finish(extraMeta: {
+          'rows': rawList.length,
+          'top_level': result.length,
+          'attached_subagents': attachedChildIndices.length,
+        });
+        return result;
+      } catch (_) {
+        _closeReadDb();
+        trace.finish();
       }
+    } else {
+      trace.finish();
     }
 
-    // Demo fallback when archive.db is not yet present on disk
-    final now = DateTime.now().millisecondsSinceEpoch;
-    final demos = [
-      ConversationSummary(
-        id: 1,
-        provider: 'openai-web',
-        externalId: 'demo-conv-1',
-        title: 'Architecting local AI conversation archive',
-        summary: 'CQRS hybrid direct SQLite read-only + on-demand CLI runner',
-        cwd: 'C:/Projects/SessionManager',
-        itemCount: 5,
-        charCount: 1420,
-        blobCount: 1,
-        revisionCount: 2,
-        starred: true,
-        updatedAt: now - 3600000,
-        headHash: 'a7f3b8912c44e901',
-        isShrunk: true,
-      ),
-      ConversationSummary(
-        id: 2,
-        provider: 'codex-local',
-        externalId: 'demo-conv-2',
-        title: 'Codex rollout session refactoring',
-        summary: 'Analyzed thread_history_1.sqlite items and >32KB payload spilling',
-        cwd: 'C:/Projects/SessionManager',
-        itemCount: 38,
-        charCount: 18400,
-        blobCount: 3,
-        revisionCount: 1,
-        updatedAt: now - 7200000,
-        headHash: 'b829d11e90ac1204',
-      ),
-      ConversationSummary(
-        id: 3,
-        provider: 'dsh-local',
-        externalId: 'demo-conv-3',
-        title: 'Streaming chunk aggregation pipeline',
-        summary: 'Handling multi-frame zstd with fzstd decompressor',
-        itemCount: 8,
-        charCount: 4120,
-        updatedAt: now - 18000000,
-        headHash: 'c310a77f29b40091',
-      ),
-    ];
-
-    return demos.where((c) {
-      if (provider != null && provider.isNotEmpty && provider != 'all' && c.provider != provider) return false;
-      if (starredOnly && !c.starred) return false;
-      if (shrunkOnly && !c.isShrunk) return false;
-      if (searchFilter != null && searchFilter.trim().isNotEmpty) {
-        final q = searchFilter.trim().toLowerCase();
-        if (!c.title.toLowerCase().contains(q) && !(c.summary?.toLowerCase().contains(q) ?? false)) {
-          return false;
-        }
-      }
-      return true;
-    }).toList();
+    return const [];
   }
 
   Future<int?> resolveConversationId(String idOrExternalId) async {
-    final db = _openReadOnlyDb();
+    final db = _getReadDb();
     if (db != null) {
       try {
         final rows = db.select(
@@ -400,40 +591,139 @@ class ArchiveDirectStore {
           [idOrExternalId, idOrExternalId],
         );
         if (rows.isNotEmpty) return rows.first['id'] as int;
-      } finally {
-        db.dispose();
-      }
-      return null;
+      } catch (_) {}
     }
-    return int.tryParse(idOrExternalId) ?? 1;
+    return null;
   }
 
   Future<ConversationDetail?> getConversationDetail(int id) async {
-    final db = _openReadOnlyDb();
+    final trace = PerfLogger.instance.startTrace('open_conversation', targetId: '$id');
+    final db = _getReadDb();
     if (db != null) {
       try {
         final convRows = db.select(
           '''
-          SELECT id, provider, external_id, title, head_hash, default_model, cwd, revision_count, flags_json
+          SELECT id, provider, external_id, title, head_hash, default_model, cwd,
+                 starred, revision_count, raw_blob_sha256, flags_json
           FROM conversation
           WHERE id = ? AND deleted_at IS NULL
           LIMIT 1
           ''',
           [id],
         );
-        if (convRows.isEmpty) return null;
+        if (convRows.isEmpty) {
+          trace.finish(extraMeta: {'found': false});
+          return null;
+        }
         final conv = convRows.first;
+        final convProvider = conv['provider'] as String;
+        final convExtId = conv['external_id'] as String?;
+        final convTitle = (conv['title'] as String?) ?? 'Untitled';
 
         String? convSupersededBy;
+        Map<String, dynamic>? convFlagsMap;
         final convFlags = conv['flags_json'] as String?;
         if (convFlags != null && convFlags.isNotEmpty) {
           try {
             final decoded = jsonDecode(convFlags);
             if (decoded is Map<String, dynamic>) {
+              convFlagsMap = decoded;
               convSupersededBy = decoded['superseded_by']?.toString();
             }
           } catch (_) {}
         }
+
+        final subMeta = _resolveSubagentMeta(
+          convId: id,
+          provider: convProvider,
+          title: convTitle,
+          flagsMap: convFlagsMap,
+          rawBlobSha256: conv['raw_blob_sha256'] as String?,
+        );
+
+        int? parentConversationId;
+        if (subMeta.parentExternalId != null && subMeta.parentExternalId!.isNotEmpty) {
+          final pRows = db.select(
+            '''
+            SELECT id FROM conversation
+            WHERE deleted_at IS NULL AND provider = ? AND external_id = ?
+            LIMIT 1
+            ''',
+            [convProvider, subMeta.parentExternalId],
+          );
+          if (pRows.isNotEmpty) {
+            parentConversationId = pRows.first['id'] as int;
+          }
+        }
+
+        var tags = <String>[];
+        try {
+          final tagRows = db.select(
+            '''
+            SELECT t.name
+            FROM tag t
+            JOIN conversation_tag ct ON ct.tag_id = t.id
+            WHERE ct.conversation_id = ?
+            ORDER BY t.name ASC
+            ''',
+            [id],
+          );
+          tags = tagRows.map((r) => r['name'] as String).toList();
+        } catch (_) {
+          // Optional tag tables may be absent in minimal test or legacy schemas
+        }
+
+        // Find child subagents matching externalId directly via SQLite LIKE/json check
+        final childSubagents = <ConversationSummary>[];
+        if (convExtId != null && convExtId.isNotEmpty) {
+          final subRows = db.select(
+            '''
+            SELECT id, provider, external_id, title, summary, cwd, default_model,
+                   project_id, item_count, char_count, blob_count, revision_count,
+                   starred, updated_at, head_hash, flags_json
+            FROM conversation
+            WHERE deleted_at IS NULL AND provider = ? AND flags_json LIKE ?
+            ORDER BY COALESCE(updated_at, created_at, 0) ASC, id ASC
+            ''',
+            [convProvider, '%$convExtId%'],
+          );
+          for (final sr in subRows) {
+            final srId = sr['id'] as int;
+            if (srId == id) continue;
+            final sFlagsRaw = sr['flags_json'] as String?;
+            Map<String, dynamic>? sFlags;
+            if (sFlagsRaw != null && sFlagsRaw.isNotEmpty) {
+              try {
+                final d = jsonDecode(sFlagsRaw);
+                if (d is Map<String, dynamic>) sFlags = d;
+              } catch (_) {}
+            }
+            if (sFlags?['parent_external_id']?.toString() == convExtId) {
+              childSubagents.add(ConversationSummary(
+                id: srId,
+                provider: sr['provider'] as String,
+                externalId: sr['external_id'] as String?,
+                parentExternalId: convExtId,
+                parentConversationId: id,
+                isSubagent: true,
+                subagentName: sFlags?['subagent_name']?.toString(),
+                title: (sr['title'] as String?) ?? 'Subagent',
+                summary: sr['summary'] as String?,
+                cwd: sr['cwd'] as String?,
+                defaultModel: sr['default_model'] as String?,
+                projectId: sr['project_id'] as int?,
+                itemCount: (sr['item_count'] as int?) ?? 0,
+                charCount: (sr['char_count'] as int?) ?? 0,
+                blobCount: (sr['blob_count'] as int?) ?? 0,
+                revisionCount: (sr['revision_count'] as int?) ?? 1,
+                starred: ((sr['starred'] as int?) ?? 0) == 1,
+                updatedAt: sr['updated_at'] as int?,
+                headHash: sr['head_hash'] as String?,
+              ));
+            }
+          }
+        }
+        trace.markPhase('meta_tags_subagents');
 
         final revRows = db.select(
           '''
@@ -467,32 +757,20 @@ class ArchiveDirectStore {
           ''',
           [id],
         );
+        trace.markPhase('sql_items');
 
         final items = itemRows.map((r) {
-          final rawBlocks = r['blocks_json'] as String?;
-          List<ViewBlock> decodedBlocks = const [];
-          if (rawBlocks != null && rawBlocks.isNotEmpty) {
-            try {
-              final parsed = jsonDecode(rawBlocks);
-              if (parsed is List) {
-                var idx = 0;
-                decodedBlocks = parsed
-                    .whereType<Map<String, dynamic>>()
-                    .map((m) => ViewBlock.fromJson(m, fallbackIdx: idx++))
-                    .toList();
-              }
-            } catch (_) {}
-          }
-
           String? itemSupersededBy;
           final rawItemFlags = r['flags_json'] as String?;
           if (rawItemFlags != null && rawItemFlags.isNotEmpty) {
-            try {
-              final decoded = jsonDecode(rawItemFlags);
-              if (decoded is Map<String, dynamic>) {
-                itemSupersededBy = decoded['superseded_by']?.toString();
-              }
-            } catch (_) {}
+            if (rawItemFlags.contains('superseded_by')) {
+              try {
+                final decoded = jsonDecode(rawItemFlags);
+                if (decoded is Map<String, dynamic>) {
+                  itemSupersededBy = decoded['superseded_by']?.toString();
+                }
+              } catch (_) {}
+            }
           }
 
           return MessageItem(
@@ -505,7 +783,7 @@ class ArchiveDirectStore {
             model: r['model'] as String?,
             toolName: r['tool_name'] as String?,
             text: (r['text'] as String?) ?? '',
-            blocks: decodedBlocks,
+            rawBlocksJson: r['blocks_json'] as String?,
             payloadRef: r['payload_ref'] as String?,
             createdAt: r['created_at'] as int?,
             isActiveBranch: ((r['is_active_branch'] as int?) ?? 1) == 1,
@@ -515,145 +793,38 @@ class ArchiveDirectStore {
             supersededBy: itemSupersededBy,
           );
         }).toList();
+        trace.markPhase('row_mapping');
+        trace.finish(extraMeta: {'item_count': items.length});
 
         return ConversationDetail(
           id: conv['id'] as int,
-          provider: conv['provider'] as String,
-          externalId: conv['external_id'] as String?,
-          title: (conv['title'] as String?) ?? 'Untitled',
+          provider: convProvider,
+          externalId: convExtId,
+          parentExternalId: subMeta.parentExternalId,
+          parentConversationId: parentConversationId,
+          isSubagent: subMeta.isSubagent,
+          subagentName: subMeta.subagentName,
+          subagents: childSubagents,
+          title: convTitle,
           headHash: conv['head_hash'] as String?,
           defaultModel: conv['default_model'] as String?,
           cwd: conv['cwd'] as String?,
+          starred: ((conv['starred'] as int?) ?? 0) == 1,
+          tags: tags,
           revisionCount: (conv['revision_count'] as int?) ?? 1,
           supersededBy: convSupersededBy,
           revisions: revisions,
           items: items,
         );
-      } finally {
-        db.dispose();
+      } catch (_) {
+        _closeReadDb();
+        trace.finish();
       }
+    } else {
+      trace.finish();
     }
 
-    // Demo fallback with branch tree + synthetic run + rich blocks
-    final now = DateTime.now().millisecondsSinceEpoch;
-    return ConversationDetail(
-      id: id,
-      provider: 'openai-web',
-      externalId: 'demo-conv-$id',
-      title: 'Architecting local AI conversation archive',
-      headHash: 'a7f3b8912c44e901',
-      defaultModel: 'gpt-5',
-      cwd: 'C:/Projects/SessionManager',
-      revisionCount: 2,
-      revisions: [
-        ConversationRevisionInfo(
-          id: 2,
-          revisionNo: 2,
-          batchId: 2,
-          contentHash: 'a7f3b8912c44e901',
-          itemCount: 5,
-          charCount: 1420,
-          createdAt: now - 3600000,
-        ),
-        ConversationRevisionInfo(
-          id: 1,
-          revisionNo: 1,
-          batchId: 1,
-          contentHash: '91ab0023ff110022',
-          itemCount: 6,
-          charCount: 1680,
-          createdAt: now - 86400000,
-        ),
-      ],
-      items: [
-        const MessageItem(
-          id: 10,
-          parentId: null,
-          ordinal: 0,
-          depth: 0,
-          role: 'system',
-          kind: 'system_note',
-          text: '<turn_context cwd="C:/Projects/SessionManager" git_branch="main"/>',
-          isActiveBranch: true,
-          isSynthetic: true,
-        ),
-        const MessageItem(
-          id: 11,
-          parentId: 10,
-          ordinal: 1,
-          depth: 1,
-          role: 'user',
-          kind: 'message',
-          text: r'How should we architect SessionManager and compute $$H(m) = \text{sha256}(text)$$ without a resident daemon?',
-          isActiveBranch: true,
-          isSynthetic: false,
-        ),
-        const MessageItem(
-          id: 12,
-          parentId: 11,
-          ordinal: 2,
-          depth: 2,
-          role: 'assistant',
-          kind: 'message',
-          model: 'gpt-5',
-          text: 'We use CQRS Hybrid Direct-Connection: Dart sqlite3 FFI read-only queries + on-demand sm CLI.',
-          blocks: [
-            ViewBlock(
-              idx: 0,
-              type: 'thinking',
-              text: 'Comparing local HTTP server overhead vs WAL read-only direct SQLite access on Windows.',
-            ),
-            ViewBlock(
-              idx: 1,
-              type: 'text',
-              text: 'Adopt **CQRS Hybrid Direct-Connection**: read `archive.db` directly via `sqlite3.open(..., mode: OpenMode.readOnly)` and invoke `sm --json` only for writes.',
-            ),
-            ViewBlock(
-              idx: 2,
-              type: 'code',
-              lang: 'dart',
-              text: "final db = sqlite3.open(dbPath, mode: OpenMode.readOnly);\ndb.execute('PRAGMA busy_timeout = 3000;');",
-            ),
-          ],
-          isActiveBranch: true,
-          isSynthetic: false,
-        ),
-        const MessageItem(
-          id: 13,
-          parentId: 11,
-          ordinal: 3,
-          depth: 2,
-          role: 'assistant',
-          kind: 'message',
-          model: 'gpt-5',
-          text: '[Alternative regenerate branch]: Using a local daemon adds firewall prompts and token plumbing.',
-          isActiveBranch: false,
-          isSynthetic: false,
-          supersededBy: 'item:12',
-        ),
-        const MessageItem(
-          id: 14,
-          parentId: 12,
-          ordinal: 4,
-          depth: 3,
-          role: 'tool',
-          kind: 'tool_call',
-          toolName: 'exec_command',
-          text: 'npx vitest run',
-          blocks: [
-            ViewBlock(
-              idx: 0,
-              type: 'tool_use',
-              toolName: 'exec_command',
-              toolInput: '{"cmd":"npx vitest run"}',
-              status: 'ok',
-            ),
-          ],
-          isActiveBranch: true,
-          isSynthetic: false,
-        ),
-      ],
-    );
+    return null;
   }
 
   static final RegExp _cjkRunRe = RegExp(
@@ -697,7 +868,7 @@ class ArchiveDirectStore {
     final trimmed = q.trim();
     if (trimmed.isEmpty) return [];
 
-    final db = _openReadOnlyDb();
+    final db = _getReadDb();
     if (db != null) {
       try {
         final cjkTokens = _cjkRunRe.allMatches(trimmed).map((m) => m.group(0)!).toList();
@@ -877,27 +1048,14 @@ class ArchiveDirectStore {
 
         final sorted = hitsByKey.values.toList()..sort((a, b) => b.score.compareTo(a.score));
         return sorted.take(50).toList();
-      } finally {
-        db.dispose();
-      }
+      } catch (_) {}
     }
 
-    return const [
-      SearchHit(
-        itemId: 11,
-        conversationId: 1,
-        provider: 'openai-web',
-        title: 'Architecting local AI conversation archive',
-        role: 'user',
-        snippet: '...architect SessionManager and compute sha256 without a resident daemon...',
-        strategy: 'uni',
-        score: 1.42,
-      ),
-    ];
+    return const [];
   }
 
   Future<List<BatchReport>> getBatches() async {
-    final db = _openReadOnlyDb();
+    final db = _getReadDb();
     if (db != null) {
       try {
         final rows = db.select(
@@ -933,30 +1091,14 @@ class ArchiveDirectStore {
             shrunkConversationIds: rawShrunkIds.map((e) => e.toString()).toList(),
           );
         }).toList();
-      } finally {
-        db.dispose();
-      }
+      } catch (_) {}
     }
 
-    return [
-      BatchReport(
-        id: 1,
-        provider: 'openai-web',
-        kind: 'zip',
-        sourcePath: 'demo-export-2026-11.zip',
-        importedAt: DateTime.now().millisecondsSinceEpoch - 86400000,
-        status: 'completed',
-        addedConversations: 120,
-        grownConversations: 15,
-        shrunkConversations: 1,
-        identicalConversations: 430,
-        shrunkConversationIds: const ['demo-conv-1'],
-      ),
-    ];
+    return const [];
   }
 
   Future<List<DedupeCandidatePair>> getDedupeCandidates() async {
-    final db = _openReadOnlyDb();
+    final db = _getReadDb();
     if (db != null) {
       try {
         final rows = db.select(
@@ -1012,36 +1154,149 @@ class ArchiveDirectStore {
             bPreviewTurns: loadPreview(bId),
           );
         }).toList();
-      } finally {
-        db.dispose();
+      } catch (_) {}
+    }
+
+    return const [];
+  }
+
+  Future<List<String>> getConversationTags(int conversationId) async {
+    final db = _getReadDb();
+    if (db == null) return const [];
+    try {
+      final rows = db.select(
+        '''
+        SELECT t.name
+        FROM tag t
+        JOIN conversation_tag ct ON ct.tag_id = t.id
+        WHERE ct.conversation_id = ?
+        ORDER BY t.name ASC
+        ''',
+        [conversationId],
+      );
+      return rows.map((r) => r['name'] as String).toList();
+    } catch (_) {
+      return const [];
+    }
+  }
+
+  static int _dirSizeBytes(Directory dir) {
+    if (!dir.existsSync()) return 0;
+    var total = 0;
+    try {
+      for (final entity in dir.listSync(recursive: true, followLinks: false)) {
+        if (entity is File) {
+          try {
+            total += entity.lengthSync();
+          } catch (_) {}
+        }
+      }
+    } catch (_) {}
+    return total;
+  }
+
+  List<String> _sqliteSidecarPaths() => <String>[
+        _dbPath,
+        '$_dbPath-wal',
+        '$_dbPath-shm',
+        '$_dbPath-journal',
+      ];
+
+  List<String> _archiveCacheDirs() => <String>[
+        p.join(_archiveRoot, 'blobs'),
+        p.join(_archiveRoot, 'raw'),
+        p.join(_archiveRoot, 'reports'),
+      ];
+
+  Future<ArchiveDiskStats> inspectArchiveStats() async {
+    final dbExists = File(_dbPath).existsSync();
+    var dbBytes = 0;
+    for (final path in _sqliteSidecarPaths()) {
+      final f = File(path);
+      if (f.existsSync()) {
+        try {
+          dbBytes += f.lengthSync();
+        } catch (_) {}
+      }
+    }
+    var cacheBytes = 0;
+    for (final dirPath in _archiveCacheDirs()) {
+      cacheBytes += _dirSizeBytes(Directory(dirPath));
+    }
+
+    var conversationCount = 0;
+    var batchCount = 0;
+    final db = _getReadDb();
+    if (db != null) {
+      try {
+        conversationCount = (db
+                .select('SELECT COUNT(*) AS n FROM conversation WHERE deleted_at IS NULL')
+                .first['n'] as num)
+            .toInt();
+        batchCount = (db.select('SELECT COUNT(*) AS n FROM import_batch').first['n'] as num).toInt();
+      } catch (_) {
+        // DB might not be migrated yet or schema differs
       }
     }
 
-    return const [
-      DedupeCandidatePair(
-        id: 1,
-        aId: 1,
-        bId: 2,
-        similarity: 0.84,
-        reason: 'minhash_jaccard_0.84',
-        status: 'open',
-        aTitle: 'Architecting local AI conversation archive (March Export)',
-        aProvider: 'openai-web',
-        aHeadHash: 'a7f3b8912c44e901',
-        aItemCount: 14,
-        aPreviewTurns: [
-          'user: How do we prevent SQLite bloat on 3MB inline tool results?',
-          'assistant: Spill payloads > 32KB into content-addressed blobs/.',
-        ],
-        bTitle: 'Architecting local AI conversation archive (Nov Export)',
-        bProvider: 'openai-web',
-        bHeadHash: '91ab0023ff110022',
-        bItemCount: 16,
-        bPreviewTurns: [
-          'user: How do we prevent SQLite bloat on 3MB inline tool results?',
-          'assistant: Spill payloads > 32KB into blobs/ and keep payload_ref.',
-        ],
-      ),
-    ];
+    return ArchiveDiskStats(
+      dbPath: _dbPath,
+      archiveRoot: _archiveRoot,
+      dbExists: dbExists,
+      dbBytes: dbBytes,
+      cacheBytes: cacheBytes,
+      conversationCount: conversationCount,
+      batchCount: batchCount,
+    );
+  }
+
+  /// Deletes the current archive SQLite database (plus WAL/SHM/journal sidecars)
+  /// and optionally clears `blobs/`, `raw/`, and `reports/` in the same archive folder.
+  /// Preserves user-exported share images (`shares/`) and original local agent files.
+  Future<ArchiveResetResult> resetArchiveData({bool includeBlobsAndRaw = true}) async {
+    _closeReadDb();
+    _cachedShrunkIds = null;
+    _subagentBackfillCache.clear();
+    var deletedFiles = 0;
+    var deletedDirs = 0;
+    var freedBytes = 0;
+    final errors = <String>[];
+
+    for (final filePath in _sqliteSidecarPaths()) {
+      final f = File(filePath);
+      if (!f.existsSync()) continue;
+      try {
+        freedBytes += f.lengthSync();
+        f.deleteSync();
+        deletedFiles++;
+      } catch (e) {
+        errors.add('$filePath: $e');
+      }
+    }
+
+    if (includeBlobsAndRaw) {
+      for (final dirPath in _archiveCacheDirs()) {
+        final d = Directory(dirPath);
+        if (!d.existsSync()) continue;
+        try {
+          freedBytes += _dirSizeBytes(d);
+          d.deleteSync(recursive: true);
+          deletedDirs++;
+        } catch (e) {
+          errors.add('$dirPath: $e');
+        }
+      }
+    }
+
+    checkConnection();
+    dbPathNotifier.value = _dbPath;
+
+    return ArchiveResetResult(
+      ok: errors.isEmpty,
+      deletedFiles: deletedFiles,
+      deletedDirs: deletedDirs,
+      freedBytes: freedBytes,
+      errorMessage: errors.isEmpty ? null : errors.join('\n'),
+    );
   }
 }

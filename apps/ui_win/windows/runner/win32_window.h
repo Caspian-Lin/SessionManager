@@ -6,6 +6,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <vector>
 
 // A class abstraction for a high DPI-aware Win32 Window. Intended to be
 // inherited from by classes that wish to specialize with custom
@@ -39,6 +40,10 @@ class Win32Window {
   // Show the current window. Returns true if the window was successfully shown.
   bool Show();
 
+  // Centers the window on its monitor, shrinking it if the work area is
+  // smaller. Intended to be called once, right after |Create|.
+  void CenterOnWorkArea();
+
   // Release OS resources associated with window.
   void Destroy();
 
@@ -54,6 +59,48 @@ class Win32Window {
 
   // Return a RECT representing the bounds of the current client area.
   RECT GetClientArea();
+
+  // ---------------------------------------------------------------------------
+  // Custom title bar (frameless window) support
+  // ---------------------------------------------------------------------------
+
+  // Removes the OS caption (title bar + system buttons) while keeping the
+  // resize frame, Aero snap, Windows 11 snap layouts, rounded corners and the
+  // system menu. The client area then covers the whole window, so Flutter can
+  // paint a title bar of its own.
+  void SetFrameless(bool frameless);
+
+  // Registers the regions of the window (physical pixels, window coordinates)
+  // that behave like the OS caption: click-and-drag to move, double-click to
+  // maximize/restore, right-click for the system menu and edge snap. The
+  // regions must be re-sent whenever the layout or the display scale changes.
+  void SetCaptionDragAreas(std::vector<RECT> areas);
+
+  // Called whenever the maximize or the activation state changes so that the
+  // host can mirror it in the custom title bar.
+  void SetWindowStateCallback(
+      std::function<void(bool maximized, bool focused)> callback);
+
+  bool IsWindowMaximized() const;
+  bool IsWindowFocused() const;
+
+  void MinimizeWindow();
+  void ToggleMaximizeWindow();
+  void MaximizeWindow();
+  void RestoreWindow();
+  void CloseWindow();
+
+  // Hit-tests a point (as delivered in WM_NCHITTEST |lparam|, screen space)
+  // against the custom frame: resize grips, caption regions and content.
+  LRESULT HitTestFrame(LPARAM const lparam) const;
+
+  // Same as above, resolved from |window|. Needed by the Flutter view, which
+  // is a child window covering the whole client area: it must forward
+  // non-client hits to the frame through HTTRANSPARENT.
+  static LRESULT HitTestFrameForWindow(HWND const window, LPARAM const lparam);
+
+  // The window scale factor derived from the current DPI (96 DPI == 1.0).
+  double GetScaleFactor() const;
 
  protected:
   // Processes and route salient window messages for mouse handling,
@@ -90,7 +137,29 @@ class Win32Window {
   // Update the window frame's theme to match the system theme.
   static void UpdateTheme(HWND const window);
 
+  // Applies the Windows 11 rounded corner + border policy and re-evaluates the
+  // frame after the window style changed.
+  void ApplyFramelessFrameStyle();
+
+  // Pushes the current maximize/activation state to the registered callback
+  // when it changed since the last notification.
+  void NotifyWindowState();
+
+  LRESULT HandleNonClientCalcSize(WPARAM const wparam, LPARAM const lparam);
+  LRESULT HandleGetMinMaxInfo(LPARAM const lparam);
+
   bool quit_on_close_ = false;
+
+  // When true the window is rendered without the OS non-client area.
+  bool frameless_ = true;
+
+  // Regions that behave like the OS caption. Physical pixels, window space.
+  std::vector<RECT> caption_drag_areas_;
+
+  std::function<void(bool maximized, bool focused)> window_state_callback_;
+
+  bool last_maximized_ = false;
+  bool last_focused_ = true;
 
   // window handle for top level window.
   HWND window_handle_ = nullptr;

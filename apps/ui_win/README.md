@@ -1,6 +1,6 @@
 # `ui_win` · Session Manager Windows Reader
 
-`ui_win` is a lightweight, high-performance Flutter desktop reader application tailored for Windows (`flutter build windows`, producing `sm_ui_win.exe`). Built with **Flutter native Material 3 + Windows 11 platform-adapted desktop styling** (Win11 Fluent neutral palette, `Segoe UI Variable` / `Segoe UI` typography, `Cascadia Mono` code typography, compact desktop density, adaptive Light/Dark/System themes, and keyboard shortcuts), it provides instant browsing and branch inspection across archived AI dialogues.
+`ui_win` is a lightweight, high-performance Flutter desktop reader application tailored for Windows (`flutter build windows`, producing `sm_ui_win.exe`). Built with **Flutter native Material 3 + a Google-native desktop shell** (frameless custom title bar aligned with Google Workspace surfaces, Google Blue accents, `Segoe UI` / `Microsoft YaHei UI` typography, `Cascadia Mono` code typography, compact desktop density, adaptive Light/Dark/System themes, and keyboard shortcuts), it provides instant browsing and branch inspection across archived AI dialogues.
 
 ---
 
@@ -9,7 +9,7 @@
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
 │ Flutter Windows Desktop UI (sm_ui_win.exe)                             │
-│   · Mica / Acrylic frosted title bar and navigation rail               │
+│   · Custom frameless title bar (Win32 hit testing) + navigation rail    │
 │   · Virtualized Session List, Branch Tree Reader, Search & Integrity   │
 └───────────┬─────────────────────────────────────────┬──────────────────┘
             │ Read Path (Zero Daemon / Zero IPC)       │ Write / Heavy IO Path
@@ -30,8 +30,18 @@
    - `ArchiveDirectStore.resolveBlobFile(sha256, ext: ..., relPath: ...)` resolves local paths under `<archiveRoot>/blobs/<2-char>/<sha256><ext>` directly for Flutter `Image.file()` rendering without HTTP Range proxy overhead.
 3. **On-Demand CLI Runner (`SmCliRunner`)**:
    - Heavy write/compute pipelines (`sm import`, `sm verify`, `sm dedupe`, `sm reindex`, `sm export`) are invoked on demand as single-shot `Process.run(smExecutable, [..., '--json'])` subprocesses; upon exit, the read-only Flutter views immediately reload fresh WAL data.
-4. **Windows 11 Platform-Adapted Material 3 Styling**:
-   - Uses `WinAdaptiveTheme` (`useMaterial3: true`, `ThemeMode.system` with Light/Dark/System toggle), Win11 Fluent neutral palette (`#0067C0` light / `#60CDFF` dark accents), `Segoe UI Variable` / `Segoe UI` UI typography, `Cascadia Mono` / `Consolas` monospace code blocks, compact desktop density, desktop scrollbars, responsive wide-screen split layout (`>= 1100px`), and keyboard shortcuts (`Ctrl+F`, `Ctrl+O`, `Ctrl+R` / `F5`).
+4. **Google-native Material 3 shell (custom Win32 title bar)**:
+   - The window opens **frameless**: `WM_NCCALCSIZE` removes the OS caption, so the 56px app bar *is* the
+     title bar. Dragging, double-click maximize, Aero snap, edge resizing, the Alt+Space system menu and
+     Windows 11 rounded corners are still implemented by the OS (`WM_NCHITTEST` / `WM_GETMINMAXINFO` /
+     `DwmSetWindowAttribute`), while the minimize / maximize / close buttons are drawn in Flutter.
+   - One chrome tone (canvas + app bar + navigation rail) and one content tone (a top-rounded sheet), so the
+     transition between the app bar and the sidebar is a 16px arc instead of a 90° notch.
+   - One radius scale (`6 / 10 / 12 / 16 / pill`) and one type scale (`22 / 16 / 14 / 13 / 12 / 11.5 / 11`);
+     containers are flat fills with a ≤2% gradient and **no borders**. Google Blue (`#1A73E8`) accent,
+     `Segoe UI` / `Microsoft YaHei UI` UI typography, `Cascadia Mono` code typography, Light/Dark/System
+     themes, responsive wide split layout (`>= 1100px`), and keyboard shortcuts (`Ctrl+F`, `Ctrl+O`,
+     `Ctrl+R` / `F5`). See [`docs/ui/google-native-shell.md`](../../docs/ui/google-native-shell.md).
 
 ---
 
