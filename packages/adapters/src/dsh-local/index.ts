@@ -211,6 +211,7 @@ export class DshSessionDocument extends BaseSessionDocument<DshNativeSession> {
     let latestTime: number | null = this.init.created_at ?? null;
     const spills = this.nativeData.spills ?? {};
     const emittedToolCallIds = new Set<string>();
+    const toolNameByCallId = new Map<string, string>();
 
     const attachmentsByName = new Map<string, DshAttachmentRef>();
     for (const att of this.nativeData.attachments ?? []) {
@@ -221,39 +222,14 @@ export class DshSessionDocument extends BaseSessionDocument<DshNativeSession> {
 function isSyntheticDshUserMessage(sourceKind: string | null, text: string): boolean {
   if (sourceKind) {
     const sk = sourceKind.toLowerCase().trim();
-    if (
-      sk === 'user-approval' ||
-      sk === 'inbox' ||
-      sk === 'subagent' ||
-      sk === 'agent' ||
-      sk === 'inter-agent' ||
-      sk === 'inter_agent' ||
-      sk === 'delegation' ||
-      sk === 'system' ||
-      sk === 'system-time' ||
-      sk === 'time' ||
-      sk === 'timer' ||
-      sk === 'permission' ||
-      sk === 'permission-prompt' ||
-      sk === 'hook' ||
-      sk === 'cron' ||
-      sk === 'scheduler' ||
-      sk === 'notification' ||
-      sk === 'task-notification' ||
-      sk.startsWith('system') ||
-      sk.startsWith('subagent') ||
-      sk.startsWith('agent/') ||
-      sk.startsWith('permission') ||
-      sk.startsWith('timer') ||
-      sk.startsWith('hook')
-    ) {
+    if (sk.length > 0 && sk !== 'user' && sk !== 'human' && sk !== 'user-input' && sk !== 'user_input') {
       return true;
     }
   }
 
   const trimmed = text.trimStart();
   if (!trimmed) return false;
-  return /^(?:<(?:system-reminder|system_reminder|system-notification|system_notification|system-time|time_reminder|permission_hint|permission-hint|subagent_reply|subagent-reply|agent_reply|task-notification|inbox|local-command-[a-z-]+)\b|\[(?:system\b|system\s+time|current\s+time|time\s+hint|permission\b|user-approval|approval\b|inbox\b|subagent\b|agent\s+reply|inter-agent)|(?:system\s+time|current\s+time|permission\s+(?:hint|notice|prompt|mode)|subagent\s+(?:reply|response|report)|reply\s+from\s+(?:sub)?agent)\s*[:：]|(?:系统时间|当前时间|系统权限|权限提示|子代理回复|来自子代理)\s*[:：]?)/i.test(
+  return /^(?:<(?:goal_round|goal_complete|system-reminder|system_reminder|system-notification|system_notification|system-time|time_reminder|permission_hint|permission-hint|subagent_reply|subagent-reply|agent_reply|task-notification|inbox|environment_context|permissions instructions|collaboration_mode|skills_instructions|turn_aborted|subagent_notification|local-command-[a-z-]+)\b|\[(?:model\s+changed:|system\b|system\s+time|current\s+time|time\s+hint|permission\b|user-approval|approval\b|inbox\b|subagent\b|agent\s+reply|inter-agent)|(?:system\s+time|current\s+time|permission\s+(?:hint|notice|prompt|mode)|subagent\s+(?:reply|response|report)|reply\s+from\s+(?:sub)?agent|browser\s+time\s+zone\s+for\s+this\s+request|elapsed\s+since\s+the\s+preceding\s+step\s+context)\s*[:：]|time\s+sampled\s+while\b|background\s+job\s+\S+|(?:background\s+)?subagent\s+\S+\s+(?:finished|completed|failed|stopped|canceled|cancelled)\b|background\s+subagent\b|agent\s+\S+\s+sent\s+a\s+message:|current\s+runtime\s+context\.\s+this\s+snapshot\s+supersedes|this\s+is\s+an\s+automatically\s+generated\s+checkpoint\s+condensing|the\s+(?:user\s+changed\s+the\s+)?approval\s+policy\s+(?:changed|was\s+changed)\b|the\s+working\s+directory\s+changed\s+from\b|(?:系统时间|当前时间|系统权限|权限提示|子代理回复|来自子代理)\s*[:：]?)/i.test(
     trimmed
   );
 }
@@ -309,7 +285,9 @@ function isSyntheticDshUserMessage(sourceKind: string | null, text: string): boo
           }
         }
 
-        const sourceObj = dObj ? asObj(dObj['source']) : null;
+        const sourceObj =
+          (dObj ? asObj(dObj['source']) ?? asObj(asObj(dObj['message'])?.['source']) : null) ??
+          asObj((record as Record<string, unknown>)['source']);
         const sourceKind = typeof sourceObj?.['kind'] === 'string' ? sourceObj['kind'] : null;
         const isSynthetic = isSyntheticDshUserMessage(sourceKind, text);
         const spilled = pushSpillable(`user:${seq}`, text);
@@ -320,6 +298,7 @@ function isSyntheticDshUserMessage(sourceKind: string | null, text: string): boo
             type: 'text',
             text: spilled.text,
             blob_sha256: spilled.payload_ref,
+            ...(sourceKind ? { meta: { dsh_source_kind: sourceKind } } : {}),
           });
         }
 
@@ -436,6 +415,9 @@ function isSyntheticDshUserMessage(sourceKind: string | null, text: string): boo
             if (tc.id) emittedToolCallIds.add(tc.id);
             const tcId = `dsh-${seq}-tc-${tIdx}`;
             const toolName = tc.name ?? 'tool';
+            if (tc.id && toolName) {
+              toolNameByCallId.set(tc.id, toolName);
+            }
             const inputStr = tc.arguments ?? '';
             const tcSpill = pushSpillable(`asst-tc:${seq}:${tIdx}`, inputStr);
             const summary = `${toolName}${tcSpill.text ? ` ${tcSpill.text.slice(0, 120)}` : ''}`;
@@ -511,10 +493,13 @@ function isSyntheticDshUserMessage(sourceKind: string | null, text: string): boo
         prevId = id;
       } else if (evtType === 'tool/call') {
         const callId = dObj && typeof dObj['callId'] === 'string' ? dObj['callId'] : null;
+        const toolName = dObj && typeof dObj['name'] === 'string' ? dObj['name'] : null;
+        if (callId && toolName) {
+          toolNameByCallId.set(callId, toolName);
+        }
         if (callId && emittedToolCallIds.has(callId)) {
           continue;
         }
-        const toolName = dObj && typeof dObj['name'] === 'string' ? dObj['name'] : null;
         let inputStr = '';
         if (typeof data === 'string') {
           inputStr = data;
@@ -558,6 +543,7 @@ function isSyntheticDshUserMessage(sourceKind: string | null, text: string): boo
       } else if (evtType === 'tool/result') {
         let resText = '';
         let callId: string | null = null;
+        let resolvedToolName: string | null = null;
         if (typeof data === 'string') {
           resText = data;
         } else if (dObj) {
@@ -567,6 +553,12 @@ function isSyntheticDshUserMessage(sourceKind: string | null, text: string): boo
             (typeof dObj['toolCallId'] === 'string' ? dObj['toolCallId'] : null) ??
             (typeof msgObj?.['toolCallId'] === 'string' ? (msgObj['toolCallId'] as string) : null) ??
             (typeof srcObj?.['callId'] === 'string' ? (srcObj['callId'] as string) : null);
+          resolvedToolName =
+            (typeof dObj['toolName'] === 'string' ? dObj['toolName'] : null) ??
+            (typeof dObj['name'] === 'string' ? dObj['name'] : null) ??
+            (typeof dObj['tool'] === 'string' ? dObj['tool'] : null) ??
+            (typeof msgObj?.['toolName'] === 'string' ? (msgObj['toolName'] as string) : null) ??
+            (typeof srcObj?.['toolName'] === 'string' ? (srcObj['toolName'] as string) : null);
           if (msgObj && Array.isArray(msgObj['content'])) {
             resText = extractContentPartsText(msgObj['content'] as unknown[]).text;
           } else if (typeof dObj['output'] === 'string') {
@@ -576,6 +568,9 @@ function isSyntheticDshUserMessage(sourceKind: string | null, text: string): boo
           } else {
             resText = JSON.stringify(dObj);
           }
+        }
+        if (!resolvedToolName && callId) {
+          resolvedToolName = toolNameByCallId.get(callId) ?? null;
         }
         const trSpill = pushSpillable(`tres:${seq}`, resText);
         const id = `dsh-${seq}`;
@@ -595,6 +590,7 @@ function isSyntheticDshUserMessage(sourceKind: string | null, text: string): boo
             {
               idx: 0,
               type: 'tool_result',
+              tool_name: resolvedToolName,
               tool_call_id: callId,
               text: trSpill.text,
               blob_sha256: trSpill.payload_ref,

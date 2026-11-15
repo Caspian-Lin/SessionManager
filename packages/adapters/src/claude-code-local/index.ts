@@ -137,6 +137,7 @@ export class ClaudeCodeSessionDocument extends BaseSessionDocument<ClaudeCodeNat
     const turns: RawTurnProjection[] = [];
     let ordinal = 0;
     const createdAt = this.init.created_at ?? null;
+    const toolNameByCallId = new Map<string, string>();
 
     for (const record of this.nativeData.records) {
       const parsedTs = typeof record.timestamp === 'string' ? Date.parse(record.timestamp) : Number.NaN;
@@ -201,20 +202,30 @@ export class ClaudeCodeSessionDocument extends BaseSessionDocument<ClaudeCodeNat
             sawToolResult = true;
             kind = 'tool_result';
             const contentVal = cObj['content'];
+            const callId = typeof cObj['tool_use_id'] === 'string' ? cObj['tool_use_id'] : null;
+            const resolvedToolName =
+              (typeof cObj['name'] === 'string' ? cObj['name'] : null) ??
+              (callId ? toolNameByCallId.get(callId) ?? null : null);
             blocks.push({
               idx: bIdx++,
               type: 'tool_result',
-              tool_call_id: typeof cObj['tool_use_id'] === 'string' ? cObj['tool_use_id'] : null,
+              tool_name: resolvedToolName,
+              tool_call_id: callId,
               text: typeof contentVal === 'string' ? contentVal : JSON.stringify(contentVal ?? ''),
             });
           } else if (typeStr === 'tool_use') {
             sawNonToolContent = true;
             kind = 'tool_call';
+            const toolName = typeof cObj['name'] === 'string' ? cObj['name'] : null;
+            const callId = typeof cObj['id'] === 'string' ? cObj['id'] : null;
+            if (callId && toolName) {
+              toolNameByCallId.set(callId, toolName);
+            }
             blocks.push({
               idx: bIdx++,
               type: 'tool_use',
-              tool_name: typeof cObj['name'] === 'string' ? cObj['name'] : null,
-              tool_call_id: typeof cObj['id'] === 'string' ? cObj['id'] : null,
+              tool_name: toolName,
+              tool_call_id: callId,
               tool_input: cObj['input'] ? JSON.stringify(cObj['input']) : null,
             });
           } else if (typeStr === 'thinking') {

@@ -70,6 +70,7 @@ export interface DeepSeekNativeConversation {
   update_time?: number | string;
   model?: string;
   current_node?: string | null;
+  current_message_id?: string | number | null;
   mapping?: Record<string, DeepSeekMappingNode>;
   messages?: Record<string, unknown>[];
   chat_messages?: Record<string, unknown>[];
@@ -90,6 +91,7 @@ const KNOWN_CONV_KEYS = [
   'chat_messages',
   'mapping',
   'current_node',
+  'current_message_id',
   'model',
 ] as const;
 
@@ -153,23 +155,38 @@ function hasDeepSeekMarkersText(sample: string): { matched: boolean; confidence:
   return { matched: confidence > 0, confidence, reason };
 }
 
+function hasConversationContent(obj: Record<string, unknown>): boolean {
+  return (
+    Array.isArray(obj['messages']) ||
+    Array.isArray(obj['chat_messages']) ||
+    Array.isArray(obj['fragments']) ||
+    (Boolean(obj['mapping']) && typeof obj['mapping'] === 'object')
+  );
+}
+
 function extractConversationsList(parsed: unknown): DeepSeekNativeConversation[] {
   if (Array.isArray(parsed)) {
-    return parsed.filter((x): x is DeepSeekNativeConversation => Boolean(x && typeof x === 'object'));
+    return parsed.filter(
+      (x): x is DeepSeekNativeConversation =>
+        Boolean(x && typeof x === 'object' && hasConversationContent(x as Record<string, unknown>))
+    );
   }
   if (parsed && typeof parsed === 'object') {
     const obj = parsed as Record<string, unknown>;
     for (const key of ['conversations', 'chat_sessions', 'sessions', 'data']) {
       const candidate = obj[key];
       if (Array.isArray(candidate)) {
-        return candidate.filter((x): x is DeepSeekNativeConversation => Boolean(x && typeof x === 'object'));
+        return candidate.filter(
+          (x): x is DeepSeekNativeConversation =>
+            Boolean(x && typeof x === 'object' && hasConversationContent(x as Record<string, unknown>))
+        );
       }
       if (candidate && typeof candidate === 'object' && key === 'data') {
         const nested = extractConversationsList(candidate);
         if (nested.length > 0) return nested;
       }
     }
-    return [obj as DeepSeekNativeConversation];
+    return hasConversationContent(obj) ? [obj as DeepSeekNativeConversation] : [];
   }
   return [];
 }
@@ -306,6 +323,28 @@ export class DeepSeekSessionDocument extends BaseSessionDocument<DeepSeekNativeC
         ? this.nativeData.chat_messages
         : [];
 
+    const activeIds = new Set<string>();
+    const rawTip = this.nativeData.current_message_id ?? this.nativeData.current_node;
+    if (typeof rawTip === 'string' || typeof rawTip === 'number') {
+      const parentById = new Map<string, string | null>();
+      for (let i = 0; i < messages.length; i++) {
+        const msg = messages[i];
+        if (!msg || typeof msg !== 'object') continue;
+        const rawId = msg['id'] ?? msg['message_id'];
+        const msgId =
+          typeof rawId === 'string' || typeof rawId === 'number' ? String(rawId) : `dsk-msg-${i}`;
+        const rawParent = msg['parent_id'] ?? msg['parent_message_id'];
+        const parentId =
+          typeof rawParent === 'string' || typeof rawParent === 'number' ? String(rawParent) : null;
+        parentById.set(msgId, parentId);
+      }
+      let cursor: string | null = String(rawTip);
+      while (cursor && parentById.has(cursor) && !activeIds.has(cursor)) {
+        activeIds.add(cursor);
+        cursor = parentById.get(cursor) ?? null;
+      }
+    }
+
     const turns: RawTurnProjection[] = [];
     let prevId: string | null = null;
 
@@ -313,12 +352,11 @@ export class DeepSeekSessionDocument extends BaseSessionDocument<DeepSeekNativeC
       const msg = messages[i];
       if (!msg || typeof msg !== 'object') continue;
 
+      const rawId = msg['id'] ?? msg['message_id'];
       const msgId =
-        typeof msg['id'] === 'string'
-          ? msg['id']
-          : typeof msg['message_id'] === 'string'
-            ? msg['message_id']
-            : `dsk-msg-${i}`;
+        typeof rawId === 'string' || typeof rawId === 'number'
+          ? String(rawId)
+          : `dsk-msg-${i}`;
 
       const { blocks, inferredRole, inferredModel } = extractMessageBlocks(msg, contentKey);
       const rawRoleVal = msg[roleKey] ?? msg['role'] ?? msg['sender'];
@@ -332,12 +370,11 @@ export class DeepSeekSessionDocument extends BaseSessionDocument<DeepSeekNativeC
               ? 'user'
               : inferredRole ?? 'user';
 
+      const rawParent = msg['parent_id'] ?? msg['parent_message_id'];
       const explicitParent =
-        typeof msg['parent_id'] === 'string'
-          ? msg['parent_id']
-          : typeof msg['parent_message_id'] === 'string'
-            ? msg['parent_message_id']
-            : prevId;
+        typeof rawParent === 'string' || typeof rawParent === 'number'
+          ? String(rawParent)
+          : prevId;
 
       const projectedText = blocks.map((b) => b.text ?? '').filter(Boolean).join('\n');
 
@@ -351,7 +388,12 @@ export class DeepSeekSessionDocument extends BaseSessionDocument<DeepSeekNativeC
           parseFlexTimestamp(msg['create_time'] ?? msg['created_at'] ?? msg['inserted_at']) ?? createdAt,
         model: inferredModel,
         text: projectedText,
-        is_active_branch: typeof msg['is_active_branch'] === 'boolean' ? msg['is_active_branch'] : true,
+        is_active_branch:
+          typeof msg['is_active_branch'] === 'boolean'
+            ? msg['is_active_branch']
+            : activeIds.size > 0
+              ? activeIds.has(msgId)
+              : true,
         is_hidden: false,
         is_synthetic: false,
         blocks,
@@ -502,9 +544,14 @@ export class DeepSeekWebAdapter implements Adapter<DeepSeekNativeConversation> {
         let archive: ZipArchive | null = null;
         try {
           archive = ZipArchive.open(src.path);
+          const ignoredNames = new Set(['manifest.json', 'user.json', 'chat_session_index.json']);
           const jsonEntries = archive
             .listEntries()
-            .filter((e) => !e.isDirectory && e.name.toLowerCase().endsWith('.json'));
+            .filter((e) => {
+              if (e.isDirectory || !e.name.toLowerCase().endsWith('.json')) return false;
+              const entryBase = path.basename(e.name).toLowerCase();
+              return !ignoredNames.has(entryBase);
+            });
           for (const entryInfo of jsonEntries) {
             const sample = archive.readEntryText(entryInfo.name).slice(0, 32768);
             const check = hasDeepSeekMarkersText(sample);
@@ -606,7 +653,8 @@ export class DeepSeekWebAdapter implements Adapter<DeepSeekNativeConversation> {
 
     let parsed: unknown;
     try {
-      parsed = JSON.parse(rawContent);
+      const cleanRaw = rawContent.charCodeAt(0) === 0xfeff ? rawContent.slice(1) : rawContent;
+      parsed = JSON.parse(cleanRaw);
     } catch (err) {
       ctx.log('error', `JSON parse error in ${entry}: ${(err as Error).message}`);
       return [];
