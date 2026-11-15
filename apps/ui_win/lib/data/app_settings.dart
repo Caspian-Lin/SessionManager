@@ -135,6 +135,10 @@ class AppSettingsController extends ChangeNotifier {
   String _shareBrandText;
   ShareColorStyle _shareColorStyle;
   bool _perfLoggingEnabled;
+  double _sessionListWidth = 316.0;
+  final Set<String> _pinnedProjects = <String>{};
+  final Set<int> _pinnedSessions = <int>{};
+  final Set<String> _starredProjects = <String>{};
 
   AppSettingsController({
     String? settingsDir,
@@ -183,6 +187,50 @@ class AppSettingsController extends ChangeNotifier {
   String get shareBrandText => _shareBrandText;
   ShareColorStyle get shareColorStyle => _shareColorStyle;
   bool get perfLoggingEnabled => _perfLoggingEnabled;
+  double get sessionListWidth => _sessionListWidth;
+  Set<String> get pinnedProjects => Set.unmodifiable(_pinnedProjects);
+  Set<int> get pinnedSessions => Set.unmodifiable(_pinnedSessions);
+  Set<String> get starredProjects => Set.unmodifiable(_starredProjects);
+
+  bool isProjectPinned(String providerProjectKey) =>
+      _pinnedProjects.contains(providerProjectKey);
+
+  bool isSessionPinned(int sessionId) => _pinnedSessions.contains(sessionId);
+
+  bool isProjectStarred(String globalProjectKey) =>
+      _starredProjects.contains(globalProjectKey);
+
+  void togglePinProject(String providerProjectKey) {
+    if (!_pinnedProjects.add(providerProjectKey)) {
+      _pinnedProjects.remove(providerProjectKey);
+    }
+    notifyListeners();
+    _persist();
+  }
+
+  void togglePinSession(int sessionId) {
+    if (!_pinnedSessions.add(sessionId)) {
+      _pinnedSessions.remove(sessionId);
+    }
+    notifyListeners();
+    _persist();
+  }
+
+  void toggleStarProject(String globalProjectKey) {
+    if (!_starredProjects.add(globalProjectKey)) {
+      _starredProjects.remove(globalProjectKey);
+    }
+    notifyListeners();
+    _persist();
+  }
+
+  void setSessionListWidth(double width, {bool persist = true}) {
+    final clamped = width.clamp(220.0, 560.0);
+    if ((_sessionListWidth - clamped).abs() < 0.5) return;
+    _sessionListWidth = clamped;
+    notifyListeners();
+    if (persist) _persist();
+  }
 
   String get effectiveWatermarkText {
     final trimmed = _shareWatermarkText.trim();
@@ -326,6 +374,27 @@ class AppSettingsController extends ChangeNotifier {
         _perfLoggingEnabled = decoded['perf_logging_enabled'] as bool;
         PerfLogger.instance.enabled = _perfLoggingEnabled;
       }
+      if (decoded['session_list_width'] is num) {
+        _sessionListWidth =
+            (decoded['session_list_width'] as num).toDouble().clamp(220.0, 560.0);
+      }
+      if (decoded['pinned_projects'] is List) {
+        _pinnedProjects
+          ..clear()
+          ..addAll((decoded['pinned_projects'] as List).map((e) => e.toString()));
+      }
+      if (decoded['pinned_sessions'] is List) {
+        _pinnedSessions
+          ..clear()
+          ..addAll((decoded['pinned_sessions'] as List)
+              .map((e) => int.tryParse(e.toString()))
+              .whereType<int>());
+      }
+      if (decoded['starred_projects'] is List) {
+        _starredProjects
+          ..clear()
+          ..addAll((decoded['starred_projects'] as List).map((e) => e.toString()));
+      }
       notifyListeners();
     } catch (_) {
       // Ignore corrupt or inaccessible settings files
@@ -349,6 +418,10 @@ class AppSettingsController extends ChangeNotifier {
         'share_brand_text': _shareBrandText,
         'share_color_style': _shareColorStyle.name,
         'perf_logging_enabled': _perfLoggingEnabled,
+        'session_list_width': _sessionListWidth,
+        'pinned_projects': _pinnedProjects.toList(),
+        'pinned_sessions': _pinnedSessions.toList(),
+        'starred_projects': _starredProjects.toList(),
       };
       file.writeAsStringSync(const JsonEncoder.withIndent('  ').convert(payload));
     } catch (_) {

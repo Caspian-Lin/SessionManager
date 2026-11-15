@@ -317,4 +317,11 @@ class AppStrings {
   String get noDedupePairs => isZh ? '暂无待处理的疑似重复候选对' : 'No open dedupe candidate pairs.';
   String get batchLedgerTitle => isZh ? '导入批次台账' : 'Import Batch Ledger';
   String get openInReader => isZh ? '在阅读器中打开' : 'Open in Reader';
+
+  // Pinning, Project Starring & Message Timestamps
+  String get pinInProvider => isZh ? '在当前来源中置顶' : 'Pin in provider';
+  String get unpinInProvider => isZh ? '取消来源置顶' : 'Unpin in provider';
+  String get starProjectGlobal => isZh ? '全局星标项目' : 'Star project globally';
+  String get unstarProjectGlobal => isZh ? '取消项目星标' : 'Unstar project';
+  String get sentAtLabel => isZh ? '发送时间' : 'Sent at';
 }

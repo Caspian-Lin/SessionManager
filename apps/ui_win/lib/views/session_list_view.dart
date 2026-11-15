@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import 'package:path/path.dart' as p;
 
+import '../data/app_settings.dart';
 import '../data/archive_direct_store.dart';
 import '../data/sm_cli_runner.dart';
 import '../l10n/app_strings.dart';
@@ -12,6 +13,7 @@ import '../widgets/gm3_surface.dart';
 class SessionListView extends StatefulWidget {
   final ArchiveDirectStore store;
   final SmCliRunner? cliRunner;
+  final AppSettingsController? settings;
   final ValueNotifier<int> refreshTick;
   final int? selectedConversationId;
   final ValueChanged<int> onSelectSession;
@@ -22,6 +24,7 @@ class SessionListView extends StatefulWidget {
     super.key,
     required this.store,
     this.cliRunner,
+    this.settings,
     required this.refreshTick,
     this.selectedConversationId,
     required this.onSelectSession,
@@ -54,18 +57,24 @@ class _ProviderTreeRow extends _TreeRow {
 class _ProjectTreeRow extends _TreeRow {
   final String provider;
   final String projectKey;
+  final String globalProjectKey;
   final String projectLabel;
   final String? projectPath;
   final int sessionCount;
   final bool expanded;
+  final bool pinned;
+  final bool starred;
 
   const _ProjectTreeRow({
     required this.provider,
     required this.projectKey,
+    required this.globalProjectKey,
     required this.projectLabel,
     this.projectPath,
     required this.sessionCount,
     required this.expanded,
+    this.pinned = false,
+    this.starred = false,
   });
 }
 
@@ -109,24 +118,47 @@ class _SessionListViewState extends State<SessionListView> {
   void initState() {
     super.initState();
     widget.refreshTick.addListener(_loadSessions);
+    widget.settings?.addListener(_onSettingsChanged);
     _loadSessions();
+  }
+
+  @override
+  void didUpdateWidget(covariant SessionListView oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.settings != widget.settings) {
+      oldWidget.settings?.removeListener(_onSettingsChanged);
+      widget.settings?.addListener(_onSettingsChanged);
+    }
   }
 
   @override
   void dispose() {
     widget.refreshTick.removeListener(_loadSessions);
+    widget.settings?.removeListener(_onSettingsChanged);
     _searchCtrl.dispose();
     _scrollCtrl.dispose();
     super.dispose();
   }
 
+  void _onSettingsChanged() {
+    if (mounted) {
+      if (_starredOnly) {
+        _loadSessions();
+      } else {
+        setState(() {});
+      }
+    }
+  }
+
   Future<void> _loadSessions() async {
     setState(() => _loading = true);
+    final starredProjs = widget.settings?.starredProjects ?? const <String>{};
+    final needInMemoryStarFilter = _starredOnly && starredProjs.isNotEmpty;
     final results = await Future.wait([
       widget.store.getConversations(
         provider: _providerFilter == 'all' ? null : _providerFilter,
         projectId: _projectIdFilter,
-        starredOnly: _starredOnly,
+        starredOnly: _starredOnly && !needInMemoryStarFilter,
         shrunkOnly: _shrunkOnly,
         searchFilter: _searchCtrl.text,
         sortBy: _sortBy,
@@ -134,8 +166,17 @@ class _SessionListViewState extends State<SessionListView> {
       widget.store.getProjects(),
     ]);
     if (!mounted) return;
+    var loaded = results[0] as List<ConversationSummary>;
+    if (needInMemoryStarFilter) {
+      loaded = loaded.where((s) {
+        if (s.starred) return true;
+        final label = _projectLabelForRaw(s);
+        final gKey = _globalProjectKey(label, s.cwd);
+        return starredProjs.contains(gKey);
+      }).toList();
+    }
     setState(() {
-      _sessions = results[0] as List<ConversationSummary>;
+      _sessions = loaded;
       _projects = results[1] as List<ProjectInfo>;
       _loading = false;
     });
@@ -149,7 +190,7 @@ class _SessionListViewState extends State<SessionListView> {
     };
   }
 
-  static String _projectLabelFor(ConversationSummary session, AppStrings s) {
+  static String _projectLabelForRaw(ConversationSummary session) {
     if (session.projectName != null && session.projectName!.trim().isNotEmpty) {
       return session.projectName!.trim();
     }
@@ -160,10 +201,24 @@ class _SessionListViewState extends State<SessionListView> {
       if (base.isNotEmpty) return base;
       return normalized;
     }
-    return s.uncategorizedProject;
+    return '';
+  }
+
+  static String _globalProjectKey(String label, String? pathOrCwd) {
+    final raw = (pathOrCwd ?? '').trim();
+    if (raw.isNotEmpty) {
+      return raw.replaceAll('\\', '/').replaceAll(RegExp(r'/+$'), '').toLowerCase();
+    }
+    return 'name:${label.trim().toLowerCase()}';
+  }
+
+  static String _projectLabelFor(ConversationSummary session, AppStrings s) {
+    final raw = _projectLabelForRaw(session);
+    return raw.isNotEmpty ? raw : s.uncategorizedProject;
   }
 
   List<_TreeRow> _buildTreeRows(AppStrings s) {
+    final settings = widget.settings;
     final byProvider = <String, List<ConversationSummary>>{};
     for (final session in _sessions) {
       byProvider.putIfAbsent(session.provider, () => []).add(session);
@@ -178,6 +233,7 @@ class _SessionListViewState extends State<SessionListView> {
       final byProject = <String, List<ConversationSummary>>{};
       final projectLabels = <String, String>{};
       final projectPaths = <String, String?>{};
+      final globalKeys = <String, String>{};
 
       for (final sess in provSessions) {
         final label = _projectLabelFor(sess, s);
@@ -185,6 +241,7 @@ class _SessionListViewState extends State<SessionListView> {
         byProject.putIfAbsent(key, () => []).add(sess);
         projectLabels[key] = label;
         projectPaths[key] ??= sess.cwd;
+        globalKeys[key] ??= _globalProjectKey(label, sess.cwd);
       }
 
       final provExpanded = !_collapsedProviders.contains(prov);
@@ -196,17 +253,43 @@ class _SessionListViewState extends State<SessionListView> {
       ));
       if (!provExpanded) continue;
 
-      for (final entry in byProject.entries) {
+      final projectEntries = byProject.entries.toList()
+        ..sort((a, b) {
+          final aPin = settings?.isProjectPinned(a.key) == true ? 1 : 0;
+          final bPin = settings?.isProjectPinned(b.key) == true ? 1 : 0;
+          if (aPin != bPin) return bPin.compareTo(aPin);
+          final aStar =
+              settings?.isProjectStarred(globalKeys[a.key]!) == true ? 1 : 0;
+          final bStar =
+              settings?.isProjectStarred(globalKeys[b.key]!) == true ? 1 : 0;
+          if (aStar != bStar) return bStar.compareTo(aStar);
+          return 0;
+        });
+
+      for (final entry in projectEntries) {
         final pKey = entry.key;
-        final pSessions = entry.value;
+        final gKey = globalKeys[pKey]!;
+        final pSessions = List<ConversationSummary>.from(entry.value)
+          ..sort((a, b) {
+            final aPin = settings?.isSessionPinned(a.id) == true ? 1 : 0;
+            final bPin = settings?.isSessionPinned(b.id) == true ? 1 : 0;
+            if (aPin != bPin) return bPin.compareTo(aPin);
+            final aStar = a.starred ? 1 : 0;
+            final bStar = b.starred ? 1 : 0;
+            if (aStar != bStar) return bStar.compareTo(aStar);
+            return 0;
+          });
         final projExpanded = !_collapsedProjects.contains(pKey);
         rows.add(_ProjectTreeRow(
           provider: prov,
           projectKey: pKey,
+          globalProjectKey: gKey,
           projectLabel: projectLabels[pKey]!,
           projectPath: projectPaths[pKey],
           sessionCount: pSessions.length,
           expanded: projExpanded,
+          pinned: settings?.isProjectPinned(pKey) ?? false,
+          starred: settings?.isProjectStarred(gKey) ?? false,
         ));
         if (!projExpanded) continue;
 
@@ -494,6 +577,14 @@ class _SessionListViewState extends State<SessionListView> {
                                   }
                                 });
                               },
+                              onTogglePin: widget.settings == null
+                                  ? null
+                                  : () => widget.settings!
+                                      .togglePinProject(row.projectKey),
+                              onToggleStar: widget.settings == null
+                                  ? null
+                                  : () => widget.settings!
+                                      .toggleStarProject(row.globalProjectKey),
                             );
                           }
                           if (row is _SubagentLeafRow) {
@@ -512,6 +603,10 @@ class _SessionListViewState extends State<SessionListView> {
                             isSubagent: false,
                             isSelected:
                                 widget.selectedConversationId == session.id,
+                            isPinned: widget.settings?.isSessionPinned(session.id) ?? false,
+                            onTogglePin: widget.settings == null
+                                ? null
+                                : () => widget.settings!.togglePinSession(session.id),
                             subagentsExpanded: leaf.subagentsExpanded,
                             onToggleSubagents: session.subagents.isEmpty
                                 ? null
@@ -628,11 +723,16 @@ class _ProviderTreeHeader extends StatelessWidget {
                     padding:
                         const EdgeInsets.symmetric(horizontal: 7, vertical: 1),
                   ),
-                  const Spacer(),
-                  Text(
-                    '${s.projectCountBadge(row.projectCount)} · ${s.sessionsCount(row.sessionCount)}',
-                    style: theme.textTheme.labelSmall?.copyWith(
-                      color: cs.onSurfaceVariant,
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Text(
+                      '${s.projectCountBadge(row.projectCount)} · ${s.sessionsCount(row.sessionCount)}',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      textAlign: TextAlign.right,
+                      style: theme.textTheme.labelSmall?.copyWith(
+                        color: cs.onSurfaceVariant,
+                      ),
                     ),
                   ),
                 ],
@@ -648,27 +748,76 @@ class _ProviderTreeHeader extends StatelessWidget {
 class _ProjectTreeHeader extends StatelessWidget {
   final _ProjectTreeRow row;
   final VoidCallback onToggle;
+  final VoidCallback? onTogglePin;
+  final VoidCallback? onToggleStar;
 
   const _ProjectTreeHeader({
     required this.row,
     required this.onToggle,
+    this.onTogglePin,
+    this.onToggleStar,
   });
 
   @override
   Widget build(BuildContext context) {
+    final s = AppStringsScope.of(context);
     final theme = Theme.of(context);
     final cs = theme.colorScheme;
+    final surfaces = Gm3Surfaces.of(context);
+    final pathLabel = row.projectPath ?? row.projectLabel;
 
     return Tooltip(
-      message: row.projectPath ?? row.projectLabel,
-      waitDuration: const Duration(milliseconds: 350),
+      waitDuration: const Duration(seconds: 2),
+      decoration: BoxDecoration(
+        color: surfaces.card,
+        borderRadius: BorderRadius.circular(Gm3.radiusMd),
+        border: Border.all(color: surfaces.hairline.withOpacity(0.75)),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withOpacity(theme.brightness == Brightness.dark ? 0.35 : 0.10),
+            blurRadius: 12,
+            offset: const Offset(0, 4),
+          ),
+        ],
+      ),
+      richMessage: WidgetSpan(
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 320),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                row.projectLabel,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: theme.textTheme.labelLarge?.copyWith(
+                  fontWeight: FontWeight.w700,
+                  color: cs.onSurface,
+                ),
+              ),
+              if (pathLabel != row.projectLabel) ...[
+                const SizedBox(height: 2),
+                Text(
+                  pathLabel,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    color: cs.onSurfaceVariant,
+                  ),
+                ),
+              ],
+            ],
+          ),
+        ),
+      ),
       child: InkWell(
         borderRadius: BorderRadius.circular(6),
         onTap: onToggle,
         child: SizedBox(
-          height: 28,
+          height: 30,
           child: Padding(
-            padding: const EdgeInsets.only(left: 16, right: 8),
+            padding: const EdgeInsets.only(left: 16, right: 6),
             child: Row(
               children: <Widget>[
                 Icon(
@@ -690,13 +839,50 @@ class _ProjectTreeHeader extends StatelessWidget {
                     row.projectLabel,
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
-                    style: theme.textTheme.labelMedium?.copyWith(
+                    style: theme.textTheme.bodyMedium?.copyWith(
+                      fontSize: 13.5,
                       fontWeight: FontWeight.w600,
                       color: cs.onSurface,
                     ),
                   ),
                 ),
-                const SizedBox(width: 6),
+                if (onTogglePin != null)
+                  Tooltip(
+                    message: row.pinned ? s.unpinInProvider : s.pinInProvider,
+                    child: InkWell(
+                      borderRadius: BorderRadius.circular(10),
+                      onTap: onTogglePin,
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 3, vertical: 2),
+                        child: Icon(
+                          row.pinned ? Icons.push_pin_rounded : Icons.push_pin_outlined,
+                          size: 13,
+                          color: row.pinned
+                              ? cs.primary
+                              : cs.onSurfaceVariant.withOpacity(0.45),
+                        ),
+                      ),
+                    ),
+                  ),
+                if (onToggleStar != null)
+                  Tooltip(
+                    message: row.starred ? s.unstarProjectGlobal : s.starProjectGlobal,
+                    child: InkWell(
+                      borderRadius: BorderRadius.circular(10),
+                      onTap: onToggleStar,
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 3, vertical: 2),
+                        child: Icon(
+                          row.starred ? Icons.star_rounded : Icons.star_border_rounded,
+                          size: 14,
+                          color: row.starred
+                              ? const Color(0xFFF9AB00)
+                              : cs.onSurfaceVariant.withOpacity(0.45),
+                        ),
+                      ),
+                    ),
+                  ),
+                const SizedBox(width: 4),
                 Text(
                   '${row.sessionCount}',
                   style: theme.textTheme.labelSmall?.copyWith(
@@ -716,9 +902,11 @@ class _CompactSessionRow extends StatelessWidget {
   final ConversationSummary session;
   final bool isSubagent;
   final bool isSelected;
+  final bool isPinned;
   final bool subagentsExpanded;
   final VoidCallback? onToggleSubagents;
   final VoidCallback onTap;
+  final VoidCallback? onTogglePin;
   final VoidCallback? onToggleStar;
   final VoidCallback? onSoftDelete;
 
@@ -726,47 +914,74 @@ class _CompactSessionRow extends StatelessWidget {
     required this.session,
     required this.isSubagent,
     required this.isSelected,
+    this.isPinned = false,
     this.subagentsExpanded = false,
     this.onToggleSubagents,
     required this.onTap,
+    this.onTogglePin,
     this.onToggleStar,
     this.onSoftDelete,
   });
 
   InlineSpan _buildHoverTooltipSpan(BuildContext context, AppStrings s) {
+    final theme = Theme.of(context);
+    final cs = theme.colorScheme;
     final updatedStr = session.updatedAt != null
         ? DateFormat('yyyy-MM-dd HH:mm')
             .format(DateTime.fromMillisecondsSinceEpoch(session.updatedAt!))
         : '-';
     final summaryText = (session.summary ?? '').trim();
-    final clippedSummary = summaryText.length > 220
-        ? '${summaryText.substring(0, 220)}...'
-        : summaryText;
 
-    final children = <InlineSpan>[
-      TextSpan(
-        text: '${session.title}\n',
-        style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 12.5),
+    return WidgetSpan(
+      child: SizedBox(
+        width: 310,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              session.title,
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+              style: theme.textTheme.labelLarge?.copyWith(
+                fontWeight: FontWeight.w700,
+                fontSize: 13,
+                color: cs.onSurface,
+              ),
+            ),
+            if (summaryText.isNotEmpty) ...[
+              const SizedBox(height: 4),
+              Text(
+                summaryText,
+                maxLines: 3,
+                overflow: TextOverflow.ellipsis,
+                style: theme.textTheme.bodySmall?.copyWith(
+                  fontSize: 12,
+                  color: cs.onSurface.withOpacity(0.86),
+                ),
+              ),
+            ],
+            const SizedBox(height: 6),
+            Text(
+              '${session.provider}'
+              '${session.defaultModel != null ? ' · ${session.defaultModel}' : ''}'
+              '${session.cwd != null ? '\n${session.cwd}' : ''}'
+              '\n${s.itemsLabel(session.itemCount)} · ${session.charCount} chars'
+              '${session.revisionCount > 1 ? ' · Rev x${session.revisionCount}' : ''}'
+              '${session.subagents.isNotEmpty ? ' · ${s.subagentsBadge(session.subagents.length)}' : ''}'
+              '\nUpdated: $updatedStr',
+              maxLines: 5,
+              overflow: TextOverflow.ellipsis,
+              style: theme.textTheme.bodySmall?.copyWith(
+                fontSize: 11.5,
+                height: 1.4,
+                color: cs.onSurfaceVariant,
+              ),
+            ),
+          ],
+        ),
       ),
-    ];
-    if (clippedSummary.isNotEmpty) {
-      children.add(TextSpan(
-        text: '$clippedSummary\n',
-        style: const TextStyle(fontSize: 11.5),
-      ));
-    }
-    children.add(TextSpan(
-      text: '\n'
-          '${session.provider}'
-          '${session.defaultModel != null ? ' · ${session.defaultModel}' : ''}'
-          '${session.cwd != null ? '\n${session.cwd}' : ''}'
-          '\n${s.itemsLabel(session.itemCount)} · ${session.charCount} chars'
-          '${session.revisionCount > 1 ? ' · Rev x${session.revisionCount}' : ''}'
-          '${session.subagents.isNotEmpty ? ' · ${s.subagentsBadge(session.subagents.length)}' : ''}'
-          '\nUpdated: $updatedStr',
-      style: const TextStyle(fontSize: 11, color: Color(0xFFD0D7DE)),
-    ));
-    return TextSpan(children: children);
+    );
   }
 
   @override
@@ -774,6 +989,7 @@ class _CompactSessionRow extends StatelessWidget {
     final s = AppStringsScope.of(context);
     final theme = Theme.of(context);
     final cs = theme.colorScheme;
+    final surfaces = Gm3Surfaces.of(context);
     final shrunkColor =
         Gm3.adaptiveTint(const Color(0xFFB06000), theme.brightness);
     final subColor =
@@ -786,8 +1002,21 @@ class _CompactSessionRow extends StatelessWidget {
 
     return Tooltip(
       richMessage: _buildHoverTooltipSpan(context, s),
-      waitDuration: const Duration(milliseconds: 220),
+      waitDuration: const Duration(seconds: 2),
       preferBelow: false,
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: surfaces.card,
+        borderRadius: BorderRadius.circular(Gm3.radiusMd),
+        border: Border.all(color: surfaces.hairline.withOpacity(0.75)),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withOpacity(theme.brightness == Brightness.dark ? 0.35 : 0.10),
+            blurRadius: 12,
+            offset: const Offset(0, 4),
+          ),
+        ],
+      ),
       child: Padding(
         padding: EdgeInsets.only(left: isSubagent ? 42 : 26, right: 2, top: 1, bottom: 1),
         child: Material(
@@ -799,8 +1028,12 @@ class _CompactSessionRow extends StatelessWidget {
             borderRadius: BorderRadius.circular(6),
             onTap: onTap,
             child: SizedBox(
-              height: isSubagent ? 28 : 32,
-              child: Row(
+              height: isSubagent ? 30 : 34,
+              child: LayoutBuilder(
+                builder: (context, constraints) {
+                  final showExtraBadges = constraints.maxWidth >= 340;
+                  final showDate = constraints.maxWidth >= 310;
+                  return Row(
                 children: <Widget>[
                   Container(
                     width: 3,
@@ -830,23 +1063,38 @@ class _CompactSessionRow extends StatelessWidget {
                       ),
                       const SizedBox(width: 4),
                     ],
-                  ] else if (onToggleStar != null || session.starred)
-                    InkWell(
-                      borderRadius: BorderRadius.circular(10),
-                      onTap: onToggleStar,
-                      child: Padding(
-                        padding: const EdgeInsets.only(right: 5),
-                        child: Icon(
-                          session.starred
-                              ? Icons.star_rounded
-                              : Icons.star_border_rounded,
-                          size: 14,
-                          color: session.starred
-                              ? const Color(0xFFF9AB00)
-                              : cs.onSurfaceVariant.withOpacity(0.45),
+                  ] else ...<Widget>[
+                    if (isPinned)
+                      InkWell(
+                        borderRadius: BorderRadius.circular(10),
+                        onTap: onTogglePin,
+                        child: Padding(
+                          padding: const EdgeInsets.only(right: 4),
+                          child: Icon(
+                            Icons.push_pin_rounded,
+                            size: 13,
+                            color: cs.primary,
+                          ),
                         ),
                       ),
-                    ),
+                    if (onToggleStar != null || session.starred)
+                      InkWell(
+                        borderRadius: BorderRadius.circular(10),
+                        onTap: onToggleStar,
+                        child: Padding(
+                          padding: const EdgeInsets.only(right: 5),
+                          child: Icon(
+                            session.starred
+                                ? Icons.star_rounded
+                                : Icons.star_border_rounded,
+                            size: 14,
+                            color: session.starred
+                                ? const Color(0xFFF9AB00)
+                                : cs.onSurfaceVariant.withOpacity(0.45),
+                          ),
+                        ),
+                      ),
+                  ],
                   Expanded(
                     child: Text(
                       session.title,
@@ -854,7 +1102,7 @@ class _CompactSessionRow extends StatelessWidget {
                       softWrap: false,
                       overflow: TextOverflow.ellipsis,
                       style: theme.textTheme.bodyMedium?.copyWith(
-                        fontSize: isSubagent ? 12 : 12.5,
+                        fontSize: isSubagent ? 13 : 14,
                         fontWeight:
                             isSelected ? FontWeight.w600 : FontWeight.w400,
                         color: isSelected ? cs.onSecondaryContainer : cs.onSurface,
@@ -896,7 +1144,7 @@ class _CompactSessionRow extends StatelessWidget {
                       ),
                     ),
                   ],
-                  if (session.isShrunk) ...<Widget>[
+                  if (session.isShrunk && showExtraBadges) ...<Widget>[
                     const SizedBox(width: 4),
                     Gm3Pill(
                       label: s.shrunkBadge,
@@ -906,8 +1154,18 @@ class _CompactSessionRow extends StatelessWidget {
                       padding:
                           const EdgeInsets.symmetric(horizontal: 4, vertical: 0),
                     ),
+                  ] else if (session.isShrunk) ...<Widget>[
+                    const SizedBox(width: 4),
+                    Container(
+                      width: 6,
+                      height: 6,
+                      decoration: BoxDecoration(
+                        color: shrunkColor,
+                        shape: BoxShape.circle,
+                      ),
+                    ),
                   ],
-                  if (session.revisionCount > 1) ...<Widget>[
+                  if (session.revisionCount > 1 && showExtraBadges) ...<Widget>[
                     const SizedBox(width: 4),
                     Text(
                       'v${session.revisionCount}',
@@ -925,7 +1183,7 @@ class _CompactSessionRow extends StatelessWidget {
                       color: cs.onSurfaceVariant,
                     ),
                   ),
-                  if (updatedShort.isNotEmpty) ...<Widget>[
+                  if (updatedShort.isNotEmpty && showDate) ...<Widget>[
                     const SizedBox(width: 6),
                     Text(
                       updatedShort,
@@ -936,29 +1194,43 @@ class _CompactSessionRow extends StatelessWidget {
                     ),
                   ],
                   if (!isSubagent && onSoftDelete != null)
-                    PopupMenuButton<String>(
-                      padding: EdgeInsets.zero,
-                      iconSize: 14,
-                      icon: Icon(Icons.more_horiz,
-                          size: 14,
-                          color: cs.onSurfaceVariant.withOpacity(0.6)),
-                      onSelected: (v) {
-                        if (v == 'star') onToggleStar?.call();
-                        if (v == 'delete') onSoftDelete?.call();
-                      },
-                      itemBuilder: (_) => [
-                        PopupMenuItem(
-                          value: 'star',
-                          child: Text(
-                              session.starred ? s.unstarAction : s.starAction),
-                        ),
-                        PopupMenuItem(
-                          value: 'delete',
-                          child: Text(s.deleteAction),
-                        ),
-                      ],
+                    SizedBox(
+                      width: 24,
+                      height: 24,
+                      child: PopupMenuButton<String>(
+                        padding: EdgeInsets.zero,
+                        iconSize: 14,
+                        icon: Icon(Icons.more_horiz,
+                            size: 14,
+                            color: cs.onSurfaceVariant.withOpacity(0.6)),
+                        onSelected: (v) {
+                          if (v == 'pin') onTogglePin?.call();
+                          if (v == 'star') onToggleStar?.call();
+                          if (v == 'delete') onSoftDelete?.call();
+                        },
+                        itemBuilder: (_) => [
+                          if (onTogglePin != null)
+                            PopupMenuItem(
+                              value: 'pin',
+                              child: Text(isPinned
+                                  ? s.unpinInProvider
+                                  : s.pinInProvider),
+                            ),
+                          PopupMenuItem(
+                            value: 'star',
+                            child: Text(
+                                session.starred ? s.unstarAction : s.starAction),
+                          ),
+                          PopupMenuItem(
+                            value: 'delete',
+                            child: Text(s.deleteAction),
+                          ),
+                        ],
+                      ),
                     ),
                 ],
+                  );
+                },
               ),
             ),
           ),

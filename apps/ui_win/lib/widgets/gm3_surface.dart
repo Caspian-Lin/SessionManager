@@ -277,6 +277,7 @@ class Gm3SegmentedTrack extends StatelessWidget {
     return Container(
       height: height,
       padding: const EdgeInsets.all(2),
+      alignment: Alignment.center,
       decoration: BoxDecoration(
         color: surfaces.chipFill,
         borderRadius: BorderRadius.circular(Gm3.radiusPill),

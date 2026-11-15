@@ -264,7 +264,7 @@ List<ShareSegment> _splitMessageIfOversized(
 /// Splits [messages] into ordered slices whose rendered heights stay below GPU limits.
 List<ShareSlice> buildShareSlices(
   List<MessageItem> messages, {
-  double maxBodyHeight = 3200.0,
+  double maxBodyHeight = 6400.0,
 }) {
   final allSegments = <ShareSegment>[];
   for (final m in messages) {
@@ -348,12 +348,16 @@ class _ShareImageDialogState extends State<ShareImageDialog> {
   String? _errorMsg;
 
   List<MessageItem> get _assistantTurns => widget.activeItems
-      .where((m) =>
-          m.role == 'assistant' &&
-          !m.isHidden &&
-          !m.isSynthetic &&
-          (m.text.trim().isNotEmpty ||
-              m.blocks.any((b) => !_isToolLikeBlock(b))))
+      .where((m) {
+        if (m.id == widget.initialAssistantItemId) return true;
+        if (m.role != 'assistant' || m.isHidden || _isToolLikeItem(m)) {
+          return false;
+        }
+        if (m.blocks.isNotEmpty) {
+          return m.blocks.any((b) => !_isToolLikeBlock(b));
+        }
+        return m.text.trim().isNotEmpty;
+      })
       .toList();
 
   @override
@@ -901,6 +905,10 @@ if (\$dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Outp
                   ? _selectedAssistantId
                   : assistants.last.id,
               isExpanded: true,
+              menuMaxHeight: 320,
+              itemHeight: 48,
+              dropdownColor: surfaces.card,
+              borderRadius: BorderRadius.circular(Gm3.radiusMd),
               decoration: InputDecoration(
                 filled: true,
                 fillColor: surfaces.inset,
@@ -911,14 +919,30 @@ if (\$dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Outp
                   borderSide: BorderSide.none,
                 ),
               ),
+              selectedItemBuilder: (ctx) => [
+                for (var i = 0; i < assistants.length; i++)
+                  Align(
+                    alignment: Alignment.centerLeft,
+                    child: Text(
+                      'Reply #${i + 1}: ${_turnPreview(assistants[i])}',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: theme.textTheme.bodyMedium,
+                    ),
+                  ),
+              ],
               items: [
                 for (var i = 0; i < assistants.length; i++)
                   DropdownMenuItem(
                     value: assistants[i].id,
-                    child: Text(
-                      'Reply #${i + 1}: ${_turnPreview(assistants[i])}',
-                      overflow: TextOverflow.ellipsis,
-                      style: theme.textTheme.bodyMedium,
+                    child: ConstrainedBox(
+                      constraints: const BoxConstraints(maxWidth: 320),
+                      child: Text(
+                        'Reply #${i + 1}: ${_turnPreview(assistants[i])}',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: theme.textTheme.bodyMedium?.copyWith(fontSize: 13),
+                      ),
                     ),
                   ),
               ],

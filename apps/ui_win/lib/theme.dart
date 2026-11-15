@@ -314,6 +314,11 @@ class Gm3 {
       segmentedButtonTheme: SegmentedButtonThemeData(
         style: ButtonStyle(
           elevation: const WidgetStatePropertyAll(0),
+          tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+          visualDensity: VisualDensity.compact,
+          minimumSize: const WidgetStatePropertyAll(Size(0, 28)),
+          maximumSize: const WidgetStatePropertyAll(Size(double.infinity, 28)),
+          alignment: Alignment.center,
           backgroundColor: WidgetStateProperty.resolveWith((states) {
             if (states.contains(WidgetState.selected)) {
               return surfaces.chipSelected;
@@ -330,12 +335,13 @@ class Gm3 {
           // No `shape` override: SegmentedButton derives the per-position
           // corner radii itself, so the outer ends stay rounded.
           padding: const WidgetStatePropertyAll(
-            EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+            EdgeInsets.symmetric(horizontal: 10, vertical: 0),
           ),
           textStyle: WidgetStatePropertyAll(
             Gm3.text(
               fontSize: fontSizeLabelMedium,
               fontWeight: FontWeight.w600,
+              height: 1.0,
             ),
           ),
         ),

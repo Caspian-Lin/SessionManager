@@ -139,8 +139,6 @@ class _AppTitleBarState extends State<AppTitleBar> {
                       widget.trailingBadge!,
                       const SizedBox(width: 8),
                     ],
-                    _LocaleSwitch(notifier: widget.localeNotifier),
-                    const SizedBox(width: 4),
                     IconButton(
                       tooltip: strings.reloadTooltip,
                       onPressed: widget.onReload,
@@ -151,27 +149,6 @@ class _AppTitleBarState extends State<AppTitleBar> {
                         minimumSize: const Size(34, 34),
                         padding: EdgeInsets.zero,
                       ),
-                    ),
-                    ValueListenableBuilder<ThemeMode>(
-                      valueListenable: widget.themeModeNotifier,
-                      builder: (context, mode, _) {
-                        final icon = switch (mode) {
-                          ThemeMode.system => Icons.brightness_auto_outlined,
-                          ThemeMode.light => Icons.light_mode_outlined,
-                          ThemeMode.dark => Icons.dark_mode_outlined,
-                        };
-                        return IconButton(
-                          tooltip: strings.themeTooltip(mode),
-                          onPressed: widget.onCycleTheme,
-                          icon: Icon(icon, size: 19),
-                          visualDensity: VisualDensity.compact,
-                          style: IconButton.styleFrom(
-                            fixedSize: const Size(34, 34),
-                            minimumSize: const Size(34, 34),
-                            padding: EdgeInsets.zero,
-                          ),
-                        );
-                      },
                     ),
                     const SizedBox(width: 10),
                     // A 1px rule is the only acceptable separator between app
@@ -309,38 +286,6 @@ class _PathChip extends StatelessWidget {
           ],
         ),
       ),
-    );
-  }
-}
-
-class _LocaleSwitch extends StatelessWidget {
-  const _LocaleSwitch({required this.notifier});
-
-  final ValueNotifier<AppLocale> notifier;
-
-  @override
-  Widget build(BuildContext context) {
-    return ValueListenableBuilder<AppLocale>(
-      valueListenable: notifier,
-      builder: (context, locale, _) {
-        return Gm3SegmentedTrack(
-          child: SegmentedButton<AppLocale>(
-            showSelectedIcon: false,
-            segments: const <ButtonSegment<AppLocale>>[
-              ButtonSegment<AppLocale>(value: AppLocale.zh, label: Text('中文')),
-              ButtonSegment<AppLocale>(value: AppLocale.en, label: Text('EN')),
-            ],
-            selected: <AppLocale>{locale},
-            onSelectionChanged: (selection) => notifier.value = selection.first,
-            style: SegmentedButton.styleFrom(
-              visualDensity: VisualDensity.compact,
-              padding: const EdgeInsets.symmetric(horizontal: 10),
-              minimumSize: const Size(0, 28),
-              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-            ),
-          ),
-        );
-      },
     );
   }
 }

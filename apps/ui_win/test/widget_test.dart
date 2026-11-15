@@ -21,6 +21,7 @@ import 'package:ui_win/views/import_view.dart';
 import 'package:ui_win/views/integrity_view.dart';
 import 'package:ui_win/views/session_list_view.dart';
 import 'package:ui_win/views/settings_view.dart';
+import 'package:ui_win/widgets/markdown_prose.dart';
 import 'package:ui_win/widgets/share_image_sheet.dart';
 
 ffi.DynamicLibrary _openWindowsSqliteForTest() {
@@ -525,10 +526,16 @@ void main() {
     expect(find.text('归档会话'), findsOneWidget);
     expect(find.text('会话归档与分支测试'), findsOneWidget);
 
-    // Switch language to EN via top-bar SegmentedButton
-    await tester.tap(find.text('EN'));
+    // Switch language to EN via Settings view (titlebar switcher removed)
+    await tester.tap(find.text('设置'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('English'));
     await tester.pumpAndSettle();
     expect(find.text('SQLite WAL Direct'), findsOneWidget);
+    expect(find.text('Settings & Diagnostics'), findsOneWidget);
+
+    await tester.tap(find.text('Sessions'));
+    await tester.pumpAndSettle();
     expect(find.text('Archived Sessions'), findsOneWidget);
 
     // Navigate to Import Hub tab
@@ -1020,6 +1027,54 @@ void main() {
     expect(find.text('SessionManager ${AppSettingsController.appVersion}'), findsOneWidget);
     expect(find.text(AppSettingsController.githubUrl), findsOneWidget);
     expect(find.textContaining('open_conversation'), findsWidgets);
+  });
+
+  testWidgets('MarkdownProse renders GFM pipe tables and AppSettingsController persists pins & global project stars',
+      (WidgetTester tester) async {
+    final dir = Directory.systemTemp.createTempSync('sm_table_pin_');
+    final settings = AppSettingsController(settingsDir: dir.path);
+    addTearDown(() {
+      settings.dispose();
+      try {
+        dir.deleteSync(recursive: true);
+      } catch (_) {}
+    });
+
+    settings.togglePinProject('codex-local::1');
+    settings.togglePinSession(42);
+    settings.toggleStarProject('c:/lab/sessionmanager');
+    settings.setSessionListWidth(400);
+
+    final reloaded = AppSettingsController(settingsDir: dir.path);
+    addTearDown(reloaded.dispose);
+    expect(reloaded.isProjectPinned('codex-local::1'), isTrue);
+    expect(reloaded.isSessionPinned(42), isTrue);
+    expect(reloaded.isProjectStarred('c:/lab/sessionmanager'), isTrue);
+    expect(reloaded.sessionListWidth, 400.0);
+
+    await tester.pumpWidget(
+      AppStringsScope(
+        notifier: ValueNotifier<AppLocale>(AppLocale.en),
+        child: MaterialApp(
+          theme: GoogleMaterialTheme.light(),
+          home: const Scaffold(
+            body: Padding(
+              padding: EdgeInsets.all(16),
+              child: MarkdownProse(
+                text: 'Summary:\n\n| Name | Score |\n| :--- | ---: |\n| **Alpha** | `99` |\n',
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.byType(Table), findsOneWidget);
+    expect(find.text('Name'), findsOneWidget);
+    expect(find.text('Score'), findsOneWidget);
+    expect(find.textContaining('Alpha'), findsOneWidget);
+    expect(find.textContaining('99'), findsOneWidget);
   });
 }
 

@@ -311,6 +311,7 @@ class _MainShellState extends State<MainShell> {
                                   : SessionListView(
                                       store: _store,
                                       cliRunner: _cliRunner,
+                                      settings: widget.settings,
                                       refreshTick: _refreshTick,
                                       selectedConversationId:
                                           _selectedConversationId,
@@ -449,8 +450,8 @@ class _NavigationRailPane extends StatelessWidget {
   }
 }
 
-/// Session list + branch reader inside one sheet, split by a single hairline.
-class _WideSessionsPane extends StatelessWidget {
+/// Session list + branch reader inside one sheet, split by a draggable hairline.
+class _WideSessionsPane extends StatefulWidget {
   const _WideSessionsPane({
     required this.store,
     required this.cliRunner,
@@ -474,31 +475,81 @@ class _WideSessionsPane extends StatelessWidget {
   final VoidCallback onGoToImport;
 
   @override
+  State<_WideSessionsPane> createState() => _WideSessionsPaneState();
+}
+
+class _WideSessionsPaneState extends State<_WideSessionsPane> {
+  double? _dragWidth;
+  bool _hoveringSplitter = false;
+
+  @override
   Widget build(BuildContext context) {
+    final surfaces = Gm3Surfaces.of(context);
+    final cs = Theme.of(context).colorScheme;
+    final paneWidth = (_dragWidth ?? widget.settings.sessionListWidth)
+        .clamp(220.0, 560.0);
+
     return Row(
       children: <Widget>[
         SizedBox(
-          width: Gm3.listPaneWidth,
+          width: paneWidth,
           child: SessionListView(
-            store: store,
-            cliRunner: cliRunner,
-            refreshTick: refreshTick,
-            selectedConversationId: selectedConversationId,
-            onSelectSession: onSelectSession,
-            onDataChanged: onDataChanged,
-            onGoToImport: onGoToImport,
+            store: widget.store,
+            cliRunner: widget.cliRunner,
+            settings: widget.settings,
+            refreshTick: widget.refreshTick,
+            selectedConversationId: widget.selectedConversationId,
+            onSelectSession: widget.onSelectSession,
+            onDataChanged: widget.onDataChanged,
+            onGoToImport: widget.onGoToImport,
           ),
         ),
-        const Gm3Hairline(axis: Axis.vertical),
+        MouseRegion(
+          cursor: SystemMouseCursors.resizeColumn,
+          onEnter: (_) => setState(() => _hoveringSplitter = true),
+          onExit: (_) => setState(() => _hoveringSplitter = false),
+          child: GestureDetector(
+            behavior: HitTestBehavior.translucent,
+            onHorizontalDragStart: (_) {
+              setState(() => _dragWidth = widget.settings.sessionListWidth);
+            },
+            onHorizontalDragUpdate: (details) {
+              setState(() {
+                final cur = _dragWidth ?? widget.settings.sessionListWidth;
+                _dragWidth = (cur + details.delta.dx).clamp(220.0, 560.0);
+              });
+            },
+            onHorizontalDragEnd: (_) {
+              final finalW = _dragWidth;
+              if (finalW != null) {
+                widget.settings.setSessionListWidth(finalW);
+              }
+              setState(() => _dragWidth = null);
+            },
+            child: SizedBox(
+              width: 7,
+              child: Center(
+                child: AnimatedContainer(
+                  duration: const Duration(milliseconds: 120),
+                  width: _hoveringSplitter || _dragWidth != null ? 2.5 : 1,
+                  color: _hoveringSplitter || _dragWidth != null
+                      ? cs.primary.withOpacity(0.55)
+                      : surfaces.hairline.withOpacity(0.55),
+                ),
+              ),
+            ),
+          ),
+        ),
         Expanded(
           child: BranchTreeReaderView(
-            store: store,
-            cliRunner: cliRunner,
-            settings: settings,
-            refreshTick: refreshTick,
-            conversationId: isActiveTab ? selectedConversationId : null,
-            onSelectOtherSession: onSelectSession,
-            onDataChanged: onDataChanged,
+            store: widget.store,
+            cliRunner: widget.cliRunner,
+            settings: widget.settings,
+            refreshTick: widget.refreshTick,
+            conversationId:
+                widget.isActiveTab ? widget.selectedConversationId : null,
+            onSelectOtherSession: widget.onSelectSession,
+            onDataChanged: widget.onDataChanged,
           ),
         ),
       ],

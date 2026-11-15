@@ -131,11 +131,32 @@ class _ProseLines extends StatelessWidget {
   static final RegExp _orderedRe = RegExp(r'^(\s*)(\d+)\.\s+(.+)$');
   static final RegExp _bulletRe = RegExp(r'^(\s*)[-*•]\s+(.+)$');
   static final RegExp _quoteRe = RegExp(r'^>\s?(.*)$');
+  static final RegExp _tableSepRe =
+      RegExp(r'^\|?\s*:?-{2,}:?\s*(?:\|\s*:?-{2,}:?\s*)+\|?$|^\|?\s*:?-{2,}:?\s*\|?$');
+
+  static List<String> _splitTableRow(String line) {
+    var trimmed = line.trim();
+    if (trimmed.startsWith('|')) trimmed = trimmed.substring(1);
+    if (trimmed.endsWith('|')) {
+      trimmed = trimmed.substring(0, trimmed.length - 1);
+    }
+    return trimmed.split('|').map((c) => c.trim()).toList();
+  }
+
+  static TextAlign _parseColAlign(String sepCell) {
+    final t = sepCell.trim();
+    final left = t.startsWith(':');
+    final right = t.endsWith(':');
+    if (left && right) return TextAlign.center;
+    if (right) return TextAlign.right;
+    return TextAlign.left;
+  }
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final cs = theme.colorScheme;
+    final surfaces = Gm3Surfaces.of(context);
     final baseColor = textColor ?? cs.onSurface;
     final baseStyle = theme.textTheme.bodyLarge!.copyWith(
       fontSize: 15,
@@ -160,10 +181,109 @@ class _ProseLines extends StatelessWidget {
       );
     }
 
-    for (final rawLine in lines) {
-      final line = rawLine.trimRight();
+    for (var idx = 0; idx < lines.length; idx++) {
+      final line = lines[idx].trimRight();
       if (line.trim().isEmpty) {
         flushParagraph();
+        continue;
+      }
+
+      // GFM Pipe Table: header line with `|` + separator line (`|---|`) + data rows
+      if (line.contains('|') &&
+          idx + 1 < lines.length &&
+          _tableSepRe.hasMatch(lines[idx + 1].trim())) {
+        flushParagraph();
+        final headerCells = _splitTableRow(line);
+        final sepCells = _splitTableRow(lines[idx + 1].trim());
+        final colCount = headerCells.length > sepCells.length
+            ? headerCells.length
+            : sepCells.length;
+        final alignments = [
+          for (var c = 0; c < colCount; c++)
+            c < sepCells.length ? _parseColAlign(sepCells[c]) : TextAlign.left,
+        ];
+        final rows = <List<String>>[];
+        var nextIdx = idx + 2;
+        while (nextIdx < lines.length) {
+          final rowLine = lines[nextIdx].trim();
+          if (rowLine.isEmpty || !rowLine.contains('|')) break;
+          rows.add(_splitTableRow(rowLine));
+          nextIdx++;
+        }
+        idx = nextIdx - 1;
+
+        final borderColor = surfaces.hairline.withOpacity(0.65);
+        final tableStyle = baseStyle.copyWith(fontSize: 13.5, height: 1.48);
+
+        widgets.add(
+          Padding(
+            padding: const EdgeInsets.only(top: 4, bottom: 12),
+            child: SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              child: Container(
+                decoration: BoxDecoration(
+                  color: surfaces.card,
+                  borderRadius: BorderRadius.circular(Gm3.radiusSm),
+                  border: Border.all(color: borderColor),
+                ),
+                clipBehavior: Clip.antiAlias,
+                child: Table(
+                  defaultColumnWidth: const IntrinsicColumnWidth(),
+                  border: TableBorder(
+                    horizontalInside: BorderSide(color: borderColor, width: 0.8),
+                    verticalInside: BorderSide(color: borderColor, width: 0.8),
+                  ),
+                  children: [
+                    TableRow(
+                      decoration: BoxDecoration(color: surfaces.inset),
+                      children: [
+                        for (var c = 0; c < colCount; c++)
+                          Padding(
+                            padding: const EdgeInsets.symmetric(
+                                horizontal: 12, vertical: 8),
+                            child: Align(
+                              alignment: alignments[c] == TextAlign.right
+                                  ? Alignment.centerRight
+                                  : alignments[c] == TextAlign.center
+                                      ? Alignment.center
+                                      : Alignment.centerLeft,
+                              child: _buildRichText(
+                                context,
+                                c < headerCells.length ? headerCells[c] : '',
+                                tableStyle.copyWith(fontWeight: FontWeight.w700),
+                              ),
+                            ),
+                          ),
+                      ],
+                    ),
+                    for (final row in rows)
+                      TableRow(
+                        children: [
+                          for (var c = 0; c < colCount; c++)
+                            Padding(
+                              padding: const EdgeInsets.symmetric(
+                                  horizontal: 12, vertical: 7),
+                              child: Align(
+                                alignment: alignments[c] == TextAlign.right
+                                    ? Alignment.centerRight
+                                    : alignments[c] == TextAlign.center
+                                        ? Alignment.center
+                                        : Alignment.centerLeft,
+                                child: _buildRichText(
+                                  context,
+                                  c < row.length ? row[c] : '',
+                                  tableStyle,
+                                ),
+                              ),
+                            ),
+                        ],
+                      ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        );
         continue;
       }
 

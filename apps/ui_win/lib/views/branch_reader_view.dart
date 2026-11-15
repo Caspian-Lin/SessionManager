@@ -3,6 +3,7 @@ import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:intl/intl.dart';
 
 import '../data/app_settings.dart';
 import '../data/archive_direct_store.dart';
@@ -834,7 +835,7 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
                       ListView.builder(
                         controller: _scrollController,
                         padding: EdgeInsets.fromLTRB(
-                          turns.isNotEmpty ? 52 : 28,
+                          turns.length >= 3 ? 52 : 28,
                           22,
                           28,
                           36,
@@ -865,7 +866,7 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
                         },
                       ),
 
-                      if (turns.isNotEmpty)
+                      if (turns.length >= 3)
                         Positioned(
                           left: 10,
                           top: 24,
@@ -1468,6 +1469,43 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
     );
   }
 
+  Widget _wrapWithSentTimeTooltip(
+    BuildContext context,
+    MessageItem item,
+    Widget child,
+  ) {
+    final ts = item.createdAt;
+    if (ts == null || ts <= 0) return child;
+    final s = AppStringsScope.of(context);
+    final theme = Theme.of(context);
+    final cs = theme.colorScheme;
+    final surfaces = Gm3Surfaces.of(context);
+    final formatted = DateFormat('yyyy-MM-dd HH:mm:ss')
+        .format(DateTime.fromMillisecondsSinceEpoch(ts));
+
+    return Tooltip(
+      waitDuration: const Duration(seconds: 2),
+      preferBelow: false,
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+      decoration: BoxDecoration(
+        color: surfaces.card,
+        borderRadius: BorderRadius.circular(Gm3.radiusSm),
+        border: Border.all(color: surfaces.hairline.withOpacity(0.75)),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withOpacity(
+                theme.brightness == Brightness.dark ? 0.35 : 0.10),
+            blurRadius: 10,
+            offset: const Offset(0, 3),
+          ),
+        ],
+      ),
+      textStyle: theme.textTheme.labelMedium?.copyWith(color: cs.onSurface),
+      message: '${s.sentAtLabel}: $formatted',
+      child: child,
+    );
+  }
+
   Widget _buildMessageNode(
     BuildContext context,
     MessageItem item, {
@@ -1504,31 +1542,35 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
               alignment: Alignment.centerRight,
               child: ConstrainedBox(
                 constraints: const BoxConstraints(maxWidth: 580),
-                child: Container(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 18,
-                    vertical: 12,
-                  ),
-                  decoration: BoxDecoration(
-                    color: surfaces.chipFill,
-                    borderRadius: BorderRadius.circular(22),
-                  ),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      if (contentBlocks.isNotEmpty)
-                        for (final block in contentBlocks)
-                          _buildViewBlock(item, block)
-                      else
-                        MarkdownProse(text: item.text),
-                      if (attachmentBlocks.isNotEmpty) ...[
-                        const SizedBox(height: 8),
-                        AttachmentChipGroup(
-                          attachmentBlocks: attachmentBlocks,
-                          resolveBlobFile: widget.store.resolveBlobFile,
-                        ),
+                child: _wrapWithSentTimeTooltip(
+                  context,
+                  item,
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 18,
+                      vertical: 12,
+                    ),
+                    decoration: BoxDecoration(
+                      color: surfaces.chipFill,
+                      borderRadius: BorderRadius.circular(22),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        if (contentBlocks.isNotEmpty)
+                          for (final block in contentBlocks)
+                            _buildViewBlock(item, block)
+                        else
+                          MarkdownProse(text: item.text),
+                        if (attachmentBlocks.isNotEmpty) ...[
+                          const SizedBox(height: 8),
+                          AttachmentChipGroup(
+                            attachmentBlocks: attachmentBlocks,
+                            resolveBlobFile: widget.store.resolveBlobFile,
+                          ),
+                        ],
                       ],
-                    ],
+                    ),
                   ),
                 ),
               ),
@@ -1606,10 +1648,19 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
               ),
             ],
 
-            if (contentBlocks.isNotEmpty)
-              for (final block in contentBlocks) _buildViewBlock(item, block)
-            else
-              MarkdownProse(text: item.text),
+            _wrapWithSentTimeTooltip(
+              context,
+              item,
+              contentBlocks.isNotEmpty
+                  ? Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        for (final block in contentBlocks)
+                          _buildViewBlock(item, block),
+                      ],
+                    )
+                  : MarkdownProse(text: item.text),
+            ),
 
             if (ArchiveDirectStore.extractPayloadSha256(item.payloadRef) !=
                 null) ...[
@@ -1902,7 +1953,25 @@ class _CodexTurnJumpRail extends StatefulWidget {
 }
 
 class _CodexTurnJumpRailState extends State<_CodexTurnJumpRail> {
+  final GlobalKey _railKey = GlobalKey();
   int? _hoveredIndex;
+  double? _hoveredTickTop;
+
+  void _onHoverTick(BuildContext tickCtx, int turnIndex) {
+    double? topOffset;
+    final tickBox = tickCtx.findRenderObject() as RenderBox?;
+    final railBox = _railKey.currentContext?.findRenderObject() as RenderBox?;
+    if (tickBox != null &&
+        tickBox.hasSize &&
+        railBox != null &&
+        railBox.hasSize) {
+      topOffset = tickBox.localToGlobal(Offset.zero, ancestor: railBox).dy;
+    }
+    setState(() {
+      _hoveredIndex = turnIndex;
+      _hoveredTickTop = topOffset;
+    });
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -1920,73 +1989,86 @@ class _CodexTurnJumpRailState extends State<_CodexTurnJumpRail> {
         : null;
 
     return SizedBox(
+      key: _railKey,
       width: 28,
-      child: Stack(
-        clipBehavior: Clip.none,
-        children: [
-          Align(
-            alignment: Alignment.centerLeft,
-            child: ConstrainedBox(
-              constraints: const BoxConstraints(maxHeight: 460),
-              child: SingleChildScrollView(
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    for (final turn in widget.turns)
-                      MouseRegion(
-                        cursor: SystemMouseCursors.click,
-                        onEnter: (_) =>
-                            setState(() => _hoveredIndex = turn.turnIndex),
-                        onExit: (_) => setState(() {
-                          if (_hoveredIndex == turn.turnIndex) {
-                            _hoveredIndex = null;
-                          }
-                        }),
-                        child: GestureDetector(
-                          behavior: HitTestBehavior.opaque,
-                          onTap: () => widget.onSelectTurn(turn),
-                          child: Container(
-                            width: 28,
-                            height: tickHeight,
-                            alignment: Alignment.centerLeft,
-                            child: AnimatedContainer(
-                              duration: const Duration(milliseconds: 120),
-                              width: (_hoveredIndex == turn.turnIndex ||
-                                      widget.activeTurnIndex ==
-                                          turn.turnIndex)
-                                  ? 22
-                                  : (turn.isCompacted ? 14 : 10),
-                              height: (_hoveredIndex == turn.turnIndex ||
-                                      widget.activeTurnIndex ==
-                                          turn.turnIndex)
-                                  ? 2.5
-                                  : 2,
-                              decoration: BoxDecoration(
-                                color: (_hoveredIndex == turn.turnIndex ||
-                                        widget.activeTurnIndex ==
-                                            turn.turnIndex)
-                                    ? cs.primary
-                                    : cs.outline.withOpacity(0.55),
-                                borderRadius:
-                                    BorderRadius.circular(Gm3.radiusPill),
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final maxH = constraints.maxHeight.isFinite
+              ? constraints.maxHeight
+              : 460.0;
+          final rawTop = (_hoveredTickTop ?? 12.0) - 20.0;
+          final clampedTop =
+              rawTop.clamp(0.0, math.max(0.0, maxH - 148.0)).toDouble();
+
+          return Stack(
+            clipBehavior: Clip.none,
+            children: [
+              Align(
+                alignment: Alignment.centerLeft,
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxHeight: 460),
+                  child: SingleChildScrollView(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        for (final turn in widget.turns)
+                          Builder(
+                            builder: (tickCtx) => MouseRegion(
+                              cursor: SystemMouseCursors.click,
+                              onEnter: (_) =>
+                                  _onHoverTick(tickCtx, turn.turnIndex),
+                              onExit: (_) => setState(() {
+                                if (_hoveredIndex == turn.turnIndex) {
+                                  _hoveredIndex = null;
+                                  _hoveredTickTop = null;
+                                }
+                              }),
+                              child: GestureDetector(
+                                behavior: HitTestBehavior.opaque,
+                                onTap: () => widget.onSelectTurn(turn),
+                                child: Container(
+                                  width: 28,
+                                  height: tickHeight,
+                                  alignment: Alignment.centerLeft,
+                                  child: AnimatedContainer(
+                                    duration: const Duration(milliseconds: 120),
+                                    width: (_hoveredIndex == turn.turnIndex ||
+                                            widget.activeTurnIndex ==
+                                                turn.turnIndex)
+                                        ? 22
+                                        : (turn.isCompacted ? 14 : 10),
+                                    height: (_hoveredIndex == turn.turnIndex ||
+                                            widget.activeTurnIndex ==
+                                                turn.turnIndex)
+                                        ? 2.5
+                                        : 2,
+                                    decoration: BoxDecoration(
+                                      color: (_hoveredIndex == turn.turnIndex ||
+                                              widget.activeTurnIndex ==
+                                                  turn.turnIndex)
+                                          ? cs.primary
+                                          : cs.outline.withOpacity(0.55),
+                                      borderRadius: BorderRadius.circular(
+                                          Gm3.radiusPill),
+                                    ),
+                                  ),
+                                ),
                               ),
                             ),
                           ),
-                        ),
-                      ),
-                  ],
+                      ],
+                    ),
+                  ),
                 ),
               ),
-            ),
-          ),
 
-          if (hoveredTurn != null)
-            Positioned(
-              left: 34,
-              top: 12,
-              width: 296,
-              child: IgnorePointer(
+              if (hoveredTurn != null)
+                Positioned(
+                  left: 34,
+                  top: clampedTop,
+                  width: 296,
+                  child: IgnorePointer(
                 child: Material(
                   elevation: 6,
                   color: isDark ? const Color(0xFF282C34) : surfaces.card,
@@ -2054,7 +2136,9 @@ class _CodexTurnJumpRailState extends State<_CodexTurnJumpRail> {
                 ),
               ),
             ),
-        ],
+            ],
+          );
+        },
       ),
     );
   }
