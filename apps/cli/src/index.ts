@@ -59,6 +59,7 @@ const VERSION = '0.1.0';
 
 const BOOLEAN_FLAGS = new Set([
   'json',
+  'progress',
   'all-branches',
   'include-synthetic',
   'include-hidden',
@@ -80,6 +81,10 @@ const KIND_ALIASES: Record<string, ProviderId> = {
   'claude-code-local': 'claude-code-local',
   dsh: 'dsh-local',
   'dsh-local': 'dsh-local',
+  zcode: 'zcode-local',
+  'zcode-local': 'zcode-local',
+  opencode: 'opencode-local',
+  'opencode-local': 'opencode-local',
   json: 'generic-json',
   'generic-json': 'generic-json',
   md: 'generic-md',
@@ -190,6 +195,19 @@ export async function runCli(argv: readonly string[]): Promise<void> {
     case 'reindex':
       await runReindex(args);
       break;
+    case 'tag':
+      await runTag(args);
+      break;
+    case 'star':
+      await runStar(args);
+      break;
+    case 'rm':
+    case 'delete':
+      await runRemove(args);
+      break;
+    case 'vacuum':
+      await runVacuum(args);
+      break;
     default:
       throw new CliError(
         `Unknown subcommand "${args.subcommand}". Run "sm --help" for available commands.`
@@ -217,7 +235,7 @@ Commands:
   import <path>                Import conversation logs/export into archive database
                                Options: --kind auto|<provider>, --db <archive.db>, --json
   ls                           List archived conversations
-                               Options: --provider <id>, --limit <n>, --db <archive.db>, --json
+                               Options: --provider <id>, --project <name|id>, --tag <tag>, --starred, --deleted, --limit <n>, --db <archive.db>, --json
   show <id>                    Inspect conversation metadata, revisions, and item tree
                                Options: --all-branches, --include-synthetic, --json, --db <archive.db>
   search <query>               Full-text search conversations & item snippets (FTS5 + CJK router)
@@ -227,9 +245,13 @@ Commands:
   dedupe                       List exact duplicate clusters and similarity candidate pairs
                                Options: --db <archive.db>, --json
   export                       Export archive conversations to folder
-                               Options: --format native|md|jsonl, --out <dir>, --provider <id>, --db <archive.db>, --json
+                               Options: --format native|md|jsonl|provider-raw, --out <dir|zip>, --provider <id>, --zip, --fallback skip|native|jsonl, --db <archive.db>, --json
   reindex                      Rebuild FTS5 search indexes and recalculate conversation counts
                                Options: --db <archive.db>, --json
+  tag <id>                     Manage tags on a conversation (--add <tag> | --remove <tag>)
+  star <id>                    Toggle star status (--off to unstar)
+  rm <id>                      Soft-delete conversation (--restore to undo)
+  vacuum                       Hard-purge soft-deleted sessions & orphan blobs (--dry-run)
 
 Global Flags:
   -h, --help                   Display this help message
@@ -601,10 +623,22 @@ async function runImport(args: ParsedArgs): Promise<void> {
   const src = resolveSourceRef(targetPath);
   const { registry } = resolveKindRegistry(args.flags['kind']);
   const isJson = Boolean(args.flags['json']);
+  const emitProgress = Boolean(args.flags['progress']);
   const { service, dbPath } = openCliArchive(args.flags, registry);
 
   try {
-    const result: PipelineResult = await service.importSource(src, { registry });
+    const result: PipelineResult = await service.importSource(src, {
+      registry,
+      ...(emitProgress
+        ? {
+            onProgress: (ev) => {
+              if (isJson) {
+                console.log(JSON.stringify({ type: 'progress', ...ev }));
+              }
+            },
+          }
+        : {}),
+    });
     const batch = result.batchId != null ? service.repository.getBatch(result.batchId) : null;
     const stats = parseJsonObject(batch?.stats_json ?? null);
     const diff = result.report.diff;
@@ -621,27 +655,26 @@ async function runImport(args: ParsedArgs): Promise<void> {
     const totalBlobs = typeof stats['blobs'] === 'number' ? stats['blobs'] : 0;
 
     if (isJson) {
-      console.log(
-        JSON.stringify(
-          {
-            dbPath,
-            batchId: result.batchId ?? null,
-            provider: result.report.provider,
-            adapterId: result.adapterId,
-            adapterVersion: result.adapterVersion,
-            sourceSha256: result.sourceSha256,
-            skipped_identical_batch: Boolean(result.skipped_identical_batch),
-            conversations: result.sessions.length,
-            items: totalItems,
-            blobs: totalBlobs,
-            decisions: decisionCounts,
-            diff: diff ?? null,
-            issuesCount: result.report.issues.length,
-          },
-          null,
-          2
-        )
-      );
+      const payload = {
+        dbPath,
+        batchId: result.batchId ?? null,
+        provider: result.report.provider,
+        adapterId: result.adapterId,
+        adapterVersion: result.adapterVersion,
+        sourceSha256: result.sourceSha256,
+        skipped_identical_batch: Boolean(result.skipped_identical_batch),
+        conversations: result.sessions.length,
+        items: totalItems,
+        blobs: totalBlobs,
+        decisions: decisionCounts,
+        diff: diff ?? null,
+        issuesCount: result.report.issues.length,
+      };
+      if (emitProgress) {
+        console.log(JSON.stringify({ type: 'result', ...payload }));
+      } else {
+        console.log(JSON.stringify(payload, null, 2));
+      }
       return;
     }
 
@@ -697,13 +730,36 @@ async function runImport(args: ParsedArgs): Promise<void> {
 
 async function runList(args: ParsedArgs): Promise<void> {
   const provider = typeof args.flags['provider'] === 'string' ? args.flags['provider'] : undefined;
+  const projectArg = typeof args.flags['project'] === 'string' ? args.flags['project'] : undefined;
+  const tagArg = typeof args.flags['tag'] === 'string' ? args.flags['tag'] : undefined;
+  const starred = args.flags['starred'] === true ? true : undefined;
+  const onlyDeleted = Boolean(args.flags['deleted']);
   const limitParam = typeof args.flags['limit'] === 'string' ? args.flags['limit'] : undefined;
   const limit = Math.min(Math.max(parseInt(limitParam ?? '25', 10) || 25, 1), 500);
   const isJson = Boolean(args.flags['json']);
 
   const { service } = openCliArchive(args.flags);
   try {
-    const rows = service.listConversations({ provider, limit });
+    let projectId: number | undefined;
+    if (projectArg !== undefined) {
+      if (/^\d+$/.test(projectArg.trim())) {
+        projectId = parseInt(projectArg.trim(), 10);
+      } else {
+        const matchedProj = service
+          .listProjects()
+          .find((p) => p.name.toLowerCase() === projectArg.trim().toLowerCase());
+        projectId = matchedProj?.id ?? -1;
+      }
+    }
+
+    const rows = service.listConversations({
+      provider,
+      project_id: projectId,
+      tag: tagArg,
+      starred,
+      only_deleted: onlyDeleted,
+      limit,
+    });
 
     if (isJson) {
       console.log(JSON.stringify(rows, null, 2));
@@ -1277,16 +1333,46 @@ async function runDedupe(args: ParsedArgs): Promise<void> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function runExport(args: ParsedArgs): Promise<void> {
-  const format = (typeof args.flags['format'] === 'string' ? args.flags['format'] : 'native').toLowerCase();
+  const rawFormat = (typeof args.flags['format'] === 'string' ? args.flags['format'] : 'native').toLowerCase();
+  const format = rawFormat === 'source-raw' ? 'provider-raw' : rawFormat;
   const outDir = typeof args.flags['out'] === 'string' ? args.flags['out'] : undefined;
   const provider = typeof args.flags['provider'] === 'string' ? args.flags['provider'] : undefined;
+  const asZip = Boolean(args.flags['zip']);
+  const fallbackRaw = typeof args.flags['fallback'] === 'string' ? args.flags['fallback'].toLowerCase() : 'skip';
   const isJson = Boolean(args.flags['json']);
 
   if (!outDir) {
     throw new CliError('"sm export" requires --out <dir> parameter.');
   }
-  if (format !== 'native' && format !== 'md' && format !== 'jsonl') {
-    throw new CliError(`Unsupported export format "${format}". Expected: native, md, jsonl`);
+  if (format !== 'native' && format !== 'md' && format !== 'jsonl' && format !== 'provider-raw') {
+    throw new CliError(
+      `Unsupported export format "${format}". Expected: native, md, jsonl, provider-raw`
+    );
+  }
+  if (fallbackRaw !== 'skip' && fallbackRaw !== 'native' && fallbackRaw !== 'jsonl') {
+    throw new CliError(`Unsupported --fallback "${fallbackRaw}". Expected: skip, native, jsonl`);
+  }
+
+  if (format === 'provider-raw') {
+    const { service, dbPath } = openCliArchive(args.flags);
+    try {
+      const report = await service.exportProviderRaw(outDir, {
+        provider,
+        zip: asZip,
+        fallback: fallbackRaw as 'skip' | 'native' | 'jsonl',
+      });
+      if (isJson) {
+        console.log(JSON.stringify({ ...report, dbPath, format }, null, 2));
+      } else {
+        console.log(
+          `\n✔ Provider-raw export complete -> ${report.outPath} ` +
+            `(exported=${report.exported}, degraded=${report.degraded}, skipped=${report.skipped})`
+        );
+      }
+      return;
+    } finally {
+      service.close();
+    }
   }
 
   const resolvedOut = path.resolve(outDir);
@@ -1522,6 +1608,118 @@ async function runReindex(args: ParsedArgs): Promise<void> {
       );
     } else {
       console.log(`✔ Successfully reindexed ${convCount} conversation(s) and rebuilt FTS5 indexes.`);
+    }
+  } finally {
+    service.close();
+  }
+}
+
+async function runTag(args: ParsedArgs): Promise<void> {
+  const idArg = args.positional[0];
+  const isJson = Boolean(args.flags['json']);
+  const addTag = typeof args.flags['add'] === 'string' ? args.flags['add'] : undefined;
+  const removeTag = typeof args.flags['remove'] === 'string' ? args.flags['remove'] : undefined;
+
+  const { service } = openCliArchive(args.flags);
+  try {
+    if (!idArg) {
+      const allTags = service.listTags();
+      if (isJson) {
+        console.log(JSON.stringify({ ok: true, tags: allTags }, null, 2));
+      } else {
+        console.log(allTags.map((t) => `${t.name} (${t.conversation_count ?? 0})`).join('\n') || 'No tags.');
+      }
+      return;
+    }
+
+    const conv = resolveConversationByArg(service, idArg);
+    if (!conv) throw new CliError(`Conversation "${idArg}" not found.`);
+
+    if (addTag) service.addTag(conv.id, addTag);
+    if (removeTag) service.removeTag(conv.id, removeTag);
+    const currentTags = service.listTags(conv.id);
+
+    if (isJson) {
+      console.log(JSON.stringify({ ok: true, conversationId: conv.id, tags: currentTags }, null, 2));
+    } else {
+      console.log(
+        `Conversation #${conv.id} tags: ${currentTags.map((t) => t.name).join(', ') || '(none)'}`
+      );
+    }
+  } finally {
+    service.close();
+  }
+}
+
+async function runStar(args: ParsedArgs): Promise<void> {
+  const idArg = args.positional[0];
+  if (!idArg) throw new CliError('"sm star" requires a <id> argument.');
+  const starred = !Boolean(args.flags['off']);
+  const isJson = Boolean(args.flags['json']);
+
+  const { service } = openCliArchive(args.flags);
+  try {
+    const conv = resolveConversationByArg(service, idArg);
+    if (!conv) throw new CliError(`Conversation "${idArg}" not found.`);
+    service.setStarred(conv.id, starred);
+    if (isJson) {
+      console.log(JSON.stringify({ ok: true, conversationId: conv.id, starred }, null, 2));
+    } else {
+      console.log(`Conversation #${conv.id} ${starred ? 'starred' : 'unstarred'}.`);
+    }
+  } finally {
+    service.close();
+  }
+}
+
+async function runRemove(args: ParsedArgs): Promise<void> {
+  const idArg = args.positional[0];
+  if (!idArg) throw new CliError('"sm rm" requires a <id> argument.');
+  const restore = Boolean(args.flags['restore']);
+  const isJson = Boolean(args.flags['json']);
+
+  const { service } = openCliArchive(args.flags);
+  try {
+    const { repository } = service;
+    let conv: ConversationRow | null = null;
+    if (/^\d+$/.test(idArg.trim())) {
+      conv = repository.getConversationById(parseInt(idArg.trim(), 10), restore);
+    } else {
+      conv = resolveConversationByArg(service, idArg);
+    }
+    if (!conv) throw new CliError(`Conversation "${idArg}" not found.`);
+
+    const changed = restore
+      ? service.restoreConversation(conv.id)
+      : service.softDeleteConversation(conv.id);
+    if (isJson) {
+      console.log(
+        JSON.stringify({ ok: true, conversationId: conv.id, restored: restore, deleted: !restore, changed }, null, 2)
+      );
+    } else {
+      console.log(
+        `Conversation #${conv.id} ${restore ? 'restored' : 'soft-deleted'}.`
+      );
+    }
+  } finally {
+    service.close();
+  }
+}
+
+async function runVacuum(args: ParsedArgs): Promise<void> {
+  const dryRun = Boolean(args.flags['dry-run']);
+  const isJson = Boolean(args.flags['json']);
+  const { service } = openCliArchive(args.flags);
+  try {
+    const report = service.vacuum({ dryRun });
+    if (isJson) {
+      console.log(JSON.stringify({ ok: true, ...report }, null, 2));
+    } else {
+      console.log(
+        `${dryRun ? '[DRY RUN] ' : ''}Vacuum summary: ${report.deleted_conversations} conversation(s), ` +
+          `${report.purged_blobs} orphan blob(s) (${formatBytes(report.purged_blob_bytes)}), ` +
+          `${report.reclaimed_tags} unused tag(s).`
+      );
     }
   } finally {
     service.close();

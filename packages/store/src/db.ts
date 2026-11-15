@@ -41,6 +41,9 @@ export class ArchiveDatabase {
     db.exec('PRAGMA journal_mode = WAL;');
     db.exec('PRAGMA foreign_keys = ON;');
     db.exec('PRAGMA synchronous = NORMAL;');
+    db.exec('PRAGMA busy_timeout = 10000;');
+    db.exec('PRAGMA cache_size = -65536;');
+    db.exec('PRAGMA temp_store = MEMORY;');
 
     return new ArchiveDatabase(db, dbPath);
   }

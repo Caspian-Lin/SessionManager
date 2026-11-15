@@ -70,11 +70,17 @@ export function decideConversationMerge(
     return 'new';
   }
 
+  const hasDistinctExtIds = Boolean(
+    incoming.meta.external_id &&
+      existing.meta.external_id &&
+      incoming.meta.external_id !== existing.meta.external_id
+  );
+
   // If both are SessionDocument instances of the same provider, leverage polymorphic diffWith()
   if ('diffWith' in incomingInput && 'diffWith' in existingInput) {
     const diff = incomingInput.diffWith(existingInput);
     if (diff.status === 'identical') return 'identical';
-    if (diff.status === 'superset_append') return 'superset_append';
+    if (!hasDistinctExtIds && diff.status === 'superset_append') return 'superset_append';
     if (
       incoming.meta.external_id &&
       existing.meta.external_id &&
@@ -82,7 +88,7 @@ export function decideConversationMerge(
     ) {
       return 'branch_revision';
     }
-    if (diff.similarity >= 0.9) return 'auto_merge_fingerprint';
+    if (!hasDistinctExtIds && diff.similarity >= 0.9) return 'auto_merge_fingerprint';
     if (diff.similarity >= 0.75) return 'candidate_review';
     return 'new';
   }
@@ -92,16 +98,18 @@ export function decideConversationMerge(
     return 'identical';
   }
 
-  // L1: Superset append check
-  const existingHashes = existing.nodes.map((it) => it.content_hash);
-  const incomingHashes = incoming.nodes.map((it) => it.content_hash);
+  // L1: Superset append check (only when external_id matches or is absent on at least one side)
+  if (!hasDistinctExtIds) {
+    const existingHashes = existing.nodes.map((it) => it.content_hash);
+    const incomingHashes = incoming.nodes.map((it) => it.content_hash);
 
-  if (
-    existingHashes.length > 0 &&
-    incomingHashes.length > existingHashes.length &&
-    isSubsequence(existingHashes, incomingHashes)
-  ) {
-    return 'superset_append';
+    if (
+      existingHashes.length > 0 &&
+      incomingHashes.length > existingHashes.length &&
+      isSubsequence(existingHashes, incomingHashes)
+    ) {
+      return 'superset_append';
+    }
   }
 
   // L2: Same provider external ID with divergence
@@ -115,7 +123,7 @@ export function decideConversationMerge(
 
   // L3 & L4: MinHash Fingerprint similarity
   const sim = estimateConversationSimilarity(incoming, existing);
-  if (sim >= 0.9) {
+  if (!hasDistinctExtIds && sim >= 0.9) {
     return 'auto_merge_fingerprint';
   }
   if (sim >= 0.75) {

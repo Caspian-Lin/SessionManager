@@ -808,3 +808,292 @@ describe('@sm/core FTS5 dual-index search router & weighted BM25 ranking (Issue 
     }
   });
 });
+
+describe('@sm/core Issues #15, #21, #33, #34 (Incremental Sync, Governance, sm-native, provider-raw)', () => {
+  it('Issue #15: incremental watermark sync skips unchanged rollout files and advances Codex next_rollout_ordinal cursor', async () => {
+    const dir = makeTempDir('sm-incr-');
+    const codexDir = path.join(dir, 'codex-home');
+    const sessionsDir = path.join(codexDir, 'sessions', '2026', '06');
+    fs.mkdirSync(sessionsDir, { recursive: true });
+
+    const rolloutA = path.join(sessionsDir, 'rollout-a.jsonl');
+    const rolloutB = path.join(sessionsDir, 'rollout-b.jsonl');
+    const makeRec = (ordinal: number, type: string, payload: Record<string, unknown>) =>
+      JSON.stringify({
+        timestamp: new Date(1750000000000 + ordinal * 1000).toISOString(),
+        ordinal,
+        type,
+        payload,
+      });
+
+    fs.writeFileSync(
+      rolloutA,
+      [
+        makeRec(0, 'session_meta', { id: 'codex-incr-a', cwd: 'C:\\Lab\\proj-alpha' }),
+        makeRec(1, 'response_item', {
+          id: 'a-1',
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: 'Question A1' }],
+        }),
+      ].join('\n') + '\n',
+      'utf8'
+    );
+    fs.writeFileSync(
+      rolloutB,
+      [
+        makeRec(0, 'session_meta', { id: 'codex-incr-b', cwd: 'C:\\Lab\\proj-beta' }),
+        makeRec(1, 'response_item', {
+          id: 'b-1',
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: 'Question B1' }],
+        }),
+      ].join('\n') + '\n',
+      'utf8'
+    );
+
+    const dbPath = path.join(dir, 'archive', 'archive.db');
+    const service = ArchiveService.open(dbPath);
+    try {
+      const r1 = await service.importSource({ kind: 'dir', path: codexDir });
+      expect(r1.sessions).toHaveLength(2);
+      expect(r1.skipped_unchanged_files).toBe(0);
+      const cursorB1 = service.repository.getSyncCursor('codex-local', 'codex-incr-b');
+      expect(cursorB1?.next_rollout_ordinal).toBeGreaterThanOrEqual(1);
+
+      // Append a new message ONLY to rolloutB; rolloutA remains untouched
+      fs.appendFileSync(
+        rolloutB,
+        makeRec(2, 'response_item', {
+          id: 'b-2',
+          type: 'message',
+          role: 'assistant',
+          content: [{ type: 'output_text', text: 'Answer B2 appended' }],
+        }) + '\n',
+        'utf8'
+      );
+
+      const r2 = await service.importSource({ kind: 'dir', path: codexDir });
+      expect(r2.skipped_unchanged_files).toBe(1);
+      expect(r2.sessions).toHaveLength(1);
+      expect(r2.sessions[0]!.getMeta().external_id).toBe('codex-incr-b');
+      expect(r2.decisions[0]!.decision).toBe('superset_append');
+      expect(r2.report.diff?.disappeared_conversations).toBe(0);
+
+      const cursorB2 = service.repository.getSyncCursor('codex-local', 'codex-incr-b');
+      expect(cursorB2!.next_rollout_ordinal!).toBeGreaterThan(cursorB1!.next_rollout_ordinal!);
+    } finally {
+      service.close();
+    }
+  });
+
+  it('Issue #21: auto-classifies project from cwd (excluding System32), manages tags, stars, soft-delete and vacuum', async () => {
+    const dir = makeTempDir('sm-gov-');
+    const dbPath = path.join(dir, 'archive', 'archive.db');
+    const service = ArchiveService.open(dbPath);
+    try {
+      const projWorkspace = 'C:\\Projects\\SessionManagerApp';
+      const codexDir = path.join(dir, 'codex-gov');
+      fs.mkdirSync(path.join(codexDir, 'sessions'), { recursive: true });
+
+      fs.writeFileSync(
+        path.join(codexDir, 'sessions', 'rollout-1.jsonl'),
+        [
+          JSON.stringify({
+            timestamp: '2026-06-22T10:00:00.000Z',
+            ordinal: 0,
+            type: 'session_meta',
+            payload: { id: 'gov-proj-1', cwd: projWorkspace },
+          }),
+          JSON.stringify({
+            timestamp: '2026-06-22T10:00:01.000Z',
+            ordinal: 1,
+            type: 'response_item',
+            payload: { id: 'm1', type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Build MSIX' }] },
+          }),
+        ].join('\n') + '\n'
+      );
+      fs.writeFileSync(
+        path.join(codexDir, 'sessions', 'rollout-2.jsonl'),
+        [
+          JSON.stringify({
+            timestamp: '2026-06-22T10:05:00.000Z',
+            ordinal: 0,
+            type: 'session_meta',
+            payload: { id: 'gov-sys-2', cwd: 'C:\\Windows\\System32' },
+          }),
+          JSON.stringify({
+            timestamp: '2026-06-22T10:05:01.000Z',
+            ordinal: 1,
+            type: 'response_item',
+            payload: { id: 'm2', type: 'message', role: 'user', content: [{ type: 'input_text', text: 'System noise' }] },
+          }),
+        ].join('\n') + '\n'
+      );
+
+      await service.importSource({ kind: 'dir', path: codexDir });
+      const projects = service.listProjects();
+      expect(projects.some((p) => p.name === 'SessionManagerApp')).toBe(true);
+      expect(projects.some((p) => /system32/i.test(p.name))).toBe(false);
+
+      const convs = service.listConversations();
+      const projConv = convs.find((c) => c.external_id === 'gov-proj-1')!;
+      const sysConv = convs.find((c) => c.external_id === 'gov-sys-2')!;
+      expect(projConv.project_id).toBeTruthy();
+      expect(sysConv.project_id).toBeNull();
+
+      // Tag & Star
+      service.addTag(projConv.id, 'release');
+      service.setStarred(projConv.id, true);
+      expect(service.listConversations({ tag: 'release', starred: true })).toHaveLength(1);
+      service.removeTag(projConv.id, 'release');
+      expect(service.listConversations({ tag: 'release' })).toHaveLength(0);
+
+      // Soft-delete -> hidden from default ls -> vacuum purges record + native blob
+      expect(service.softDeleteConversation(sysConv.id)).toBe(true);
+      expect(service.listConversations()).toHaveLength(1);
+      expect(service.listConversations({ only_deleted: true })).toHaveLength(1);
+      const dryVac = service.vacuum({ dryRun: true });
+      expect(dryVac.deleted_conversations).toBe(1);
+      expect(dryVac.purged_blobs).toBeGreaterThanOrEqual(1);
+
+      const vac = service.vacuum();
+      expect(vac.deleted_conversations).toBe(1);
+      expect(service.listConversations({ include_deleted: true })).toHaveLength(1);
+    } finally {
+      service.close();
+    }
+  });
+
+  it('Issues #33 & #34: provider-raw round-trip export (openai-web + codex-local) preserves content_hash', async () => {
+    const dir = makeTempDir('sm-roundtrip-');
+    const openaiFile = path.join(dir, 'chatgpt-conversations.json');
+    fs.writeFileSync(
+      openaiFile,
+      JSON.stringify([
+        makeOpenAiConv('oa-rt-01', 'OpenAI Round-Trip', [
+          { id: 'u1', role: 'user', text: 'Hello ChatGPT' },
+          { id: 'a1', role: 'assistant', text: 'Hello user' },
+        ]),
+      ])
+    );
+
+    const codexRollout = path.join(dir, 'rollout-codex-rt.jsonl');
+    fs.writeFileSync(
+      codexRollout,
+      [
+        JSON.stringify({
+          timestamp: '2026-06-22T12:00:00.000Z',
+          ordinal: 0,
+          type: 'session_meta',
+          payload: { id: 'codex-rt-01', cwd: 'C:\\Lab\\rt' },
+        }),
+        JSON.stringify({
+          timestamp: '2026-06-22T12:00:05.000Z',
+          ordinal: 1,
+          type: 'response_item',
+          payload: {
+            id: 'c-u1',
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: 'Run Codex check' }],
+          },
+        }),
+      ].join('\n') + '\n'
+    );
+
+    const dbPath = path.join(dir, 'src-archive', 'archive.db');
+    const service1 = ArchiveService.open(dbPath);
+    try {
+      await service1.importSource({ kind: 'file', path: openaiFile });
+      await service1.importSource({ kind: 'file', path: codexRollout });
+      const origConvs = service1.listConversations();
+      expect(origConvs).toHaveLength(2);
+
+      const rawOutDir = path.join(dir, 'provider-raw-out');
+      const report = await service1.exportProviderRaw(rawOutDir, { fallback: 'native' });
+      expect(report.exported).toBe(2);
+      expect(report.skipped).toBe(0);
+      expect(fs.existsSync(path.join(rawOutDir, 'openai-web', 'conversations.json'))).toBe(true);
+      expect(fs.existsSync(path.join(rawOutDir, 'codex-local', 'sessions', 'rollout-codex-rt-01.jsonl'))).toBe(true);
+
+      // Re-import exported provider-raw directories into a brand-new archive and verify identical content_hash
+      const dbPath2 = path.join(dir, 'dst-archive', 'archive.db');
+      const service2 = ArchiveService.open(dbPath2);
+      try {
+        await service2.importSource({ kind: 'dir', path: path.join(rawOutDir, 'openai-web') });
+        await service2.importSource({ kind: 'dir', path: path.join(rawOutDir, 'codex-local') });
+        const reimported = service2.listConversations();
+        expect(reimported).toHaveLength(2);
+
+        const byExt1 = new Map(origConvs.map((c) => [c.external_id, c.content_hash]));
+        const byExt2 = new Map(reimported.map((c) => [c.external_id, c.content_hash]));
+        expect(byExt2.get('oa-rt-01')).toBe(byExt1.get('oa-rt-01'));
+        expect(byExt2.get('codex-rt-01')).toBe(byExt1.get('codex-rt-01'));
+      } finally {
+        service2.close();
+      }
+    } finally {
+      service1.close();
+    }
+  });
+
+  it('emits monotonic onProgress events (probe -> plan -> parse -> commit -> done) with concurrent parsing', async () => {
+    const dir = makeTempDir('sm-progress-');
+    const codexDir = path.join(dir, '.codex', 'sessions');
+    fs.mkdirSync(codexDir, { recursive: true });
+    for (let i = 0; i < 6; i++) {
+      fs.writeFileSync(
+        path.join(codexDir, `rollout-2026-06-${String(i + 1).padStart(2, '0')}T00-00-00-prog-${i}.jsonl`),
+        [
+          JSON.stringify({
+            timestamp: `2026-06-0${i + 1}T00:00:00.000Z`,
+            ordinal: 0,
+            type: 'session_meta',
+            payload: { id: `prog-sess-${i}`, cwd: 'C:\\Lab\\SessionManager' },
+          }),
+          JSON.stringify({
+            timestamp: `2026-06-0${i + 1}T00:00:01.000Z`,
+            ordinal: 1,
+            type: 'response_item',
+            payload: {
+              id: `u-${i}`,
+              type: 'message',
+              role: 'user',
+              content: [{ type: 'input_text', text: `Parallel progress prompt ${i}` }],
+            },
+          }),
+        ].join('\n') + '\n'
+      );
+    }
+
+    const dbPath = path.join(dir, 'archive', 'archive.db');
+    const service = ArchiveService.open(dbPath);
+    try {
+      const stages: string[] = [];
+      let lastDoneTotal = 0;
+      const res = await service.importSource(
+        { kind: 'dir', path: path.join(dir, '.codex') },
+        {
+          concurrency: 4,
+          onProgress: (ev) => {
+            stages.push(ev.stage);
+            if (ev.stage === 'done') {
+              lastDoneTotal = ev.total;
+              expect(ev.completed).toBe(ev.total);
+            }
+          },
+        }
+      );
+      expect(res.sessions).toHaveLength(6);
+      expect(stages[0]).toBe('probe');
+      expect(stages).toContain('plan');
+      expect(stages).toContain('commit');
+      expect(stages.at(-1)).toBe('done');
+      expect(lastDoneTotal).toBe(6);
+    } finally {
+      service.close();
+    }
+  });
+});

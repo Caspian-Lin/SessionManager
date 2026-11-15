@@ -26,21 +26,6 @@ importers:
       '@sm/core':
         specifier: workspace:*
         version: link:../../packages/core
-      '@sm/server':
-        specifier: workspace:*
-        version: link:../server
-      '@sm/shared':
-        specifier: workspace:*
-        version: link:../../packages/shared
-      '@sm/store':
-        specifier: workspace:*
-        version: link:../../packages/store
-
-  apps/server:
-    dependencies:
-      '@sm/core':
-        specifier: workspace:*
-        version: link:../../packages/core
       '@sm/shared':
         specifier: workspace:*
         version: link:../../packages/shared

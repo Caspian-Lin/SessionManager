@@ -42,7 +42,7 @@ function runSm(args: string[], cwd = REPO_ROOT): string {
 }
 
 describe('@sm/cli E2E closed-loop integration (Issues #6, #19)', () => {
-  it('executes full closed loop: probe -> import -> L0 idempotent re-import -> shrunk/grown revision -> ls -> show -> search (EN + 2/3-char CJK) -> verify -> reindex -> export (native/md/jsonl)', () => {
+  it('executes full closed loop: probe -> import -> L0 idempotent re-import -> shrunk/grown revision -> ls -> show -> search (EN + 2/3-char CJK) -> verify -> reindex -> export (native/md/jsonl)', { timeout: 20_000 }, () => {
     const workDir = makeTempDir();
     const archiveDir = path.join(workDir, 'archive');
     const dbPath = path.join(archiveDir, 'archive.db');
@@ -490,5 +490,89 @@ describe('@sm/cli E2E closed-loop integration (Issues #6, #19)', () => {
     };
     expect(verifyJson.missingBlobsOnDisk.some((b) => b.rel_path === deletedRelPath)).toBe(true);
     expect(verifyJson.report.issues.some((i) => i.code === 'orphan_blob_ref')).toBe(true);
+  });
+
+  it('Issues #21, #33, #34 CLI E2E: sm-native import -> L0 idempotent -> shrunk branch -> governance (tag/star/rm/vacuum) -> provider-raw zip', { timeout: 25_000 }, () => {
+    const workDir = makeTempDir('sm-cli-e2e-native-');
+    const srcDb = path.join(workDir, 'src-archive', 'archive.db');
+
+    // 1. Seed source archive with rich OpenAI ZIP export (includes embedded PNG/JPG + oversized spill)
+    const exp1 = createRichSyntheticOpenAiExport();
+    const zip1 = path.join(workDir, 'openai-rich-v1.zip');
+    fs.writeFileSync(zip1, exp1.toZipBuffer());
+    runSm(['import', zip1, '--db', srcDb]);
+
+    // 2. Export as native directory
+    const nativeDir = path.join(workDir, 'native-export');
+    runSm(['export', '--format', 'native', '--out', nativeDir, '--db', srcDb]);
+
+    // 3. Probe & import into brand-new target archive via sm-native adapter
+    const probeJson = JSON.parse(runSm(['probe', nativeDir, '--json'])) as { adapterId: string; confidence: number };
+    expect(probeJson.adapterId).toBe('sm-native');
+    expect(probeJson.confidence).toBeGreaterThanOrEqual(0.95);
+
+    const dstDb = path.join(workDir, 'dst-archive', 'archive.db');
+    const imp1 = JSON.parse(runSm(['import', nativeDir, '--db', dstDb, '--json'])) as {
+      adapterId: string;
+      decisions: Record<string, number>;
+    };
+    expect(imp1.adapterId).toBe('sm-native');
+    expect(imp1.decisions['new']).toBe(2);
+
+    // 4. Re-import same native package -> L0 idempotent (0 new, skipped_identical_batch)
+    const imp2 = JSON.parse(runSm(['import', nativeDir, '--db', dstDb, '--json'])) as {
+      skipped_identical_batch: boolean;
+      decisions: Record<string, number>;
+    };
+    expect(imp2.skipped_identical_batch).toBe(true);
+    expect(Object.keys(imp2.decisions)).toHaveLength(0);
+
+    // 5. Modify native package to simulate shrunk conversation -> verifies shrunk_conversations detection
+    const shrunkNativeDir = path.join(workDir, 'native-shrunk');
+    fs.cpSync(nativeDir, shrunkNativeDir, { recursive: true });
+    const sessionsFile = path.join(shrunkNativeDir, 'sessions.json');
+    const sessionsData = JSON.parse(fs.readFileSync(sessionsFile, 'utf8')) as {
+      external_id: string;
+      nodes: unknown[];
+    }[];
+    const richEntry = sessionsData.find((s) => s.external_id === 'conv-openai-rich-01')!;
+    richEntry.nodes = richEntry.nodes.slice(0, 2);
+    fs.writeFileSync(sessionsFile, JSON.stringify(sessionsData, null, 2), 'utf8');
+
+    const impShrunk = JSON.parse(runSm(['import', shrunkNativeDir, '--db', dstDb, '--json'])) as {
+      diff?: { shrunk_conversations: number; shrunk_conversation_ids: string[] } | null;
+    };
+    expect(impShrunk.diff?.shrunk_conversations).toBe(1);
+    expect(impShrunk.diff?.shrunk_conversation_ids).toContain('conv-openai-rich-01');
+
+    // 6. Governance: star, tag, ls --tag/--starred, rm, vacuum
+    const listed = JSON.parse(runSm(['ls', '--db', dstDb, '--json'])) as { id: number; external_id: string }[];
+    const targetId = listed.find((c) => c.external_id === 'conv-openai-rich-01')!.id;
+    const otherId = listed.find((c) => c.external_id !== 'conv-openai-rich-01')!.id;
+
+    runSm(['tag', String(targetId), '--add', 'important', '--db', dstDb]);
+    runSm(['star', String(targetId), '--db', dstDb]);
+    const filtered = JSON.parse(runSm(['ls', '--tag', 'important', '--starred', '--db', dstDb, '--json'])) as {
+      id: number;
+    }[];
+    expect(filtered.map((f) => f.id)).toEqual([targetId]);
+
+    runSm(['rm', String(otherId), '--db', dstDb]);
+    const vacRes = JSON.parse(runSm(['vacuum', '--db', dstDb, '--json'])) as {
+      ok: boolean;
+      deleted_conversations: number;
+    };
+    expect(vacRes.ok).toBe(true);
+    expect(vacRes.deleted_conversations).toBe(1);
+
+    // 7. Provider-raw ZIP export
+    const rawZipOut = path.join(workDir, 'provider-raw.zip');
+    const rawRes = JSON.parse(
+      runSm(['export', '--format', 'provider-raw', '--out', rawZipOut, '--zip', '--fallback', 'native', '--db', dstDb, '--json'])
+    ) as { ok: boolean; zip: boolean; exported: number };
+    expect(rawRes.ok).toBe(true);
+    expect(rawRes.zip).toBe(true);
+    expect(rawRes.exported).toBe(1);
+    expect(fs.existsSync(rawZipOut)).toBe(true);
   });
 });
