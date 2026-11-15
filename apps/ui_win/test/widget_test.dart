@@ -426,6 +426,12 @@ void main() {
     await tester.tap(toolBar);
     await tester.pumpAndSettle();
 
+    // Second-level collapse: tap the 1-line tool call item to expand its body & blob button
+    final toolStepRow = find.textContaining('tool_call');
+    await tester.ensureVisible(toolStepRow.first);
+    await tester.tap(toolStepRow.first);
+    await tester.pumpAndSettle();
+
     final loadBlobBtn = find.textContaining('Load full payload from blob');
     expect(loadBlobBtn, findsOneWidget);
     await tester.ensureVisible(loadBlobBtn);
@@ -522,7 +528,7 @@ void main() {
     await tester.pumpAndSettle();
 
     // Default Chinese UI
-    expect(find.text('SQLite WAL 直连'), findsOneWidget);
+    expect(find.text('SQLite WAL 直连'), findsNothing);
     expect(find.text('归档会话'), findsOneWidget);
     expect(find.text('会话归档与分支测试'), findsOneWidget);
 
@@ -531,7 +537,7 @@ void main() {
     await tester.pumpAndSettle();
     await tester.tap(find.text('English'));
     await tester.pumpAndSettle();
-    expect(find.text('SQLite WAL Direct'), findsOneWidget);
+    expect(find.text('SQLite WAL Direct'), findsNothing);
     expect(find.text('Settings & Diagnostics'), findsOneWidget);
 
     await tester.tap(find.text('Sessions'));
