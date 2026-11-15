@@ -40,7 +40,7 @@
    - One radius scale (`6 / 10 / 12 / 16 / pill`) and one type scale (`22 / 16 / 14 / 13 / 12 / 11.5 / 11`);
      containers are flat fills with a ≤2% gradient and **no borders**. Google Blue (`#1A73E8`) accent,
      `Segoe UI` / `Microsoft YaHei UI` UI typography, `Cascadia Mono` code typography, Light/Dark/System
-     themes, responsive wide split layout (`>= 1100px`), and keyboard shortcuts (`Ctrl+F`, `Ctrl+O`,
+     themes, responsive wide split layout (`>= 720px`), and keyboard shortcuts (`Ctrl+F`, `Ctrl+O`,
      `Ctrl+R` / `F5`). See [`docs/ui/google-native-shell.md`](../../docs/ui/google-native-shell.md).
 
 ---
