@@ -216,7 +216,7 @@ CREATE TRIGGER IF NOT EXISTS item_fts_uni_ad AFTER DELETE ON item BEGIN
     VALUES ('delete', old.id, old.text, old.tool_name);
 END;
 
-CREATE TRIGGER IF NOT EXISTS item_fts_uni_au AFTER UPDATE ON item BEGIN
+CREATE TRIGGER IF NOT EXISTS item_fts_uni_au AFTER UPDATE OF text, tool_name ON item BEGIN
   INSERT INTO item_fts_uni(item_fts_uni, rowid, text, tool_name)
     VALUES ('delete', old.id, old.text, old.tool_name);
   INSERT INTO item_fts_uni(rowid, text, tool_name)
@@ -231,7 +231,7 @@ CREATE TRIGGER IF NOT EXISTS item_fts_tri_ad AFTER DELETE ON item BEGIN
   INSERT INTO item_fts_tri(item_fts_tri, rowid, text) VALUES ('delete', old.id, old.text);
 END;
 
-CREATE TRIGGER IF NOT EXISTS item_fts_tri_au AFTER UPDATE ON item BEGIN
+CREATE TRIGGER IF NOT EXISTS item_fts_tri_au AFTER UPDATE OF text ON item BEGIN
   INSERT INTO item_fts_tri(item_fts_tri, rowid, text) VALUES ('delete', old.id, old.text);
   INSERT INTO item_fts_tri(rowid, text) VALUES (new.id, new.text);
 END;
@@ -244,7 +244,7 @@ CREATE TRIGGER IF NOT EXISTS conv_fts_tri_ad AFTER DELETE ON conversation BEGIN
   INSERT INTO conv_fts_tri(conv_fts_tri, rowid, title) VALUES ('delete', old.id, old.title);
 END;
 
-CREATE TRIGGER IF NOT EXISTS conv_fts_tri_au AFTER UPDATE ON conversation BEGIN
+CREATE TRIGGER IF NOT EXISTS conv_fts_tri_au AFTER UPDATE OF title ON conversation BEGIN
   INSERT INTO conv_fts_tri(conv_fts_tri, rowid, title) VALUES ('delete', old.id, old.title);
   INSERT INTO conv_fts_tri(rowid, title) VALUES (new.id, new.title);
 END;
