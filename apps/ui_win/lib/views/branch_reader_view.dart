@@ -47,6 +47,7 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
   bool _starred = false;
   bool _branchViewMode = false;
   bool _expandAllProcess = false;
+  bool _subagentsExpanded = false;
 
   /// Chosen child index per parent fork node (`null` represents root parent).
   final Map<int?, int> _selectedChildIdxByParent = {};
@@ -80,6 +81,7 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
       _expandedBlockKeys.clear();
       _loadedPayloads.clear();
       _branchViewMode = false;
+      _subagentsExpanded = false;
       _activeTurnIndex = 0;
       if (widget.conversationId != null) {
         _loadConversation(widget.conversationId!);
@@ -319,6 +321,21 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
         t.contains('conversation was compacted');
   }
 
+  static final RegExp _syntheticUserPrefixRe = RegExp(
+    r'^(?:<(?:system-reminder|system_reminder|system-notification|system_notification|system-time|time_reminder|permission_hint|permission-hint|subagent_reply|subagent-reply|agent_reply|task-notification|inbox|local-command-[a-z-]+)\b|\[(?:system\b|system\s+time|current\s+time|time\s+hint|permission\b|user-approval|approval\b|inbox\b|subagent\b|agent\s+reply|inter-agent)|(?:system\s+time|current\s+time|permission\s+(?:hint|notice|prompt|mode)|subagent\s+(?:reply|response|report)|reply\s+from\s+(?:sub)?agent)\s*[:：]|(?:系统时间|当前时间|系统权限|权限提示|子代理回复|来自子代理)\s*[:：]?)',
+    caseSensitive: false,
+  );
+
+  static bool _isRealUserTurn(MessageItem item) {
+    if (item.role != 'user') return false;
+    if (item.isSynthetic) return false;
+    final trimmed = item.text.trimLeft();
+    if (trimmed.isNotEmpty && _syntheticUserPrefixRe.hasMatch(trimmed)) {
+      return false;
+    }
+    return true;
+  }
+
   /// Collapses consecutive process nodes, thinking chains, tool calls, synthetic
   /// steps, and intermediate pre-tool assistant commentary within every turn into
   /// ONE single-line expandable summary bar, and marks only the final substantive
@@ -333,7 +350,7 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
     final turnSlices = <List<_ActiveChainNode>>[];
     var current = <_ActiveChainNode>[];
     for (final node in chain) {
-      if (node.item.role == 'user') {
+      if (_isRealUserTurn(node.item)) {
         if (current.isNotEmpty) turnSlices.add(current);
         current = [node];
       } else {
@@ -359,7 +376,7 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
 
     for (final slice in turnSlices) {
       final startIdx =
-          slice.isNotEmpty && slice.first.item.role == 'user' ? 1 : 0;
+          slice.isNotEmpty && _isRealUserTurn(slice.first.item) ? 1 : 0;
 
       // Determine the index (within slice) of the final complete assistant reply
       int? lastFinalIdx;
@@ -773,21 +790,55 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
                         color: cs.onSurfaceVariant,
                       ),
                     ),
-                    for (final sub in detail.subagents)
+                    if (detail.subagents.length <= 3 || _subagentsExpanded)
+                      for (final sub in detail.subagents)
+                        ActionChip(
+                          avatar: Icon(
+                            Icons.subdirectory_arrow_right,
+                            size: 14,
+                            color: cs.primary,
+                          ),
+                          label: Text(
+                            '${sub.subagentName ?? sub.title} · ${sub.itemCount}',
+                            style: theme.textTheme.labelMedium,
+                          ),
+                          materialTapTargetSize:
+                              MaterialTapTargetSize.shrinkWrap,
+                          labelPadding: EdgeInsets.zero,
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 10, vertical: 4),
+                          backgroundColor: surfaces.chipFill,
+                          side: BorderSide.none,
+                          onPressed: () =>
+                              widget.onSelectOtherSession(sub.id),
+                        ),
+                    if (detail.subagents.length > 3)
                       ActionChip(
                         avatar: Icon(
-                          Icons.subdirectory_arrow_right,
-                          size: 14,
+                          _subagentsExpanded
+                              ? Icons.expand_less
+                              : Icons.expand_more,
+                          size: 16,
                           color: cs.primary,
                         ),
                         label: Text(
-                          '${sub.subagentName ?? sub.title} · ${sub.itemCount}',
-                          style: theme.textTheme.labelMedium,
+                          _subagentsExpanded
+                              ? s.collapseSubagents
+                              : s.expandAllSubagents(detail.subagents.length),
+                          style: theme.textTheme.labelMedium?.copyWith(
+                            color: cs.primary,
+                            fontWeight: FontWeight.w600,
+                          ),
                         ),
-                        visualDensity: VisualDensity.compact,
+                        materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                        labelPadding: EdgeInsets.zero,
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 10, vertical: 4),
                         backgroundColor: surfaces.chipFill,
                         side: BorderSide.none,
-                        onPressed: () => widget.onSelectOtherSession(sub.id),
+                        onPressed: () => setState(
+                          () => _subagentsExpanded = !_subagentsExpanded,
+                        ),
                       ),
                   ],
                 ),

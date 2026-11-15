@@ -483,7 +483,10 @@ class _SessionListViewState extends State<SessionListView> {
                   FilterChip(
                     label: Text(s.starredOnly),
                     selected: _starredOnly,
-                    visualDensity: VisualDensity.compact,
+                    materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                    labelPadding: EdgeInsets.zero,
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 12, vertical: 5),
                     onSelected: (v) {
                       _starredOnly = v;
                       _loadSessions();
@@ -492,7 +495,10 @@ class _SessionListViewState extends State<SessionListView> {
                   FilterChip(
                     label: Text(s.shrunkOnly),
                     selected: _shrunkOnly,
-                    visualDensity: VisualDensity.compact,
+                    materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                    labelPadding: EdgeInsets.zero,
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 12, vertical: 5),
                     onSelected: (v) {
                       _shrunkOnly = v;
                       _loadSessions();

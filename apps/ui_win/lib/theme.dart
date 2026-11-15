@@ -299,6 +299,7 @@ class Gm3 {
         side: BorderSide.none,
         shape: pillShape,
         padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+        labelPadding: EdgeInsets.zero,
         labelStyle: Gm3.text(
           fontSize: fontSizeBodySmall,
           fontWeight: FontWeight.w500,

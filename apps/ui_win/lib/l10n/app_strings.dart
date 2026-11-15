@@ -324,4 +324,6 @@ class AppStrings {
   String get starProjectGlobal => isZh ? '全局星标项目' : 'Star project globally';
   String get unstarProjectGlobal => isZh ? '取消项目星标' : 'Unstar project';
   String get sentAtLabel => isZh ? '发送时间' : 'Sent at';
+  String expandAllSubagents(int n) => isZh ? '展开全部 ($n)' : 'Show all ($n)';
+  String get collapseSubagents => isZh ? '收起子代理' : 'Collapse';
 }

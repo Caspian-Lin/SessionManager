@@ -1076,6 +1076,119 @@ void main() {
     expect(find.textContaining('Alpha'), findsOneWidget);
     expect(find.textContaining('99'), findsOneWidget);
   });
+
+  testWidgets('BranchTreeReaderView collapses >3 subagents by default and folds synthetic user items',
+      (tester) async {
+    tester.view.physicalSize = const Size(1280, 900);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+
+    final dir = _createTempArchiveFixture();
+    final detail = ConversationDetail(
+      id: 77,
+      provider: 'dsh-local',
+      externalId: 'dsh-main',
+      title: 'Main Session',
+      subagents: [
+        for (var i = 1; i <= 4; i++)
+          ConversationSummary(
+            id: 100 + i,
+            provider: 'dsh-local',
+            externalId: 'sub-$i',
+            title: 'Subagent $i',
+            isSubagent: true,
+            subagentName: 'worker-$i',
+            itemCount: 10 + i,
+            updatedAt: 1700000100000,
+          ),
+      ],
+      items: [
+        MessageItem(
+          id: 1,
+          ordinal: 0,
+          role: 'user',
+          kind: 'message',
+          createdAt: 1700000001000,
+          text: 'Real user prompt',
+          isActiveBranch: true,
+          isSynthetic: false,
+        ),
+        MessageItem(
+          id: 2,
+          parentId: 1,
+          ordinal: 1,
+          role: 'user',
+          kind: 'message',
+          createdAt: 1700000002000,
+          text: 'Subagent inbox reply',
+          isActiveBranch: true,
+          isSynthetic: true,
+        ),
+        MessageItem(
+          id: 3,
+          parentId: 2,
+          ordinal: 2,
+          role: 'assistant',
+          kind: 'message',
+          createdAt: 1700000003000,
+          text: 'Final assistant answer',
+          isActiveBranch: true,
+          isSynthetic: false,
+        ),
+      ],
+    );
+
+    final store = _FakeReaderStore(dir.path, detail);
+    addTearDown(() {
+      store.dispose();
+      try {
+        dir.deleteSync(recursive: true);
+      } catch (_) {}
+    });
+
+    await tester.pumpWidget(
+      AppStringsScope(
+        notifier: ValueNotifier<AppLocale>(AppLocale.en),
+        child: MaterialApp(
+          theme: GoogleMaterialTheme.light(),
+          home: Scaffold(
+            body: BranchTreeReaderView(
+              store: store,
+              refreshTick: ValueNotifier<int>(0),
+              conversationId: 77,
+              onSelectOtherSession: (_) {},
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    // >3 subagents collapsed by default
+    expect(find.text('Show all (4)'), findsOneWidget);
+    expect(find.text('worker-1 · 11'), findsNothing);
+
+    // Expanding reveals all 4 subagent chips
+    await tester.tap(find.text('Show all (4)'));
+    await tester.pumpAndSettle();
+    expect(find.text('worker-1 · 11'), findsOneWidget);
+    expect(find.text('worker-4 · 14'), findsOneWidget);
+    expect(find.text('Collapse'), findsOneWidget);
+
+    // Synthetic user item was folded into process bar, not rendered as a user bubble
+    expect(find.text('Real user prompt'), findsOneWidget);
+    expect(find.text('Final assistant answer'), findsOneWidget);
+    expect(find.text('Subagent inbox reply'), findsNothing);
+  });
+}
+
+class _FakeReaderStore extends ArchiveDirectStore {
+  final ConversationDetail _detail;
+  _FakeReaderStore(String archiveDir, this._detail)
+      : super(archiveDir: archiveDir);
+
+  @override
+  Future<ConversationDetail?> getConversationDetail(int id) async => _detail;
 }
 
 class _FakeDiscoveryService extends LocalAgentDiscoveryService {

@@ -218,6 +218,46 @@ export class DshSessionDocument extends BaseSessionDocument<DshNativeSession> {
       attachmentsByName.set(path.basename(att.source_path), att);
     }
 
+function isSyntheticDshUserMessage(sourceKind: string | null, text: string): boolean {
+  if (sourceKind) {
+    const sk = sourceKind.toLowerCase().trim();
+    if (
+      sk === 'user-approval' ||
+      sk === 'inbox' ||
+      sk === 'subagent' ||
+      sk === 'agent' ||
+      sk === 'inter-agent' ||
+      sk === 'inter_agent' ||
+      sk === 'delegation' ||
+      sk === 'system' ||
+      sk === 'system-time' ||
+      sk === 'time' ||
+      sk === 'timer' ||
+      sk === 'permission' ||
+      sk === 'permission-prompt' ||
+      sk === 'hook' ||
+      sk === 'cron' ||
+      sk === 'scheduler' ||
+      sk === 'notification' ||
+      sk === 'task-notification' ||
+      sk.startsWith('system') ||
+      sk.startsWith('subagent') ||
+      sk.startsWith('agent/') ||
+      sk.startsWith('permission') ||
+      sk.startsWith('timer') ||
+      sk.startsWith('hook')
+    ) {
+      return true;
+    }
+  }
+
+  const trimmed = text.trimStart();
+  if (!trimmed) return false;
+  return /^(?:<(?:system-reminder|system_reminder|system-notification|system_notification|system-time|time_reminder|permission_hint|permission-hint|subagent_reply|subagent-reply|agent_reply|task-notification|inbox|local-command-[a-z-]+)\b|\[(?:system\b|system\s+time|current\s+time|time\s+hint|permission\b|user-approval|approval\b|inbox\b|subagent\b|agent\s+reply|inter-agent)|(?:system\s+time|current\s+time|permission\s+(?:hint|notice|prompt|mode)|subagent\s+(?:reply|response|report)|reply\s+from\s+(?:sub)?agent)\s*[:：]|(?:系统时间|当前时间|系统权限|权限提示|子代理回复|来自子代理)\s*[:：]?)/i.test(
+    trimmed
+  );
+}
+
     const pushSpillable = (
       spillKey: string,
       rawText: string
@@ -271,7 +311,7 @@ export class DshSessionDocument extends BaseSessionDocument<DshNativeSession> {
 
         const sourceObj = dObj ? asObj(dObj['source']) : null;
         const sourceKind = typeof sourceObj?.['kind'] === 'string' ? sourceObj['kind'] : null;
-        const isSynthetic = sourceKind === 'user-approval' || sourceKind === 'inbox';
+        const isSynthetic = isSyntheticDshUserMessage(sourceKind, text);
         const spilled = pushSpillable(`user:${seq}`, text);
         const blocks: ViewBlock[] = [];
         if (spilled.text.length > 0 || spilled.payload_ref) {
@@ -307,8 +347,8 @@ export class DshSessionDocument extends BaseSessionDocument<DshNativeSession> {
           external_id: id,
           parent_external_id: prevId,
           ordinal: ordinal++,
-          role: 'user',
-          kind: 'message',
+          role: isSynthetic ? 'system' : 'user',
+          kind: isSynthetic ? 'system_note' : 'message',
           created_at: latestTime,
           text: spilled.text,
           is_active_branch: true,

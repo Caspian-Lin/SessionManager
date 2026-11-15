@@ -728,6 +728,41 @@ describe('@sm/adapters remaining providers (anthropic-web, deepseek-web, claude-
     expect(viewA.nodes.some((n) => n.kind === 'tool_result' && n.text === '# Protocol Body')).toBe(true);
   });
 
+  it('dsh-local classifies inbox, user-approval, subagent replies, and system time/permission hints as system synthetic', async () => {
+    const dir = makeTempDir();
+    const dshRoot = path.join(dir, '.dsh');
+    const sessDir = path.join(dshRoot, 'sessions', 'synth-session');
+    fs.mkdirSync(sessDir, { recursive: true });
+
+    const lines = [
+      { type: 'session/meta', seq: 0, time: 1700000000, data: { id: 'synth-session', title: 'Synthetic Check' } },
+      { type: 'user/message', seq: 1, time: 1700000001, data: { text: 'Actual user prompt' } },
+      { type: 'user/message', seq: 2, time: 1700000002, data: { text: 'Subagent finished task X', source: { kind: 'inbox' } } },
+      { type: 'user/message', seq: 3, time: 1700000003, data: { text: 'Approved tool execution', source: { kind: 'user-approval' } } },
+      { type: 'user/message', seq: 4, time: 1700000004, data: { text: '<system-reminder>Current time: 2026-11-15</system-reminder>' } },
+      { type: 'user/message', seq: 5, time: 1700000005, data: { text: 'Permission hint: auto-approve enabled' } },
+      { type: 'assistant/message', seq: 6, time: 1700000006, data: { text: 'Done!' } },
+    ];
+    fs.writeFileSync(
+      path.join(sessDir, 'session.v4.jsonl.zstd'),
+      zlib.zstdCompressSync(Buffer.from(lines.map((l) => JSON.stringify(l) + '\n').join(''), 'utf8'))
+    );
+
+    const mock = createMockParseCtx();
+    const res = await runAdapterLifecycle(dshLocalAdapter, { kind: 'dir', path: dshRoot }, mock.ctx);
+    expect(res.docs).toHaveLength(1);
+    const view = res.docs[0]!.toViewModel();
+
+    const realUsers = view.nodes.filter((n) => n.role === 'user');
+    expect(realUsers).toHaveLength(1);
+    expect(realUsers[0]!.text).toBe('Actual user prompt');
+    expect(realUsers[0]!.is_synthetic).toBe(false);
+
+    const sysNodes = view.nodes.filter((n) => n.role === 'system' && n.is_synthetic);
+    expect(sysNodes).toHaveLength(4);
+    expect(sysNodes.every((n) => n.kind === 'system_note')).toBe(true);
+  });
+
   it('zcode-local adapter imports ZCode cli/db/db.sqlite sessions, parts, tool calls, and tasks-index links', async () => {
     const dir = makeTempDir();
     const zcodeRoot = path.join(dir, '.zcode');
