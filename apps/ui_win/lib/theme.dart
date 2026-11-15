@@ -317,14 +317,14 @@ class Gm3 {
           elevation: const WidgetStatePropertyAll(0),
           tapTargetSize: MaterialTapTargetSize.shrinkWrap,
           visualDensity: VisualDensity.compact,
-          minimumSize: const WidgetStatePropertyAll(Size(0, 28)),
-          maximumSize: const WidgetStatePropertyAll(Size(double.infinity, 28)),
+          minimumSize: const WidgetStatePropertyAll(Size(0, 32)),
+          maximumSize: const WidgetStatePropertyAll(Size(double.infinity, 34)),
           alignment: Alignment.center,
           backgroundColor: WidgetStateProperty.resolveWith((states) {
             if (states.contains(WidgetState.selected)) {
               return surfaces.chipSelected;
             }
-            return Colors.transparent;
+            return surfaces.chipFill;
           }),
           foregroundColor: WidgetStateProperty.resolveWith((states) {
             if (states.contains(WidgetState.selected)) {
@@ -336,7 +336,7 @@ class Gm3 {
           // No `shape` override: SegmentedButton derives the per-position
           // corner radii itself, so the outer ends stay rounded.
           padding: const WidgetStatePropertyAll(
-            EdgeInsets.symmetric(horizontal: 10, vertical: 0),
+            EdgeInsets.symmetric(horizontal: 12, vertical: 0),
           ),
           textStyle: WidgetStatePropertyAll(
             Gm3.text(

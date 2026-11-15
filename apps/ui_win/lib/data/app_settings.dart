@@ -139,6 +139,7 @@ class AppSettingsController extends ChangeNotifier {
   final Set<String> _pinnedProjects = <String>{};
   final Set<int> _pinnedSessions = <int>{};
   final Set<String> _starredProjects = <String>{};
+  final Set<String> _hiddenProjects = <String>{};
 
   AppSettingsController({
     String? settingsDir,
@@ -191,6 +192,7 @@ class AppSettingsController extends ChangeNotifier {
   Set<String> get pinnedProjects => Set.unmodifiable(_pinnedProjects);
   Set<int> get pinnedSessions => Set.unmodifiable(_pinnedSessions);
   Set<String> get starredProjects => Set.unmodifiable(_starredProjects);
+  Set<String> get hiddenProjects => Set.unmodifiable(_hiddenProjects);
 
   bool isProjectPinned(String providerProjectKey) =>
       _pinnedProjects.contains(providerProjectKey);
@@ -199,6 +201,9 @@ class AppSettingsController extends ChangeNotifier {
 
   bool isProjectStarred(String globalProjectKey) =>
       _starredProjects.contains(globalProjectKey);
+
+  bool isProjectHidden(String providerProjectKey) =>
+      _hiddenProjects.contains(providerProjectKey);
 
   void togglePinProject(String providerProjectKey) {
     if (!_pinnedProjects.add(providerProjectKey)) {
@@ -219,6 +224,14 @@ class AppSettingsController extends ChangeNotifier {
   void toggleStarProject(String globalProjectKey) {
     if (!_starredProjects.add(globalProjectKey)) {
       _starredProjects.remove(globalProjectKey);
+    }
+    notifyListeners();
+    _persist();
+  }
+
+  void toggleHideProject(String providerProjectKey) {
+    if (!_hiddenProjects.add(providerProjectKey)) {
+      _hiddenProjects.remove(providerProjectKey);
     }
     notifyListeners();
     _persist();
@@ -395,6 +408,11 @@ class AppSettingsController extends ChangeNotifier {
           ..clear()
           ..addAll((decoded['starred_projects'] as List).map((e) => e.toString()));
       }
+      if (decoded['hidden_projects'] is List) {
+        _hiddenProjects
+          ..clear()
+          ..addAll((decoded['hidden_projects'] as List).map((e) => e.toString()));
+      }
       notifyListeners();
     } catch (_) {
       // Ignore corrupt or inaccessible settings files
@@ -422,6 +440,7 @@ class AppSettingsController extends ChangeNotifier {
         'pinned_projects': _pinnedProjects.toList(),
         'pinned_sessions': _pinnedSessions.toList(),
         'starred_projects': _starredProjects.toList(),
+        'hidden_projects': _hiddenProjects.toList(),
       };
       file.writeAsStringSync(const JsonEncoder.withIndent('  ').convert(payload));
     } catch (_) {

@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 import 'dart:math' as math;
 
@@ -48,21 +49,33 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
   bool _branchViewMode = false;
   bool _expandAllProcess = false;
   bool _subagentsExpanded = false;
+  bool _showContextStatsDetail = false;
 
   /// Chosen child index per parent fork node (`null` represents root parent).
   final Map<int?, int> _selectedChildIdxByParent = {};
   final Set<int> _expandedProcessGroupIds = {};
+  final Set<int> _collapsedProcessGroupIds = {};
+  final Set<String> _expandedProcessStepKeys = {};
+  final Set<String> _expandedLinkedCallKeys = {};
   final Set<String> _expandedBlockKeys = {};
   final Map<String, String> _loadedPayloads = {};
   final Set<String> _loadingPayloads = {};
 
+  final GlobalKey _scrollViewportKey = GlobalKey();
+  final Map<int, GlobalKey> _turnAnchorKeys = {};
+  final Map<int, GlobalKey> _entryItemKeys = {};
+  final Map<String, GlobalKey> _processStepKeys = {};
   final ScrollController _scrollController = ScrollController();
+  List<_TurnDirectoryEntry> _latestTurns = const [];
   int _activeTurnIndex = 0;
+  int _jumpGeneration = 0;
+  bool _isProgrammaticJump = false;
 
   @override
   void initState() {
     super.initState();
     widget.refreshTick.addListener(_reloadCurrent);
+    _scrollController.addListener(_onMainScroll);
     if (widget.conversationId != null) {
       _loadConversation(widget.conversationId!);
     }
@@ -78,11 +91,21 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
     if (oldWidget.conversationId != widget.conversationId) {
       _selectedChildIdxByParent.clear();
       _expandedProcessGroupIds.clear();
+      _collapsedProcessGroupIds.clear();
+      _expandedProcessStepKeys.clear();
+      _expandedLinkedCallKeys.clear();
       _expandedBlockKeys.clear();
       _loadedPayloads.clear();
+      _turnAnchorKeys.clear();
+      _entryItemKeys.clear();
+      _processStepKeys.clear();
+      _latestTurns = const [];
       _branchViewMode = false;
       _subagentsExpanded = false;
+      _showContextStatsDetail = false;
       _activeTurnIndex = 0;
+      _jumpGeneration++;
+      _isProgrammaticJump = false;
       if (widget.conversationId != null) {
         _loadConversation(widget.conversationId!);
       } else {
@@ -98,6 +121,7 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
   @override
   void dispose() {
     widget.refreshTick.removeListener(_reloadCurrent);
+    _scrollController.removeListener(_onMainScroll);
     _scrollController.dispose();
     super.dispose();
   }
@@ -266,23 +290,44 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
     return result;
   }
 
+  static bool _isThinkingBlockType(String type) {
+    return type == 'thinking' || type == 'reasoning' || type == 'thought';
+  }
+
   static bool _isProcessBlockType(String type) {
-    return type == 'thinking' ||
+    return _isThinkingBlockType(type) ||
         type == 'tool_use' ||
         type == 'tool_call' ||
         type == 'tool_result' ||
         type == 'file_diff';
   }
 
+  static final RegExp _thinkTagBlockRe = RegExp(
+    r'<(?:think|thought|thinking)>[\s\S]*?(?:</(?:think|thought|thinking)>|$)',
+    caseSensitive: false,
+  );
+
   static bool _isProcessOnlyItem(MessageItem item) {
     if (item.isSynthetic) return true;
     if (item.role == 'tool' || item.role == 'system') return true;
+    if (item.role == 'user') {
+      final trimmed = item.text.trimLeft();
+      if (trimmed.isNotEmpty && _syntheticUserPrefixRe.hasMatch(trimmed)) {
+        return true;
+      }
+    }
     if (item.kind == 'thinking' ||
+        item.kind == 'reasoning' ||
+        item.kind == 'thought' ||
         item.kind == 'tool_call' ||
         item.kind == 'tool_result' ||
         item.kind == 'system_note' ||
         item.kind == 'summary' ||
-        item.kind == 'compaction') {
+        item.kind == 'compaction' ||
+        item.kind == 'turn_context' ||
+        item.kind == 'notice' ||
+        item.kind == 'file_change' ||
+        item.kind == 'web_search') {
       return true;
     }
     if (item.role == 'assistant') {
@@ -294,6 +339,11 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
         }
         // Only thinking/tool blocks and text is merely the same thinking content
         if (!hasOutputBlock && blocks.every((b) => _isProcessBlockType(b.type))) {
+          return true;
+        }
+      } else {
+        final cleaned = item.text.replaceAll(_thinkTagBlockRe, '').trim();
+        if (item.text.trim().isNotEmpty && cleaned.isEmpty) {
           return true;
         }
       }
@@ -322,7 +372,7 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
   }
 
   static final RegExp _syntheticUserPrefixRe = RegExp(
-    r'^(?:<(?:system-reminder|system_reminder|system-notification|system_notification|system-time|time_reminder|permission_hint|permission-hint|subagent_reply|subagent-reply|agent_reply|task-notification|inbox|local-command-[a-z-]+)\b|\[(?:system\b|system\s+time|current\s+time|time\s+hint|permission\b|user-approval|approval\b|inbox\b|subagent\b|agent\s+reply|inter-agent)|(?:system\s+time|current\s+time|permission\s+(?:hint|notice|prompt|mode)|subagent\s+(?:reply|response|report)|reply\s+from\s+(?:sub)?agent)\s*[:：]|(?:系统时间|当前时间|系统权限|权限提示|子代理回复|来自子代理)\s*[:：]?)',
+    r'^(?:<(?:goal_round|goal_complete|system-reminder|system_reminder|system-notification|system_notification|system-time|time_reminder|permission_hint|permission-hint|subagent_reply|subagent-reply|agent_reply|task-notification|inbox|runtime-context|runtime_context|turn-context|turn_context|local-command-[a-z-]+)\b|\[(?:system\b|system\s+time|current\s+time|time\s+hint|permission\b|user-approval|approval\b|inbox\b|subagent\b|agent\s+reply|inter-agent|model\s+changed\s*:)|(?:system\s+time|current\s+time|permission\s+(?:hint|notice|prompt|mode)|subagent\s+(?:reply|response|report)|reply\s+from\s+(?:sub)?agent|browser\s+time\s+zone\s+for\s+this\s+request|elapsed\s+since\s+the\s+preceding\s+step\s+context)\s*[:：]|time\s+sampled\s+while\b|(?:background\s+)?subagent\s+\S+\s+(?:finished|completed|failed|stopped|canceled|cancelled)\b|background\s+subagent\b|(?:a\s+)?background\s+job\b|job\s+\S+\s+(?:finished|completed|failed|exited)\b|agent\s+[^\n:：]{1,80}\s+sent\s+a\s+message\s*[:：]|current\s+runtime\s+context\b|this\s+is\s+an\s+automatically\s+generated\s+checkpoint\b|the\s+(?:user[-\s])?approval\s+policy\b|the\s+working\s+directory\s+changed\s+from\b|model\s+changed\s*(?:from\b|to\b|[:：])|(?:系统时间|当前时间|系统权限|权限提示|子代理回复|来自子代理|后台任务|模型切换)\s*[:：]?)',
     caseSensitive: false,
   );
 
@@ -368,11 +418,13 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
       entries.add(
         _TimelineEntry.processGroup(
           groupId: groupSeq++,
-          steps: List<_ProcessStep>.from(buf),
+          steps: _linkProcessSteps(buf),
         ),
       );
       buf.clear();
     }
+
+    int? positiveTs(int? ts) => (ts != null && ts > 0) ? ts : null;
 
     for (final slice in turnSlices) {
       final startIdx =
@@ -387,14 +439,33 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
         }
       }
 
-      // Emit User prompt bubble (and register Turn Directory anchor)
+      // Compute fallback timestamp across the turn slice for messages missing createdAt
+      int? sliceFallbackTs;
+      for (var i = slice.length - 1; i >= 0; i--) {
+        final ts = positiveTs(slice[i].item.createdAt);
+        if (ts != null) {
+          sliceFallbackTs = ts;
+          break;
+        }
+      }
+      int? userFallbackTs = startIdx == 1
+          ? (positiveTs(slice.first.item.createdAt) ?? sliceFallbackTs)
+          : sliceFallbackTs;
+
+      // Emit User prompt bubble (and register persistent Turn Directory anchor)
       _TurnDirectoryEntry? pendingTurnDir;
       GlobalKey? turnKey;
       final bool isCompactedTurn = slice.any((n) => _looksCompacted(n.item));
 
       if (startIdx == 1) {
         final userNode = slice.first;
-        turnKey = GlobalKey();
+        final anchorId = userNode.item.id > 0
+            ? userNode.item.id
+            : -(turns.length + 1000000);
+        turnKey = _turnAnchorKeys.putIfAbsent(
+          anchorId,
+          () => GlobalKey(debugLabel: 'turn_$anchorId'),
+        );
         final entryIdx = entries.length;
         final isFinalOnlyUser = lastFinalIdx == null && slice.length == 1;
         entries.add(
@@ -403,12 +474,14 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
             anchorKey: turnKey,
             isFinalTurnReply: false,
             hideProcessBlocks: false,
+            fallbackTimestamp: userFallbackTs,
           ),
         );
 
         final finalAssistantItem =
             lastFinalIdx != null ? slice[lastFinalIdx].item : null;
-        final rawPrompt = userNode.item.text.trim().replaceAll(RegExp(r'\s+'), ' ');
+        final rawPrompt =
+            userNode.item.text.trim().replaceAll(RegExp(r'\s+'), ' ');
         final rawReply = finalAssistantItem != null
             ? _extractSummaryText(finalAssistantItem)
             : '';
@@ -426,8 +499,14 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
         );
       } else if (lastFinalIdx != null) {
         // Conversation begins with an assistant turn without a user item
-        turnKey = GlobalKey();
         final finalAssistantItem = slice[lastFinalIdx].item;
+        final anchorId = finalAssistantItem.id > 0
+            ? -finalAssistantItem.id
+            : -(turns.length + 2000000);
+        turnKey = _turnAnchorKeys.putIfAbsent(
+          anchorId,
+          () => GlobalKey(debugLabel: 'turn_$anchorId'),
+        );
         pendingTurnDir = _TurnDirectoryEntry(
           turnIndex: turns.length,
           entryIndex: entries.length,
@@ -461,12 +540,27 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
 
         flushProcessSteps(processBuf);
 
+        final replyEntryIdx = entries.length;
+        if (startIdx == 0 && pendingTurnDir != null) {
+          pendingTurnDir = _TurnDirectoryEntry(
+            turnIndex: pendingTurnDir.turnIndex,
+            entryIndex: replyEntryIdx,
+            anchorKey: pendingTurnDir.anchorKey,
+            userTitle: pendingTurnDir.userTitle,
+            assistantSummary: pendingTurnDir.assistantSummary,
+            isCompacted: pendingTurnDir.isCompacted,
+            branchCount: pendingTurnDir.branchCount,
+          );
+        }
+
         entries.add(
           _TimelineEntry.message(
             node: node,
             anchorKey: startIdx == 0 ? turnKey : null,
             isFinalTurnReply: true,
             hideProcessBlocks: true,
+            fallbackTimestamp:
+                positiveTs(node.item.createdAt) ?? sliceFallbackTs,
           ),
         );
       }
@@ -479,6 +573,163 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
     }
 
     return (entries: entries, turns: turns);
+  }
+
+  static bool _isToolCallBlockType(String type) {
+    return type == 'tool_use' || type == 'tool_call' || type == 'file_diff';
+  }
+
+  static bool _isToolCallStep(_ProcessStep step) {
+    if (step.block != null) {
+      return _isToolCallBlockType(step.block!.type);
+    }
+    if (step.node != null) {
+      final item = step.node!.item;
+      if (item.kind == 'tool_result') return false;
+      if (item.kind == 'tool_call' || item.role == 'tool') {
+        return item.kind != 'tool_result' &&
+            !item.blocks.any((b) => b.type == 'tool_result');
+      }
+      return item.blocks.any((b) => _isToolCallBlockType(b.type));
+    }
+    return false;
+  }
+
+  static bool _isToolResultStep(_ProcessStep step) {
+    if (step.block != null) return step.block!.type == 'tool_result';
+    if (step.node != null) {
+      final item = step.node!.item;
+      return item.kind == 'tool_result' ||
+          item.blocks.any((b) => b.type == 'tool_result');
+    }
+    return false;
+  }
+
+  static String? _extractStepToolName(_ProcessStep step) {
+    if (step.block != null) {
+      final name = step.block!.toolName?.trim();
+      if (name != null && name.isNotEmpty) return name;
+    }
+    if (step.node != null) {
+      final item = step.node!.item;
+      final top = item.toolName?.trim();
+      if (top != null && top.isNotEmpty) return top;
+      for (final b in item.blocks) {
+        final bn = b.toolName?.trim();
+        if (bn != null && bn.isNotEmpty) return bn;
+      }
+    }
+    return null;
+  }
+
+  static List<_ProcessStep> _linkProcessSteps(List<_ProcessStep> rawSteps) {
+    final result = <_ProcessStep>[];
+    final callById =
+        <String, ({int index, _ProcessStep step, ViewBlock? block})>{};
+    final callIndices = <int>[];
+    final claimedCallIndices = <int>{};
+
+    for (var i = 0; i < rawSteps.length; i++) {
+      final raw = rawSteps[i];
+      if (_isToolCallStep(raw)) {
+        final indexed = raw.withLink(stepIndex: i);
+        callIndices.add(i);
+        if (raw.block != null) {
+          final cid = raw.block!.toolCallId?.trim();
+          if (cid != null && cid.isNotEmpty) {
+            callById[cid] = (index: i, step: indexed, block: raw.block);
+          }
+        } else if (raw.node != null) {
+          final item = raw.node!.item;
+          for (final b in item.blocks) {
+            if (_isToolCallBlockType(b.type)) {
+              final cid = b.toolCallId?.trim();
+              if (cid != null && cid.isNotEmpty) {
+                callById[cid] = (index: i, step: indexed, block: b);
+              }
+            }
+          }
+        }
+        result.add(indexed);
+        continue;
+      }
+
+      if (_isToolResultStep(raw)) {
+        ({int index, _ProcessStep step, ViewBlock? block})? matched;
+
+        // 1. Exact toolCallId match
+        final candidateIds = <String>[];
+        if (raw.block?.toolCallId != null &&
+            raw.block!.toolCallId!.trim().isNotEmpty) {
+          candidateIds.add(raw.block!.toolCallId!.trim());
+        } else if (raw.node != null) {
+          final item = raw.node!.item;
+          for (final b in item.blocks) {
+            final bid = b.toolCallId?.trim();
+            if (bid != null && bid.isNotEmpty) candidateIds.add(bid);
+          }
+        }
+        for (final cid in candidateIds) {
+          final found = callById[cid];
+          if (found != null) {
+            matched = found;
+            claimedCallIndices.add(found.index);
+            break;
+          }
+        }
+
+        // 2. Fallback to nearest preceding unmatched tool_call (matching name first)
+        if (matched == null && callIndices.isNotEmpty) {
+          final resultToolName = _extractStepToolName(raw)?.toLowerCase();
+          int? fallbackIdx;
+          if (resultToolName != null) {
+            for (var k = callIndices.length - 1; k >= 0; k--) {
+              final cIdx = callIndices[k];
+              if (claimedCallIndices.contains(cIdx)) continue;
+              final cname = _extractStepToolName(result[cIdx])?.toLowerCase();
+              if (cname == resultToolName) {
+                fallbackIdx = cIdx;
+                break;
+              }
+            }
+          }
+          fallbackIdx ??= () {
+            for (var k = callIndices.length - 1; k >= 0; k--) {
+              final cIdx = callIndices[k];
+              if (!claimedCallIndices.contains(cIdx)) return cIdx;
+            }
+            return callIndices.last;
+          }();
+
+          claimedCallIndices.add(fallbackIdx);
+          final callStep = result[fallbackIdx];
+          ViewBlock? callBlock = callStep.block;
+          if (callBlock == null && callStep.node != null) {
+            for (final b in callStep.node!.item.blocks) {
+              if (_isToolCallBlockType(b.type)) {
+                callBlock = b;
+                break;
+              }
+            }
+          }
+          matched = (index: fallbackIdx, step: callStep, block: callBlock);
+        }
+
+        result.add(
+          raw.withLink(
+            stepIndex: i,
+            linkedCall: matched?.step,
+            linkedCallIndex: matched?.index,
+            linkedCallBlock: matched?.block,
+          ),
+        );
+        continue;
+      }
+
+      result.add(raw.withLink(stepIndex: i));
+    }
+
+    return result;
   }
 
   static String _extractSummaryText(MessageItem item) {
@@ -510,37 +761,205 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
     });
   }
 
+  void _onMainScroll() {
+    if (!mounted ||
+        _isProgrammaticJump ||
+        !_scrollController.hasClients ||
+        _latestTurns.isEmpty) {
+      return;
+    }
+    final viewportBox =
+        _scrollViewportKey.currentContext?.findRenderObject() as RenderBox?;
+    if (viewportBox == null || !viewportBox.hasSize) return;
+
+    int? activeIdx;
+    int? firstMountedIdx;
+    for (final turn in _latestTurns) {
+      final ctx = turn.anchorKey.currentContext;
+      final box = ctx?.findRenderObject() as RenderBox?;
+      if (box == null || !box.hasSize) continue;
+      firstMountedIdx ??= turn.turnIndex;
+      final dy = box.localToGlobal(Offset.zero, ancestor: viewportBox).dy;
+      if (dy <= 140.0) {
+        activeIdx = turn.turnIndex;
+      }
+    }
+    if (activeIdx == null && firstMountedIdx != null) {
+      activeIdx = _scrollController.offset <= 8.0
+          ? 0
+          : math.max(0, firstMountedIdx - 1);
+    }
+    if (activeIdx != null && activeIdx != _activeTurnIndex) {
+      setState(() => _activeTurnIndex = activeIdx!);
+    }
+  }
+
   void _jumpToTurn(_TurnDirectoryEntry turn, int totalEntries) {
-    setState(() => _activeTurnIndex = turn.turnIndex);
+    final int gen = ++_jumpGeneration;
+    setState(() {
+      _activeTurnIndex = turn.turnIndex;
+      _isProgrammaticJump = true;
+    });
 
     final ctx = turn.anchorKey.currentContext;
     if (ctx != null) {
       Scrollable.ensureVisible(
         ctx,
-        duration: const Duration(milliseconds: 240),
+        duration: const Duration(milliseconds: 220),
         curve: Curves.easeOutCubic,
-        alignment: 0.06,
-      );
+        alignment: 0.04,
+      ).whenComplete(() {
+        if (mounted && _jumpGeneration == gen) {
+          _isProgrammaticJump = false;
+        }
+      });
       return;
     }
 
-    if (!_scrollController.hasClients) return;
+    if (!_scrollController.hasClients) {
+      _isProgrammaticJump = false;
+      return;
+    }
+
     final maxExtent = _scrollController.position.maxScrollExtent;
-    final ratio = totalEntries <= 1
+    final initialRatio = totalEntries <= 1
         ? 0.0
         : (turn.entryIndex / (totalEntries - 1)).clamp(0.0, 1.0);
-    _scrollController.jumpTo(maxExtent * ratio);
+    _scrollController.jumpTo(maxExtent * initialRatio);
 
+    _refineJumpToTurn(
+      turn,
+      totalEntries,
+      gen: gen,
+      attempt: 0,
+      lowOffset: 0.0,
+      highOffset: maxExtent,
+    );
+  }
+
+  void _refineJumpToTurn(
+    _TurnDirectoryEntry turn,
+    int totalEntries, {
+    required int gen,
+    required int attempt,
+    required double lowOffset,
+    required double highOffset,
+  }) {
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      final delayedCtx = turn.anchorKey.currentContext;
-      if (delayedCtx != null) {
-        Scrollable.ensureVisible(
-          delayedCtx,
-          duration: const Duration(milliseconds: 180),
-          curve: Curves.easeOutCubic,
-          alignment: 0.06,
-        );
+      if (!mounted ||
+          !_scrollController.hasClients ||
+          _jumpGeneration != gen) {
+        return;
       }
+
+      final ctx = turn.anchorKey.currentContext;
+      if (ctx != null) {
+        Scrollable.ensureVisible(
+          ctx,
+          duration: const Duration(milliseconds: 200),
+          curve: Curves.easeOutCubic,
+          alignment: 0.04,
+        ).whenComplete(() {
+          if (mounted && _jumpGeneration == gen) {
+            _isProgrammaticJump = false;
+          }
+        });
+        return;
+      }
+
+      if (attempt >= 14) {
+        _isProgrammaticJump = false;
+        return;
+      }
+
+      final pos = _scrollController.position;
+      final cur = pos.pixels;
+      final maxExt = pos.maxScrollExtent;
+      final viewportH = pos.viewportDimension;
+      final viewportBox =
+          _scrollViewportKey.currentContext?.findRenderObject() as RenderBox?;
+
+      int? minMountedIdx;
+      int? maxMountedIdx;
+      double? minMountedTop;
+      double? maxMountedBottom;
+
+      if (viewportBox != null && viewportBox.hasSize) {
+        for (var idx = 0; idx < totalEntries; idx++) {
+          final itemCtx = _entryItemKeys[idx]?.currentContext;
+          final box = itemCtx?.findRenderObject() as RenderBox?;
+          if (box == null || !box.hasSize) continue;
+          minMountedIdx ??= idx;
+          maxMountedIdx = idx;
+          final top = box.localToGlobal(Offset.zero, ancestor: viewportBox).dy;
+          final bottom = top + box.size.height;
+          minMountedTop =
+              minMountedTop == null ? top : math.min(minMountedTop, top);
+          maxMountedBottom = maxMountedBottom == null
+              ? bottom
+              : math.max(maxMountedBottom, bottom);
+        }
+      }
+
+      double nextLow = lowOffset;
+      double nextHigh = math.min(highOffset, maxExt);
+      double nextOffset;
+
+      if (minMountedIdx != null &&
+          maxMountedIdx != null &&
+          turn.entryIndex < minMountedIdx) {
+        nextHigh = math.min(nextHigh, cur);
+        final span = ((maxMountedBottom ?? viewportH) - (minMountedTop ?? 0))
+            .clamp(80.0, 20000.0);
+        final count = math.max(1, maxMountedIdx - minMountedIdx + 1);
+        final avgH = span / count;
+        final step = math.max(
+          viewportH * 0.65,
+          (minMountedIdx - turn.entryIndex) * avgH + viewportH * 0.2,
+        );
+        var candidate = cur - step;
+        if (candidate <= nextLow || candidate >= cur) {
+          candidate = (nextLow + cur) / 2.0;
+        }
+        nextOffset = candidate.clamp(0.0, maxExt);
+      } else if (minMountedIdx != null &&
+          maxMountedIdx != null &&
+          turn.entryIndex > maxMountedIdx) {
+        nextLow = math.max(nextLow, cur);
+        final span = ((maxMountedBottom ?? viewportH) - (minMountedTop ?? 0))
+            .clamp(80.0, 20000.0);
+        final count = math.max(1, maxMountedIdx - minMountedIdx + 1);
+        final avgH = span / count;
+        final step = math.max(
+          viewportH * 0.65,
+          (turn.entryIndex - maxMountedIdx) * avgH + viewportH * 0.2,
+        );
+        var candidate = cur + step;
+        if (candidate >= nextHigh || candidate <= cur) {
+          candidate = (cur + nextHigh) / 2.0;
+        }
+        nextOffset = candidate.clamp(0.0, maxExt);
+      } else {
+        final ratio = totalEntries <= 1
+            ? 0.0
+            : (turn.entryIndex / (totalEntries - 1)).clamp(0.0, 1.0);
+        nextOffset = (maxExt * ratio).clamp(0.0, maxExt);
+      }
+
+      if ((nextOffset - cur).abs() < 2.0) {
+        _isProgrammaticJump = false;
+        return;
+      }
+
+      _scrollController.jumpTo(nextOffset);
+      _refineJumpToTurn(
+        turn,
+        totalEntries,
+        gen: gen,
+        attempt: attempt + 1,
+        lowOffset: nextLow,
+        highOffset: nextHigh,
+      );
     });
   }
 
@@ -578,6 +997,13 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
     final built = _buildCollapsedTimelineAndDirectory(detail);
     final entries = built.entries;
     final turns = built.turns;
+    final activeItems = _resolveActiveTreePath(detail)
+        .where((e) => !e.item.isHidden)
+        .map((e) => e.item)
+        .toList();
+    final contextStats = computeConversationContextStats(activeItems);
+    _latestTurns = turns;
+    _entryItemKeys.removeWhere((idx, _) => idx >= entries.length);
     final forkCount = detail.childrenByParent.values
         .where((children) => children.length > 1)
         .length;
@@ -737,37 +1163,36 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
                           ),
                           onPressed: () => setState(() {
                             _expandAllProcess = !_expandAllProcess;
+                            _collapsedProcessGroupIds.clear();
                             if (!_expandAllProcess) {
                               _expandedProcessGroupIds.clear();
+                              _expandedProcessStepKeys.clear();
                             }
                           }),
                         ),
 
                       // Conversation View | Branch View Switcher
-                      Gm3SegmentedTrack(
-                        height: 32,
-                        child: SegmentedButton<bool>(
-                          showSelectedIcon: false,
-                          segments: [
-                            ButtonSegment<bool>(
-                              value: false,
-                              label: Text(s.conversationViewTab),
-                              icon: const Icon(Icons.chat_bubble_outline, size: 14),
+                      SegmentedButton<bool>(
+                        showSelectedIcon: false,
+                        segments: [
+                          ButtonSegment<bool>(
+                            value: false,
+                            label: Text(s.conversationViewTab),
+                            icon: const Icon(Icons.chat_bubble_outline, size: 14),
+                          ),
+                          ButtonSegment<bool>(
+                            value: true,
+                            label: Text(
+                              forkCount > 0
+                                  ? '${s.branchViewTab} ($forkCount)'
+                                  : s.branchViewTab,
                             ),
-                            ButtonSegment<bool>(
-                              value: true,
-                              label: Text(
-                                forkCount > 0
-                                    ? '${s.branchViewTab} ($forkCount)'
-                                    : s.branchViewTab,
-                              ),
-                              icon: const Icon(Icons.alt_route_rounded, size: 14),
-                            ),
-                          ],
-                          selected: {_branchViewMode},
-                          onSelectionChanged: (val) =>
-                              setState(() => _branchViewMode = val.first),
-                        ),
+                            icon: const Icon(Icons.alt_route_rounded, size: 14),
+                          ),
+                        ],
+                        selected: {_branchViewMode},
+                        onSelectionChanged: (val) =>
+                            setState(() => _branchViewMode = val.first),
                       ),
                     ],
                   ),
@@ -869,6 +1294,14 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
                   ],
                 ),
               ],
+              const SizedBox(height: 8),
+              _ConversationContextStatsBar(
+                stats: contextStats,
+                expanded: _showContextStatsDetail,
+                onToggle: () => setState(
+                  () => _showContextStatsDetail = !_showContextStatsDetail,
+                ),
+              ),
             ],
           ),
         ),
@@ -877,6 +1310,7 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
         // Main Area: Conversation Canvas (+ Codex Jump Rail) OR Dedicated Branch View
         Expanded(
           child: Container(
+            key: _scrollViewportKey,
             color: surfaces.panel,
             child: _branchViewMode
                 ? _buildDedicatedBranchView(context, detail)
@@ -904,13 +1338,23 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
                                   branchCount: entry.node!.branchCount,
                                   isFinalTurnReply: entry.isFinalTurnReply,
                                   hideProcessBlocks: entry.hideProcessBlocks,
+                                  fallbackTimestamp: entry.fallbackTimestamp,
                                 );
+                          final anchored = entry.anchorKey != null
+                              ? KeyedSubtree(
+                                  key: entry.anchorKey,
+                                  child: child,
+                                )
+                              : child;
                           return Center(
                             child: ConstrainedBox(
                               constraints: const BoxConstraints(maxWidth: 780),
                               child: KeyedSubtree(
-                                key: entry.anchorKey,
-                                child: child,
+                                key: _entryItemKeys.putIfAbsent(
+                                  idx,
+                                  () => GlobalKey(debugLabel: 'entry_$idx'),
+                                ),
+                                child: anchored,
                               ),
                             ),
                           );
@@ -1225,8 +1669,9 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
     final cs = theme.colorScheme;
     final surfaces = Gm3Surfaces.of(context);
     final steps = entry.processSteps!;
-    final isExpanded =
-        _expandAllProcess || _expandedProcessGroupIds.contains(entry.groupId);
+    final isExpanded = (_expandAllProcess &&
+            !_collapsedProcessGroupIds.contains(entry.groupId)) ||
+        _expandedProcessGroupIds.contains(entry.groupId);
 
     var thinkingCount = 0;
     var toolCallCount = 0;
@@ -1237,7 +1682,7 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
     for (final step in steps) {
       if (step.block != null) {
         final t = step.block!.type;
-        if (t == 'thinking') {
+        if (_isThinkingBlockType(t)) {
           thinkingCount++;
         } else if (t == 'tool_result') {
           toolResultCount++;
@@ -1247,19 +1692,18 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
       } else if (step.node != null) {
         final it = step.node!.item;
         final blockThinking =
-            it.blocks.where((b) => b.type == 'thinking').length;
-        final blockToolCalls = it.blocks
-            .where((b) =>
-                b.type == 'tool_use' ||
-                b.type == 'tool_call' ||
-                b.type == 'file_diff')
-            .length;
+            it.blocks.where((b) => _isThinkingBlockType(b.type)).length;
+        final blockToolCalls =
+            it.blocks.where((b) => _isToolCallBlockType(b.type)).length;
         final blockToolResults =
             it.blocks.where((b) => b.type == 'tool_result').length;
 
         if (it.isSynthetic || it.role == 'system') {
           systemCount++;
-        } else if (it.kind == 'thinking' || blockThinking > 0) {
+        } else if (it.kind == 'thinking' ||
+            it.kind == 'reasoning' ||
+            it.kind == 'thought' ||
+            blockThinking > 0) {
           thinkingCount += math.max(1, blockThinking);
         } else if (it.kind == 'tool_result' || blockToolResults > 0) {
           toolResultCount += math.max(1, blockToolResults);
@@ -1281,155 +1725,631 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
       noteCount: noteCount,
     );
 
+    void expandGroup() {
+      setState(() {
+        _collapsedProcessGroupIds.remove(entry.groupId);
+        _expandedProcessGroupIds.add(entry.groupId);
+      });
+    }
+
+    void collapseGroup() {
+      setState(() {
+        _expandedProcessGroupIds.remove(entry.groupId);
+        if (_expandAllProcess) {
+          _collapsedProcessGroupIds.add(entry.groupId);
+        }
+      });
+    }
+
+    int? groupTimestampMs;
+    for (final step in steps) {
+      final ts = step.node?.item.createdAt ?? step.parentItem?.createdAt;
+      if (ts != null && ts > 0) {
+        groupTimestampMs = ts;
+        break;
+      }
+    }
+
     if (!isExpanded) {
       return Padding(
         padding: const EdgeInsets.only(bottom: 14),
-        child: Material(
-          color: surfaces.inset,
-          borderRadius: BorderRadius.circular(Gm3.radiusPill),
-          child: InkWell(
-            onTap: () =>
-                setState(() => _expandedProcessGroupIds.add(entry.groupId)),
-            borderRadius: BorderRadius.circular(Gm3.radiusPill),
-            child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
-              child: Row(
-                children: [
-                  Icon(
-                    Icons.chevron_right_rounded,
-                    size: 16,
-                    color: cs.onSurfaceVariant,
-                  ),
-                  const SizedBox(width: 6),
-                  Icon(
-                    thinkingCount > 0 && toolCallCount == 0
-                        ? Icons.psychology_outlined
-                        : Icons.build_circle_outlined,
-                    size: 14,
-                    color: cs.primary,
-                  ),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: Text(
-                      summaryText,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: theme.textTheme.labelMedium?.copyWith(
+        child: _HoverProbe(
+          builder: (ctx, hovered) {
+            final formattedTs = groupTimestampMs != null
+                ? _MessageHoverTimeWrapperState.formatTimestamp(
+                    ctx,
+                    groupTimestampMs,
+                  )
+                : null;
+            return Material(
+              color: surfaces.inset,
+              borderRadius: BorderRadius.circular(Gm3.radiusPill),
+              child: InkWell(
+                onTap: expandGroup,
+                borderRadius: BorderRadius.circular(Gm3.radiusPill),
+                child: Padding(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+                  child: Row(
+                    children: [
+                      Icon(
+                        Icons.chevron_right_rounded,
+                        size: 16,
                         color: cs.onSurfaceVariant,
                       ),
-                    ),
+                      const SizedBox(width: 6),
+                      Icon(
+                        thinkingCount > 0 && toolCallCount == 0
+                            ? Icons.psychology_outlined
+                            : Icons.build_circle_outlined,
+                        size: 14,
+                        color: cs.primary,
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          summaryText,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: theme.textTheme.labelMedium?.copyWith(
+                            color: cs.onSurfaceVariant,
+                          ),
+                        ),
+                      ),
+                      if (hovered && formattedTs != null) ...[
+                        const SizedBox(width: 8),
+                        _InlineHoverTimeChip(label: formattedTs),
+                      ],
+                    ],
                   ),
-                ],
+                ),
               ),
-            ),
-          ),
+            );
+          },
         ),
       );
     }
 
+    Widget groupHeaderContent(BuildContext ctx, bool isSticky) => InkWell(
+          onTap: collapseGroup,
+          borderRadius: BorderRadius.circular(Gm3.radiusSm),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(vertical: 4, horizontal: 4),
+            child: Row(
+              children: [
+                Icon(Icons.expand_more_rounded,
+                    size: 16, color: cs.onSurfaceVariant),
+                const SizedBox(width: 6),
+                Expanded(
+                  child: Text(
+                    summaryText,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: theme.textTheme.labelMedium?.copyWith(
+                      color: cs.primary,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ),
+                Text(
+                  s.collapseProcessGroup,
+                  style: theme.textTheme.labelSmall?.copyWith(
+                    color: cs.onSurfaceVariant,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+
+    return _ProcessGroupStickyHost(
+      builder: (ctx, footerRegistry) {
+        return _StickyLongBlockOverlay(
+          scrollController: _scrollController,
+          viewportKey: _scrollViewportKey,
+          stickyTopInset: 0.0,
+          stickyHeaderBackground: surfaces.inset,
+          stickyHeaderPadding: const EdgeInsets.fromLTRB(12, 6, 12, 6),
+          containerPadding: const EdgeInsets.fromLTRB(12, 8, 12, 10),
+          containerMargin: const EdgeInsets.only(bottom: 16),
+          clipBorderRadius: BorderRadius.circular(Gm3.radiusMd),
+          containerDecoration: BoxDecoration(
+            color: surfaces.inset.withOpacity(0.75),
+            borderRadius: BorderRadius.circular(Gm3.radiusMd),
+            border: Border.all(color: surfaces.hairline.withOpacity(0.45)),
+          ),
+          collapseRightOffset: 22.0,
+          isLongBlock: steps.length >= 8,
+          collapseLabel: s.collapseProcessGroup,
+          onCollapse: collapseGroup,
+          suppressFooterWhenNonEmpty: footerRegistry,
+          headerBuilder: groupHeaderContent,
+          body: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              const SizedBox(height: 6),
+              for (var i = 0; i < steps.length; i++)
+                _buildExpandedProcessStep(
+                  ctx,
+                  entry.groupId,
+                  steps[i],
+                  i,
+                  footerRegistry: footerRegistry,
+                ),
+              if (steps.length >= 8) const SizedBox(height: 30),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  ({
+    IconData icon,
+    String label,
+    String preview,
+    bool isLong,
+    String? linkedToolName,
+  }) _summarizeProcessStep(_ProcessStep step, AppStrings s) {
+    final linkedToolName = _extractStepToolName(step) ??
+        step.linkedCallBlock?.toolName ??
+        (step.linkedCall != null ? _extractStepToolName(step.linkedCall!) : null);
+
+    if (step.block != null && step.parentItem != null) {
+      final b = step.block!;
+      final isThinking = _isThinkingBlockType(b.type);
+      final isToolResult = b.type == 'tool_result';
+      final body = (b.toolInput ?? b.text ?? '').trim();
+      final oneLine = body.replaceAll(RegExp(r'\s+'), ' ').trim();
+      final effectiveTool = b.toolName ?? linkedToolName;
+      final label = isThinking
+          ? s.thinkingProcess
+          : '${b.type}${effectiveTool != null ? ': $effectiveTool' : ''}';
+      final isLong = body.length > 220 || '\n'.allMatches(body).length >= 5;
+      return (
+        icon: isThinking
+            ? Icons.psychology_outlined
+            : isToolResult
+                ? Icons.receipt_long_outlined
+                : Icons.terminal_rounded,
+        label: label,
+        preview: oneLine,
+        isLong: isLong,
+        linkedToolName: linkedToolName,
+      );
+    }
+
+    final item = step.node!.item;
+    final isThinking = item.kind == 'thinking' ||
+        item.kind == 'reasoning' ||
+        item.kind == 'thought' ||
+        item.blocks.any((b) => _isThinkingBlockType(b.type));
+    final isToolResult = item.kind == 'tool_result' ||
+        item.blocks.any((b) => b.type == 'tool_result');
+    final isSystem = item.isSynthetic || item.role == 'system';
+    final icon = isSystem
+        ? Icons.info_outline_rounded
+        : isThinking
+            ? Icons.psychology_outlined
+            : isToolResult
+                ? Icons.receipt_long_outlined
+                : Icons.terminal_rounded;
+    final effectiveTool = item.toolName ?? linkedToolName;
+    final label = effectiveTool != null
+        ? '${item.kind}: $effectiveTool'
+        : '${item.role.toUpperCase()} · ${item.kind}';
+
+    final rawParts = <String>[];
+    if (item.blocks.isNotEmpty) {
+      for (final b in item.blocks) {
+        final t = (b.toolInput ?? b.text ?? '').trim();
+        if (t.isNotEmpty) rawParts.add(t);
+      }
+    }
+    if (rawParts.isEmpty && item.text.trim().isNotEmpty) {
+      rawParts.add(item.text.trim());
+    }
+    final combined = rawParts.join(' ');
+    final oneLine = combined.replaceAll(RegExp(r'\s+'), ' ').trim();
+    final isLong = combined.length > 220 ||
+        '\n'.allMatches(combined).length >= 5 ||
+        ArchiveDirectStore.extractPayloadSha256(item.payloadRef) != null;
+
+    return (
+      icon: icon,
+      label: label,
+      preview: oneLine,
+      isLong: isLong,
+      linkedToolName: linkedToolName,
+    );
+  }
+
+  static bool _looksLikeRawCode(String text) {
+    final t = text.trimLeft();
+    if (t.isEmpty) return false;
+    if (t.startsWith('{') || t.startsWith('[')) return true;
+    if (t.startsWith('<') && !t.contains('\n#') && !t.contains('```')) {
+      return true;
+    }
+    return false;
+  }
+
+  Widget _buildProcessOrThinkingBody(
+    BuildContext context, {
+    required String body,
+    required bool isThinking,
+    String? language,
+    Color? textColor,
+  }) {
+    final cs = Theme.of(context).colorScheme;
+    if (isThinking && !_looksLikeRawCode(body)) {
+      return MarkdownProse(text: body);
+    }
+    return SyntaxHighlightedCodeText(
+      text: body,
+      language: language,
+      style: GoogleMaterialTheme.monoTextStyle(
+        fontSize: Gm3.monoSm,
+        color: textColor ?? cs.onSurfaceVariant,
+      ),
+    );
+  }
+
+  void _jumpToProcessStep(String targetStepKey) {
+    setState(() {
+      _expandedProcessStepKeys.add(targetStepKey);
+    });
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final ctx = _processStepKeys[targetStepKey]?.currentContext;
+      if (ctx != null) {
+        Scrollable.ensureVisible(
+          ctx,
+          duration: const Duration(milliseconds: 220),
+          curve: Curves.easeOutCubic,
+          alignment: 0.12,
+        );
+      }
+    });
+  }
+
+  Widget? _buildLinkedCallBanner(
+    BuildContext context,
+    int groupId,
+    String currentStepKey,
+    _ProcessStep step,
+  ) {
+    final linked = step.linkedCall;
+    if (linked == null) return null;
+
+    final s = AppStringsScope.of(context);
+    final theme = Theme.of(context);
+    final cs = theme.colorScheme;
+    final surfaces = Gm3Surfaces.of(context);
+
+    final linkedBlock = step.linkedCallBlock;
+    final linkedName = linkedBlock?.toolName ??
+        _extractStepToolName(linked) ??
+        'tool_call';
+    final rawInput = (linkedBlock?.toolInput ??
+            linkedBlock?.text ??
+            linked.node?.item.blocks
+                .map((b) => (b.toolInput ?? b.text ?? '').trim())
+                .where((t) => t.isNotEmpty)
+                .join('\n') ??
+            linked.node?.item.text ??
+            '')
+        .trim();
+    final oneLineInput = rawInput.replaceAll(RegExp(r'\s+'), ' ').trim();
+    final inlineKey = 'link:$currentStepKey';
+    final isPreviewExpanded = _expandedLinkedCallKeys.contains(inlineKey);
+    final linkedStepIdx = step.linkedCallIndex;
+    final linkedStepKey =
+        linkedStepIdx != null ? '$groupId:$linkedStepIdx' : null;
+
     return Container(
-      margin: const EdgeInsets.only(bottom: 16),
-      padding: const EdgeInsets.fromLTRB(12, 8, 12, 10),
+      margin: const EdgeInsets.only(top: 6),
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
       decoration: BoxDecoration(
-        color: surfaces.inset.withOpacity(0.75),
-        borderRadius: BorderRadius.circular(Gm3.radiusMd),
+        color: surfaces.inset.withOpacity(0.65),
+        borderRadius: BorderRadius.circular(Gm3.radiusSm),
         border: Border.all(color: surfaces.hairline.withOpacity(0.45)),
       ),
       child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          InkWell(
-            onTap: () =>
-                setState(() => _expandedProcessGroupIds.remove(entry.groupId)),
-            borderRadius: BorderRadius.circular(Gm3.radiusSm),
-            child: Padding(
-              padding: const EdgeInsets.symmetric(vertical: 4, horizontal: 4),
-              child: Row(
-                children: [
-                  Icon(Icons.expand_more_rounded,
-                      size: 16, color: cs.onSurfaceVariant),
-                  const SizedBox(width: 6),
-                  Expanded(
+          Row(
+            children: [
+              Icon(Icons.link_rounded, size: 14, color: cs.primary),
+              const SizedBox(width: 5),
+              Text(
+                s.linkedToolCallLabel,
+                style: theme.textTheme.labelSmall?.copyWith(
+                  color: cs.primary,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+              const SizedBox(width: 6),
+              Gm3Pill(
+                label: linkedName,
+                color: cs.primary,
+                background: surfaces.chipFill,
+                fontSize: 10.5,
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+              ),
+              if (oneLineInput.isNotEmpty) ...[
+                const SizedBox(width: 8),
+                Expanded(
+                  child: InkWell(
+                    onTap: () => setState(() {
+                      if (!_expandedLinkedCallKeys.add(inlineKey)) {
+                        _expandedLinkedCallKeys.remove(inlineKey);
+                      }
+                    }),
+                    borderRadius: BorderRadius.circular(4),
                     child: Text(
-                      summaryText,
-                      style: theme.textTheme.labelMedium?.copyWith(
-                        color: cs.primary,
-                        fontWeight: FontWeight.w600,
+                      oneLineInput,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: GoogleMaterialTheme.monoTextStyle(
+                        fontSize: Gm3.monoSm,
+                        color: cs.onSurfaceVariant,
                       ),
                     ),
                   ),
-                  Text(
-                    s.collapseProcessGroup,
-                    style: theme.textTheme.labelSmall?.copyWith(
+                ),
+              ] else
+                const Spacer(),
+              if (rawInput.isNotEmpty)
+                InkWell(
+                  onTap: () => setState(() {
+                    if (!_expandedLinkedCallKeys.add(inlineKey)) {
+                      _expandedLinkedCallKeys.remove(inlineKey);
+                    }
+                  }),
+                  borderRadius: BorderRadius.circular(4),
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 4),
+                    child: Icon(
+                      isPreviewExpanded
+                          ? Icons.expand_less_rounded
+                          : Icons.unfold_more_rounded,
+                      size: 16,
                       color: cs.onSurfaceVariant,
                     ),
                   ),
-                ],
+                ),
+              if (linkedStepKey != null) ...[
+                const SizedBox(width: 4),
+                InkWell(
+                  onTap: () => _jumpToProcessStep(linkedStepKey),
+                  borderRadius: BorderRadius.circular(4),
+                  child: Padding(
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(
+                          Icons.north_west_rounded,
+                          size: 13,
+                          color: cs.primary,
+                        ),
+                        const SizedBox(width: 2),
+                        Text(
+                          '#${linkedStepIdx! + 1}',
+                          style: theme.textTheme.labelSmall?.copyWith(
+                            color: cs.primary,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ],
+            ],
+          ),
+          if (isPreviewExpanded && rawInput.isNotEmpty) ...[
+            const SizedBox(height: 6),
+            SyntaxHighlightedCodeText(
+              text: rawInput,
+              style: GoogleMaterialTheme.monoTextStyle(
+                fontSize: Gm3.monoSm,
+                color: cs.onSurface,
               ),
             ),
-          ),
-          const SizedBox(height: 6),
-          for (var i = 0; i < steps.length; i++)
-            _buildExpandedProcessStep(context, steps[i], i),
+          ],
         ],
       ),
     );
   }
 
   Widget _buildExpandedProcessStep(
-      BuildContext context, _ProcessStep step, int index) {
+    BuildContext context,
+    int groupId,
+    _ProcessStep step,
+    int index, {
+    _StickyFooterRegistry? footerRegistry,
+  }) {
     final s = AppStringsScope.of(context);
     final theme = Theme.of(context);
     final cs = theme.colorScheme;
     final surfaces = Gm3Surfaces.of(context);
+    final stepKey = '$groupId:$index';
+    final widgetKey = _processStepKeys.putIfAbsent(
+      stepKey,
+      () => GlobalKey(debugLabel: 'step_$stepKey'),
+    );
+    final isStepExpanded = _expandedProcessStepKeys.contains(stepKey);
+    final info = _summarizeProcessStep(step, s);
+
+    void toggleStep() {
+      setState(() {
+        if (!_expandedProcessStepKeys.add(stepKey)) {
+          _expandedProcessStepKeys.remove(stepKey);
+        }
+      });
+    }
+
+    final stepTimestampMs =
+        step.node?.item.createdAt ?? step.parentItem?.createdAt;
+
+    if (!isStepExpanded) {
+      return KeyedSubtree(
+        key: widgetKey,
+        child: _HoverProbe(
+          builder: (ctx, hovered) {
+            final formattedTs = stepTimestampMs != null
+                ? _MessageHoverTimeWrapperState.formatTimestamp(
+                    ctx,
+                    stepTimestampMs,
+                  )
+                : null;
+            return Container(
+              margin: const EdgeInsets.only(top: 4),
+              decoration: BoxDecoration(
+                color: surfaces.card,
+                borderRadius: BorderRadius.circular(Gm3.radiusSm),
+              ),
+              child: InkWell(
+                onTap: toggleStep,
+                borderRadius: BorderRadius.circular(Gm3.radiusSm),
+                child: Padding(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                  child: Row(
+                    children: [
+                      Icon(info.icon, size: 14, color: cs.primary),
+                      const SizedBox(width: 6),
+                      Gm3Pill(
+                        label: info.label,
+                        color: cs.primary,
+                        background: surfaces.chipFill,
+                        fontSize: 10.5,
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 6, vertical: 1),
+                      ),
+                      if (info.preview.isNotEmpty) ...[
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            info.preview,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: GoogleMaterialTheme.monoTextStyle(
+                              fontSize: Gm3.monoSm,
+                              color: cs.onSurfaceVariant,
+                            ),
+                          ),
+                        ),
+                      ] else
+                        const Spacer(),
+                      if (hovered && formattedTs != null) ...[
+                        const SizedBox(width: 8),
+                        _InlineHoverTimeChip(label: formattedTs),
+                      ],
+                      const SizedBox(width: 6),
+                      Icon(
+                        Icons.chevron_right_rounded,
+                        size: 16,
+                        color: cs.onSurfaceVariant,
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            );
+          },
+        ),
+      );
+    }
+
+    final linkedBanner = _buildLinkedCallBanner(context, groupId, stepKey, step);
 
     if (step.block != null && step.parentItem != null) {
       final b = step.block!;
-      final isThinking = b.type == 'thinking';
+      final isThinking = _isThinkingBlockType(b.type);
       final body = (b.toolInput ?? b.text ?? '').trim();
-      return Container(
-        margin: const EdgeInsets.only(top: 6),
-        padding: const EdgeInsets.all(10),
-        decoration: BoxDecoration(
-          color: surfaces.card,
+
+      Widget stepHeader(BuildContext ctx, bool isSticky) {
+        return InkWell(
+          onTap: toggleStep,
           borderRadius: BorderRadius.circular(Gm3.radiusSm),
-        ),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
+          child: Padding(
+            padding: const EdgeInsets.symmetric(vertical: 2),
+            child: Row(
               children: [
-                Icon(
-                  isThinking
-                      ? Icons.psychology_outlined
-                      : Icons.terminal_rounded,
-                  size: 14,
-                  color: cs.primary,
-                ),
+                Icon(info.icon, size: 14, color: cs.primary),
                 const SizedBox(width: 6),
-                Text(
-                  isThinking
-                      ? s.thinkingProcess
-                      : '${b.type}${b.toolName != null ? ': ${b.toolName}' : ''}',
-                  style: GoogleMaterialTheme.monoTextStyle(
-                    fontSize: Gm3.monoSm,
-                    fontWeight: FontWeight.w600,
-                    color: cs.primary,
-                  ),
+                Gm3Pill(
+                  label: info.label,
+                  color: cs.primary,
+                  background: surfaces.chipFill,
                 ),
+                if (info.preview.isNotEmpty) ...[
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      info.preview,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: GoogleMaterialTheme.monoTextStyle(
+                        fontSize: Gm3.monoSm,
+                        color: cs.onSurfaceVariant,
+                      ),
+                    ),
+                  ),
+                ] else
+                  const Spacer(),
+                const SizedBox(width: 6),
+                Icon(Icons.expand_more_rounded,
+                    size: 16, color: cs.onSurfaceVariant),
               ],
             ),
-            if (body.isNotEmpty) ...[
-              const SizedBox(height: 4),
-              SelectableText(
-                body,
-                style: GoogleMaterialTheme.monoTextStyle(
-                  fontSize: Gm3.monoSm,
-                  color: cs.onSurfaceVariant,
+          ),
+        );
+      }
+
+      return KeyedSubtree(
+        key: widgetKey,
+        child: _StickyLongBlockOverlay(
+          scrollController: _scrollController,
+          viewportKey: _scrollViewportKey,
+          stickyTopInset: 38.0,
+          stickyHeaderBackground: surfaces.card,
+          stickyHeaderPadding: const EdgeInsets.fromLTRB(10, 8, 10, 6),
+          containerPadding: const EdgeInsets.all(10),
+          containerMargin: const EdgeInsets.only(top: 6),
+          clipBorderRadius: BorderRadius.circular(Gm3.radiusSm),
+          containerDecoration: BoxDecoration(
+            color: surfaces.card,
+            borderRadius: BorderRadius.circular(Gm3.radiusSm),
+          ),
+          collapseRightOffset: 10.0,
+          isLongBlock: info.isLong,
+          collapseLabel: s.collapseProcessGroup,
+          onCollapse: toggleStep,
+          footerRegistrationId: 'step:$stepKey',
+          reportFooterTo: footerRegistry,
+          headerBuilder: stepHeader,
+          body: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              if (linkedBanner != null) linkedBanner,
+              if (body.isNotEmpty) ...[
+                const SizedBox(height: 6),
+                _buildProcessOrThinkingBody(
+                  context,
+                  body: body,
+                  isThinking: isThinking,
+                  language: b.type == 'file_diff' ? 'diff' : b.lang,
+                  textColor: cs.onSurfaceVariant,
                 ),
-              ),
+              ],
+              if (info.isLong) const SizedBox(height: 36),
             ],
-          ],
+          ),
         ),
       );
     }
@@ -1437,34 +2357,50 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
     final node = step.node!;
     final item = node.item;
     final processBlocks = item.blocks;
-    return Container(
-      margin: const EdgeInsets.only(top: 6),
-      padding: const EdgeInsets.all(10),
-      decoration: BoxDecoration(
-        color: surfaces.card,
+    final isThinkingItem = item.kind == 'thinking' ||
+        item.kind == 'reasoning' ||
+        item.kind == 'thought';
+
+    Widget nodeHeader(BuildContext ctx, bool isSticky) {
+      return InkWell(
+        onTap: toggleStep,
         borderRadius: BorderRadius.circular(Gm3.radiusSm),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
+        child: Padding(
+          padding: const EdgeInsets.symmetric(vertical: 2),
+          child: Row(
             children: [
+              Icon(info.icon, size: 14, color: cs.primary),
+              const SizedBox(width: 6),
               Gm3Pill(
-                label: item.toolName != null
-                    ? '${item.kind}: ${item.toolName}'
-                    : '${item.role.toUpperCase()} · ${item.kind}',
+                label: info.label,
                 color: cs.primary,
                 background: surfaces.chipFill,
               ),
-              const SizedBox(width: 8),
-              if (item.isSynthetic)
+              const SizedBox(width: 6),
+              if (item.isSynthetic) ...[
                 Gm3Pill(
                   label: s.syntheticBadge,
                   color: cs.onSurfaceVariant,
                   background: surfaces.inset,
                 ),
-              const Spacer(),
-              if (node.branchCount > 1)
+                const SizedBox(width: 6),
+              ],
+              if (info.preview.isNotEmpty)
+                Expanded(
+                  child: Text(
+                    info.preview,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: GoogleMaterialTheme.monoTextStyle(
+                      fontSize: Gm3.monoSm,
+                      color: cs.onSurfaceVariant,
+                    ),
+                  ),
+                )
+              else
+                const Spacer(),
+              if (node.branchCount > 1) ...[
+                const SizedBox(width: 6),
                 _BranchSelectorPill(
                   branchIndex: node.branchIndex,
                   branchCount: node.branchCount,
@@ -1479,27 +2415,63 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
                               node.branchIndex + 1)
                       : null,
                 ),
+              ],
+              const SizedBox(width: 4),
+              Icon(Icons.expand_more_rounded,
+                  size: 16, color: cs.onSurfaceVariant),
             ],
           ),
-          if (processBlocks.isNotEmpty) ...[
-            const SizedBox(height: 6),
-            for (final b in processBlocks) _buildProcessBlockContent(context, b),
-          ] else if (item.text.trim().isNotEmpty) ...[
-            const SizedBox(height: 6),
-            SelectableText(
-              item.text,
-              style: GoogleMaterialTheme.monoTextStyle(
-                fontSize: Gm3.monoSm,
-                color: cs.onSurface,
+        ),
+      );
+    }
+
+    return KeyedSubtree(
+      key: widgetKey,
+      child: _StickyLongBlockOverlay(
+        scrollController: _scrollController,
+        viewportKey: _scrollViewportKey,
+        stickyTopInset: 38.0,
+        stickyHeaderBackground: surfaces.card,
+        stickyHeaderPadding: const EdgeInsets.fromLTRB(10, 8, 10, 6),
+        containerPadding: const EdgeInsets.all(10),
+        containerMargin: const EdgeInsets.only(top: 6),
+        clipBorderRadius: BorderRadius.circular(Gm3.radiusSm),
+        containerDecoration: BoxDecoration(
+          color: surfaces.card,
+          borderRadius: BorderRadius.circular(Gm3.radiusSm),
+        ),
+        collapseRightOffset: 10.0,
+        isLongBlock: info.isLong,
+        collapseLabel: s.collapseProcessGroup,
+        onCollapse: toggleStep,
+        footerRegistrationId: 'step:$stepKey',
+        reportFooterTo: footerRegistry,
+        headerBuilder: nodeHeader,
+        body: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            if (linkedBanner != null) linkedBanner,
+            if (processBlocks.isNotEmpty) ...[
+              const SizedBox(height: 6),
+              for (final b in processBlocks)
+                _buildProcessBlockContent(context, b),
+            ] else if (item.text.trim().isNotEmpty) ...[
+              const SizedBox(height: 6),
+              _buildProcessOrThinkingBody(
+                context,
+                body: item.text,
+                isThinking: isThinkingItem,
+                textColor: cs.onSurface,
               ),
-            ),
+            ],
+            if (ArchiveDirectStore.extractPayloadSha256(item.payloadRef) !=
+                null) ...[
+              const SizedBox(height: 8),
+              _buildSpilledPayloadControl(item.payloadRef!),
+            ],
+            if (info.isLong) const SizedBox(height: 36),
           ],
-          if (ArchiveDirectStore.extractPayloadSha256(item.payloadRef) !=
-              null) ...[
-            const SizedBox(height: 8),
-            _buildSpilledPayloadControl(item.payloadRef!),
-          ],
-        ],
+        ),
       ),
     );
   }
@@ -1508,51 +2480,34 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
     final cs = Theme.of(context).colorScheme;
     final body = (block.toolInput ?? block.text ?? '').trim();
     if (body.isEmpty) return const SizedBox.shrink();
+    final isThinking = _isThinkingBlockType(block.type);
+    final displayText =
+        (!isThinking && block.toolName != null) ? '[${block.toolName}] $body' : body;
     return Padding(
       padding: const EdgeInsets.only(bottom: 4),
-      child: SelectableText(
-        block.toolName != null ? '[${block.toolName}] $body' : body,
-        style: GoogleMaterialTheme.monoTextStyle(
-          fontSize: Gm3.monoSm,
-          color: cs.onSurfaceVariant,
-        ),
+      child: _buildProcessOrThinkingBody(
+        context,
+        body: displayText,
+        isThinking: isThinking,
+        language: block.type == 'file_diff' ? 'diff' : block.lang,
+        textColor: cs.onSurfaceVariant,
       ),
     );
   }
 
-  Widget _wrapWithSentTimeTooltip(
+  Widget _wrapWithHoverTime(
     BuildContext context,
     MessageItem item,
-    Widget child,
-  ) {
-    final ts = item.createdAt;
-    if (ts == null || ts <= 0) return child;
-    final s = AppStringsScope.of(context);
-    final theme = Theme.of(context);
-    final cs = theme.colorScheme;
-    final surfaces = Gm3Surfaces.of(context);
-    final formatted = DateFormat('yyyy-MM-dd HH:mm:ss')
-        .format(DateTime.fromMillisecondsSinceEpoch(ts));
-
-    return Tooltip(
-      waitDuration: const Duration(seconds: 2),
-      preferBelow: false,
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-      decoration: BoxDecoration(
-        color: surfaces.card,
-        borderRadius: BorderRadius.circular(Gm3.radiusSm),
-        border: Border.all(color: surfaces.hairline.withOpacity(0.75)),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withOpacity(
-                theme.brightness == Brightness.dark ? 0.35 : 0.10),
-            blurRadius: 10,
-            offset: const Offset(0, 3),
-          ),
-        ],
-      ),
-      textStyle: theme.textTheme.labelMedium?.copyWith(color: cs.onSurface),
-      message: '${s.sentAtLabel}: $formatted',
+    Widget child, {
+    int? fallbackTimestamp,
+    required _HoverTimePlacement placement,
+  }) {
+    return _MessageHoverTimeWrapper(
+      timestampMs: item.createdAt,
+      fallbackTimestampMs: fallbackTimestamp,
+      placement: placement,
+      viewportKey: _scrollViewportKey,
+      label: AppStringsScope.of(context).invokedAtLabel,
       child: child,
     );
   }
@@ -1565,6 +2520,7 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
     required int branchCount,
     required bool isFinalTurnReply,
     required bool hideProcessBlocks,
+    int? fallbackTimestamp,
   }) {
     final s = AppStringsScope.of(context);
     final theme = Theme.of(context);
@@ -1585,7 +2541,7 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
     // User Prompt -> Google/Gemini compact right-aligned tonal pill bubble
     if (item.role == 'user') {
       return Padding(
-        padding: const EdgeInsets.only(bottom: 20),
+        padding: const EdgeInsets.only(bottom: 24),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.end,
           children: [
@@ -1593,7 +2549,7 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
               alignment: Alignment.centerRight,
               child: ConstrainedBox(
                 constraints: const BoxConstraints(maxWidth: 580),
-                child: _wrapWithSentTimeTooltip(
+                child: _wrapWithHoverTime(
                   context,
                   item,
                   Container(
@@ -1609,8 +2565,13 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
                         if (contentBlocks.isNotEmpty)
-                          for (final block in contentBlocks)
-                            _buildViewBlock(item, block)
+                          for (var i = 0; i < contentBlocks.length; i++)
+                            _buildViewBlock(
+                              item,
+                              contentBlocks[i],
+                              isLast: i == contentBlocks.length - 1 &&
+                                  attachmentBlocks.isEmpty,
+                            )
                         else
                           MarkdownProse(text: item.text),
                         if (attachmentBlocks.isNotEmpty) ...[
@@ -1623,6 +2584,8 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
                       ],
                     ),
                   ),
+                  fallbackTimestamp: fallbackTimestamp,
+                  placement: _HoverTimePlacement.leftOutside,
                 ),
               ),
             ),
@@ -1699,18 +2662,24 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
               ),
             ],
 
-            _wrapWithSentTimeTooltip(
+            _wrapWithHoverTime(
               context,
               item,
               contentBlocks.isNotEmpty
                   ? Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        for (final block in contentBlocks)
-                          _buildViewBlock(item, block),
+                        for (var i = 0; i < contentBlocks.length; i++)
+                          _buildViewBlock(
+                            item,
+                            contentBlocks[i],
+                            isLast: i == contentBlocks.length - 1,
+                          ),
                       ],
                     )
                   : MarkdownProse(text: item.text),
+              fallbackTimestamp: fallbackTimestamp,
+              placement: _HoverTimePlacement.bottomRightOutside,
             ),
 
             if (ArchiveDirectStore.extractPayloadSha256(item.payloadRef) !=
@@ -1827,94 +2796,141 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
   String _collectCopyableText(MessageItem item) {
     if (item.text.trim().isNotEmpty) return item.text;
     return item.blocks
-        .where((b) => b.type != 'thinking')
+        .where((b) => !_isThinkingBlockType(b.type))
         .map((b) => b.text ?? b.toolInput ?? '')
         .where((t) => t.trim().isNotEmpty)
         .join('\n\n');
   }
 
-  Widget _buildViewBlock(MessageItem item, ViewBlock block) {
+  Widget _buildViewBlock(
+    MessageItem item,
+    ViewBlock block, {
+    bool isLast = false,
+  }) {
     final s = AppStringsScope.of(context);
     final theme = Theme.of(context);
     final cs = theme.colorScheme;
     final surfaces = Gm3Surfaces.of(context);
 
-    if (block.type == 'thinking' ||
-        block.type == 'tool_use' ||
-        block.type == 'tool_call' ||
-        block.type == 'tool_result' ||
-        block.type == 'file_diff') {
-      final isThinking = block.type == 'thinking';
+    if (_isProcessBlockType(block.type)) {
+      final isThinking = _isThinkingBlockType(block.type);
       final title = isThinking
           ? s.thinkingProcess
           : '${block.type}${block.toolName != null ? ': ${block.toolName}' : ''}';
       final body = (block.toolInput ?? block.text ?? '').trim();
       final blockKey = '${item.id}_${block.idx}_${block.type}';
       final expanded = _expandedBlockKeys.contains(blockKey);
+      final isLong = body.length > 220 || '\n'.allMatches(body).length >= 5;
 
-      return Container(
-        margin: const EdgeInsets.only(bottom: 8),
-        decoration: BoxDecoration(
+      void toggleBlock() {
+        setState(() {
+          if (expanded) {
+            _expandedBlockKeys.remove(blockKey);
+          } else {
+            _expandedBlockKeys.add(blockKey);
+          }
+        });
+      }
+
+      if (!expanded || body.isEmpty) {
+        return Container(
+          margin: EdgeInsets.only(bottom: isLast ? 0 : 8),
+          decoration: BoxDecoration(
+            color: surfaces.inset,
+            borderRadius: BorderRadius.circular(Gm3.radiusMd),
+          ),
+          child: InkWell(
+            onTap: toggleBlock,
+            borderRadius: BorderRadius.circular(Gm3.radiusMd),
+            child: Padding(
+              padding:
+                  const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              child: Row(
+                children: [
+                  Icon(
+                    expanded
+                        ? Icons.expand_more_rounded
+                        : Icons.chevron_right_rounded,
+                    size: 16,
+                    color: cs.onSurfaceVariant,
+                  ),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Text(
+                      title,
+                      style: GoogleMaterialTheme.monoTextStyle(
+                        fontSize: Gm3.monoSm,
+                        fontWeight: FontWeight.w600,
+                        color: cs.primary,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        );
+      }
+
+      return _StickyLongBlockOverlay(
+        scrollController: _scrollController,
+        viewportKey: _scrollViewportKey,
+        stickyTopInset: 0.0,
+        stickyHeaderBackground: surfaces.inset,
+        stickyHeaderPadding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
+        containerPadding: const EdgeInsets.fromLTRB(12, 8, 12, 10),
+        containerMargin: EdgeInsets.only(bottom: isLast ? 0 : 8),
+        clipBorderRadius: BorderRadius.circular(Gm3.radiusMd),
+        containerDecoration: BoxDecoration(
           color: surfaces.inset,
           borderRadius: BorderRadius.circular(Gm3.radiusMd),
         ),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            InkWell(
-              onTap: () => setState(() {
-                if (expanded) {
-                  _expandedBlockKeys.remove(blockKey);
-                } else {
-                  _expandedBlockKeys.add(blockKey);
-                }
-              }),
-              borderRadius: BorderRadius.circular(Gm3.radiusMd),
-              child: Padding(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                child: Row(
-                  children: [
-                    Icon(
-                      expanded
-                          ? Icons.expand_more_rounded
-                          : Icons.chevron_right_rounded,
-                      size: 16,
-                      color: cs.onSurfaceVariant,
-                    ),
-                    const SizedBox(width: 6),
-                    Expanded(
-                      child: Text(
-                        title,
-                        style: GoogleMaterialTheme.monoTextStyle(
-                          fontSize: Gm3.monoSm,
-                          fontWeight: FontWeight.w600,
-                          color: cs.primary,
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
+        collapseRightOffset: 12.0,
+        isLongBlock: isLong,
+        collapseLabel: s.collapseProcessGroup,
+        onCollapse: toggleBlock,
+        headerBuilder: (ctx, isSticky) => InkWell(
+          onTap: toggleBlock,
+          borderRadius: BorderRadius.circular(Gm3.radiusMd),
+          child: Row(
+            children: [
+              Icon(
+                Icons.expand_more_rounded,
+                size: 16,
+                color: cs.onSurfaceVariant,
               ),
-            ),
-            if (expanded && body.isNotEmpty)
-              Padding(
-                padding: const EdgeInsets.fromLTRB(12, 0, 12, 10),
-                child: SelectableText(
-                  body,
+              const SizedBox(width: 6),
+              Expanded(
+                child: Text(
+                  title,
                   style: GoogleMaterialTheme.monoTextStyle(
                     fontSize: Gm3.monoSm,
-                    color: cs.onSurfaceVariant,
+                    fontWeight: FontWeight.w600,
+                    color: cs.primary,
                   ),
                 ),
               ),
-          ],
+            ],
+          ),
+        ),
+        body: Padding(
+          padding: EdgeInsets.only(top: 6, bottom: isLong ? 34 : 0),
+          child: _buildProcessOrThinkingBody(
+            context,
+            body: body,
+            isThinking: isThinking,
+            language: block.type == 'file_diff' ? 'diff' : block.lang,
+            textColor: cs.onSurfaceVariant,
+          ),
         ),
       );
     }
 
     if (block.type == 'code') {
-      return MarkdownCodeBlock(code: block.text ?? '', lang: block.lang);
+      return Padding(
+        padding: EdgeInsets.only(bottom: isLast ? 0 : 6),
+        child: MarkdownCodeBlock(code: block.text ?? '', lang: block.lang),
+      );
     }
 
     if (block.type == 'image') {
@@ -1923,7 +2939,7 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
           sha != null ? widget.store.resolveBlobFile(sha) : null;
       if (imgFile != null && imgFile.existsSync()) {
         return Padding(
-          padding: const EdgeInsets.only(bottom: 8),
+          padding: EdgeInsets.only(bottom: isLast ? 0 : 8),
           child: ClipRRect(
             borderRadius: BorderRadius.circular(Gm3.radiusMd),
             child: ConstrainedBox(
@@ -1934,7 +2950,7 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
         );
       }
       return Padding(
-        padding: const EdgeInsets.only(bottom: 8),
+        padding: EdgeInsets.only(bottom: isLast ? 0 : 8),
         child: Container(
           padding: const EdgeInsets.all(10),
           decoration: BoxDecoration(
@@ -1956,7 +2972,7 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
     }
 
     return Padding(
-      padding: const EdgeInsets.only(bottom: 6),
+      padding: EdgeInsets.only(bottom: isLast ? 0 : 6),
       child: MarkdownProse(text: block.text ?? ''),
     );
   }
@@ -1972,8 +2988,8 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
           color: Gm3Surfaces.of(context).inset,
           borderRadius: BorderRadius.circular(Gm3.radiusMd),
         ),
-        child: SelectableText(
-          loaded,
+        child: SyntaxHighlightedCodeText(
+          text: loaded,
           style: GoogleMaterialTheme.monoTextStyle(fontSize: Gm3.monoSm),
         ),
       );
@@ -2005,8 +3021,57 @@ class _CodexTurnJumpRail extends StatefulWidget {
 
 class _CodexTurnJumpRailState extends State<_CodexTurnJumpRail> {
   final GlobalKey _railKey = GlobalKey();
+  final ScrollController _railScrollCtrl = ScrollController();
   int? _hoveredIndex;
   double? _hoveredTickTop;
+  bool _canScrollUp = false;
+  bool _canScrollDown = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _railScrollCtrl.addListener(_syncScrollArrows);
+    WidgetsBinding.instance.addPostFrameCallback((_) => _syncScrollArrows());
+  }
+
+  @override
+  void didUpdateWidget(covariant _CodexTurnJumpRail oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.turns.length != widget.turns.length) {
+      WidgetsBinding.instance.addPostFrameCallback((_) => _syncScrollArrows());
+    }
+  }
+
+  @override
+  void dispose() {
+    _railScrollCtrl.removeListener(_syncScrollArrows);
+    _railScrollCtrl.dispose();
+    super.dispose();
+  }
+
+  void _syncScrollArrows() {
+    if (!mounted || !_railScrollCtrl.hasClients) return;
+    final pos = _railScrollCtrl.position;
+    final up = pos.pixels > 2.0;
+    final down = pos.pixels < pos.maxScrollExtent - 2.0;
+    if (up != _canScrollUp || down != _canScrollDown) {
+      setState(() {
+        _canScrollUp = up;
+        _canScrollDown = down;
+      });
+    }
+  }
+
+  void _scrollRailBy(double delta) {
+    if (!_railScrollCtrl.hasClients) return;
+    final pos = _railScrollCtrl.position;
+    final target = (pos.pixels + delta).clamp(0.0, pos.maxScrollExtent);
+    _railScrollCtrl.animateTo(
+      target,
+      duration: const Duration(milliseconds: 180),
+      curve: Curves.easeOutCubic,
+    );
+  }
 
   void _onHoverTick(BuildContext tickCtx, int turnIndex) {
     double? topOffset;
@@ -2058,58 +3123,119 @@ class _CodexTurnJumpRailState extends State<_CodexTurnJumpRail> {
                 alignment: Alignment.centerLeft,
                 child: ConstrainedBox(
                   constraints: const BoxConstraints(maxHeight: 460),
-                  child: SingleChildScrollView(
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        for (final turn in widget.turns)
-                          Builder(
-                            builder: (tickCtx) => MouseRegion(
-                              cursor: SystemMouseCursors.click,
-                              onEnter: (_) =>
-                                  _onHoverTick(tickCtx, turn.turnIndex),
-                              onExit: (_) => setState(() {
-                                if (_hoveredIndex == turn.turnIndex) {
-                                  _hoveredIndex = null;
-                                  _hoveredTickTop = null;
-                                }
-                              }),
-                              child: GestureDetector(
-                                behavior: HitTestBehavior.opaque,
-                                onTap: () => widget.onSelectTurn(turn),
-                                child: Container(
-                                  width: 28,
-                                  height: tickHeight,
-                                  alignment: Alignment.centerLeft,
-                                  child: AnimatedContainer(
-                                    duration: const Duration(milliseconds: 120),
-                                    width: (_hoveredIndex == turn.turnIndex ||
-                                            widget.activeTurnIndex ==
-                                                turn.turnIndex)
-                                        ? 22
-                                        : (turn.isCompacted ? 14 : 10),
-                                    height: (_hoveredIndex == turn.turnIndex ||
-                                            widget.activeTurnIndex ==
-                                                turn.turnIndex)
-                                        ? 2.5
-                                        : 2,
-                                    decoration: BoxDecoration(
-                                      color: (_hoveredIndex == turn.turnIndex ||
-                                              widget.activeTurnIndex ==
-                                                  turn.turnIndex)
-                                          ? cs.primary
-                                          : cs.outline.withOpacity(0.55),
-                                      borderRadius: BorderRadius.circular(
-                                          Gm3.radiusPill),
-                                    ),
-                                  ),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      if (_canScrollUp)
+                        InkWell(
+                          onTap: () => _scrollRailBy(-140),
+                          borderRadius: BorderRadius.circular(6),
+                          child: Container(
+                            width: 28,
+                            height: 20,
+                            alignment: Alignment.centerLeft,
+                            child: SizedBox(
+                              width: 14,
+                              height: 18,
+                              child: Center(
+                                child: Icon(
+                                  Icons.keyboard_arrow_up_rounded,
+                                  size: 14,
+                                  color: cs.onSurfaceVariant,
                                 ),
                               ),
                             ),
                           ),
-                      ],
-                    ),
+                        ),
+                      Flexible(
+                        child: ScrollConfiguration(
+                          behavior: ScrollConfiguration.of(context)
+                              .copyWith(scrollbars: false),
+                          child: SingleChildScrollView(
+                            controller: _railScrollCtrl,
+                            child: Column(
+                              mainAxisSize: MainAxisSize.min,
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                for (final turn in widget.turns)
+                                  Builder(
+                                    builder: (tickCtx) => MouseRegion(
+                                      cursor: SystemMouseCursors.click,
+                                      onEnter: (_) =>
+                                          _onHoverTick(tickCtx, turn.turnIndex),
+                                      onExit: (_) => setState(() {
+                                        if (_hoveredIndex == turn.turnIndex) {
+                                          _hoveredIndex = null;
+                                          _hoveredTickTop = null;
+                                        }
+                                      }),
+                                      child: GestureDetector(
+                                        behavior: HitTestBehavior.opaque,
+                                        onTap: () => widget.onSelectTurn(turn),
+                                        child: Container(
+                                          width: 28,
+                                          height: tickHeight,
+                                          alignment: Alignment.centerLeft,
+                                          child: AnimatedContainer(
+                                            duration: const Duration(
+                                                milliseconds: 120),
+                                            width: (_hoveredIndex ==
+                                                        turn.turnIndex ||
+                                                    widget.activeTurnIndex ==
+                                                        turn.turnIndex)
+                                                ? 22
+                                                : (turn.isCompacted ? 16 : 14),
+                                            height: (_hoveredIndex ==
+                                                        turn.turnIndex ||
+                                                    widget.activeTurnIndex ==
+                                                        turn.turnIndex)
+                                                ? 2.5
+                                                : 2,
+                                            decoration: BoxDecoration(
+                                              color: (_hoveredIndex ==
+                                                          turn.turnIndex ||
+                                                      widget.activeTurnIndex ==
+                                                          turn.turnIndex)
+                                                  ? cs.primary
+                                                  : cs.outline
+                                                      .withOpacity(0.55),
+                                              borderRadius:
+                                                  BorderRadius.circular(
+                                                      Gm3.radiusPill),
+                                            ),
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ),
+                      if (_canScrollDown)
+                        InkWell(
+                          onTap: () => _scrollRailBy(140),
+                          borderRadius: BorderRadius.circular(6),
+                          child: Container(
+                            width: 28,
+                            height: 20,
+                            alignment: Alignment.centerLeft,
+                            child: SizedBox(
+                              width: 14,
+                              height: 18,
+                              child: Center(
+                                child: Icon(
+                                  Icons.keyboard_arrow_down_rounded,
+                                  size: 14,
+                                  color: cs.onSurfaceVariant,
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                    ],
                   ),
                 ),
               ),
@@ -2272,18 +3398,685 @@ class _ActiveChainNode {
   });
 }
 
+enum _HoverTimePlacement { leftOutside, bottomRightOutside }
+
+class _HoverProbe extends StatefulWidget {
+  final Widget Function(BuildContext context, bool hovered) builder;
+
+  const _HoverProbe({required this.builder});
+
+  @override
+  State<_HoverProbe> createState() => _HoverProbeState();
+}
+
+class _HoverProbeState extends State<_HoverProbe> {
+  static const Duration _hoverDelay = Duration(milliseconds: 1500);
+  bool _hovered = false;
+  Timer? _hoverTimer;
+
+  @override
+  void dispose() {
+    _hoverTimer?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return MouseRegion(
+      onEnter: (_) {
+        _hoverTimer?.cancel();
+        if (_hovered) return;
+        _hoverTimer = Timer(_hoverDelay, () {
+          if (mounted && !_hovered) setState(() => _hovered = true);
+        });
+      },
+      onExit: (_) {
+        _hoverTimer?.cancel();
+        _hoverTimer = null;
+        if (_hovered) setState(() => _hovered = false);
+      },
+      child: widget.builder(context, _hovered),
+    );
+  }
+}
+
+class _InlineHoverTimeChip extends StatelessWidget {
+  final String label;
+
+  const _InlineHoverTimeChip({required this.label});
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final cs = theme.colorScheme;
+    final surfaces = Gm3Surfaces.of(context);
+    return IgnorePointer(
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+        decoration: BoxDecoration(
+          color: surfaces.card,
+          borderRadius: BorderRadius.circular(Gm3.radiusPill),
+          border: Border.all(color: surfaces.hairline.withOpacity(0.7)),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.schedule_rounded, size: 11, color: cs.primary),
+            const SizedBox(width: 4),
+            Text(
+              label,
+              style: theme.textTheme.labelSmall?.copyWith(
+                fontSize: 10.5,
+                color: cs.onSurfaceVariant,
+                fontFeatures: const [FontFeature.tabularFigures()],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _MessageHoverTimeWrapper extends StatefulWidget {
+  final int? timestampMs;
+  final int? fallbackTimestampMs;
+  final _HoverTimePlacement placement;
+  final GlobalKey? viewportKey;
+  final String label;
+  final Widget child;
+
+  const _MessageHoverTimeWrapper({
+    required this.timestampMs,
+    required this.fallbackTimestampMs,
+    required this.placement,
+    this.viewportKey,
+    required this.label,
+    required this.child,
+  });
+
+  @override
+  State<_MessageHoverTimeWrapper> createState() =>
+      _MessageHoverTimeWrapperState();
+}
+
+class _MessageHoverTimeWrapperState extends State<_MessageHoverTimeWrapper> {
+  static const Duration _hoverDelay = Duration(milliseconds: 1500);
+  bool _hovered = false;
+  bool _hasLeftBlankSpace = true;
+  Timer? _hoverTimer;
+
+  @override
+  void dispose() {
+    _hoverTimer?.cancel();
+    super.dispose();
+  }
+
+  static int? _normalizeEpochMs(int? raw) {
+    if (raw == null || raw <= 0) return null;
+    return raw < 100000000000 ? raw * 1000 : raw;
+  }
+
+  static String? formatTimestamp(BuildContext context, int? raw) {
+    final effectiveTs = _normalizeEpochMs(raw);
+    if (effectiveTs == null) return null;
+    final s = AppStringsScope.of(context);
+    final formatted = DateFormat('yyyy-MM-dd HH:mm:ss')
+        .format(DateTime.fromMillisecondsSinceEpoch(effectiveTs));
+    return '${s.invokedAtLabel}: $formatted';
+  }
+
+  void _updateLeftSpaceAvailability() {
+    if (widget.placement != _HoverTimePlacement.leftOutside) return;
+    final box = context.findRenderObject() as RenderBox?;
+    if (box == null || !box.hasSize) return;
+    final viewportBox =
+        widget.viewportKey?.currentContext?.findRenderObject() as RenderBox?;
+    final leftOffset = viewportBox != null
+        ? box.localToGlobal(Offset.zero, ancestor: viewportBox).dx
+        : box.localToGlobal(Offset.zero).dx;
+    final hasRoom = leftOffset >= 186.0;
+    if (hasRoom != _hasLeftBlankSpace && mounted) {
+      setState(() => _hasLeftBlankSpace = hasRoom);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final effectiveTs = _normalizeEpochMs(widget.timestampMs) ??
+        _normalizeEpochMs(widget.fallbackTimestampMs);
+    if (effectiveTs == null) return widget.child;
+
+    final theme = Theme.of(context);
+    final cs = theme.colorScheme;
+    final surfaces = Gm3Surfaces.of(context);
+    final formatted = DateFormat('yyyy-MM-dd HH:mm:ss')
+        .format(DateTime.fromMillisecondsSinceEpoch(effectiveTs));
+    final text = '${widget.label}: $formatted';
+
+    final placeLeft =
+        widget.placement == _HoverTimePlacement.leftOutside &&
+            _hasLeftBlankSpace;
+
+    final badge = IgnorePointer(
+      child: Container(
+        padding: const EdgeInsets.symmetric(
+          horizontal: 8,
+          vertical: 3,
+        ),
+        decoration: BoxDecoration(
+          color: surfaces.card,
+          borderRadius: BorderRadius.circular(Gm3.radiusPill),
+          border: Border.all(
+            color: surfaces.hairline.withOpacity(0.7),
+          ),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withOpacity(
+                  theme.brightness == Brightness.dark ? 0.30 : 0.08),
+              blurRadius: 8,
+              offset: const Offset(0, 2),
+            ),
+          ],
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              Icons.schedule_rounded,
+              size: 11,
+              color: cs.primary,
+            ),
+            const SizedBox(width: 4),
+            Text(
+              text,
+              style: theme.textTheme.labelSmall?.copyWith(
+                fontSize: 10.5,
+                color: cs.onSurfaceVariant,
+                fontFeatures: const [FontFeature.tabularFigures()],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+
+    return MouseRegion(
+      onEnter: (_) {
+        _hoverTimer?.cancel();
+        _updateLeftSpaceAvailability();
+        if (_hovered) return;
+        _hoverTimer = Timer(_hoverDelay, () {
+          if (!mounted || _hovered) return;
+          _updateLeftSpaceAvailability();
+          setState(() => _hovered = true);
+        });
+      },
+      onExit: (_) {
+        _hoverTimer?.cancel();
+        _hoverTimer = null;
+        if (_hovered) setState(() => _hovered = false);
+      },
+      child: Stack(
+        clipBehavior: Clip.none,
+        children: [
+          widget.child,
+          if (_hovered && placeLeft)
+            Positioned(
+              top: 8,
+              left: 0,
+              child: FractionalTranslation(
+                translation: const Offset(-1.0, 0.0),
+                child: Padding(
+                  padding: const EdgeInsets.only(right: 10),
+                  child: badge,
+                ),
+              ),
+            )
+          else if (_hovered)
+            Positioned(
+              top: -24,
+              right: 4,
+              child: badge,
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+class _StickyFooterRegistry extends ValueNotifier<Set<String>> {
+  _StickyFooterRegistry() : super(const <String>{});
+  bool _disposed = false;
+
+  void setActive(String id, bool active) {
+    if (_disposed) return;
+    final has = value.contains(id);
+    if (has == active) return;
+    final next = Set<String>.from(value);
+    if (active) {
+      next.add(id);
+    } else {
+      next.remove(id);
+    }
+    value = next;
+  }
+
+  @override
+  void dispose() {
+    _disposed = true;
+    super.dispose();
+  }
+}
+
+class _ProcessGroupStickyHost extends StatefulWidget {
+  final Widget Function(
+    BuildContext context,
+    _StickyFooterRegistry footerRegistry,
+  ) builder;
+
+  const _ProcessGroupStickyHost({required this.builder});
+
+  @override
+  State<_ProcessGroupStickyHost> createState() =>
+      _ProcessGroupStickyHostState();
+}
+
+class _ProcessGroupStickyHostState extends State<_ProcessGroupStickyHost> {
+  final _StickyFooterRegistry _registry = _StickyFooterRegistry();
+
+  @override
+  void dispose() {
+    _registry.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return widget.builder(context, _registry);
+  }
+}
+
+class _StickyBlockMetrics {
+  final double? stickyHeaderTop;
+  final double? collapseTop;
+
+  const _StickyBlockMetrics({
+    this.stickyHeaderTop,
+    this.collapseTop,
+  });
+
+  static const empty = _StickyBlockMetrics();
+
+  bool approxEquals(_StickyBlockMetrics other) {
+    final hSame = (stickyHeaderTop == null && other.stickyHeaderTop == null) ||
+        (stickyHeaderTop != null &&
+            other.stickyHeaderTop != null &&
+            (stickyHeaderTop! - other.stickyHeaderTop!).abs() < 0.5);
+    final cSame = (collapseTop == null && other.collapseTop == null) ||
+        (collapseTop != null &&
+            other.collapseTop != null &&
+            (collapseTop! - other.collapseTop!).abs() < 0.5);
+    return hSame && cSame;
+  }
+}
+
+class _StickyLongBlockOverlay extends StatefulWidget {
+  final ScrollController scrollController;
+  final GlobalKey viewportKey;
+  final double stickyTopInset;
+  final Color stickyHeaderBackground;
+  final EdgeInsetsGeometry stickyHeaderPadding;
+  final EdgeInsetsGeometry containerPadding;
+  final EdgeInsetsGeometry containerMargin;
+  final BorderRadius? clipBorderRadius;
+  final BoxDecoration containerDecoration;
+  final double collapseRightOffset;
+  final bool isLongBlock;
+  final String collapseLabel;
+  final VoidCallback onCollapse;
+  final String? footerRegistrationId;
+  final _StickyFooterRegistry? reportFooterTo;
+  final _StickyFooterRegistry? suppressFooterWhenNonEmpty;
+  final Widget Function(BuildContext context, bool isSticky) headerBuilder;
+  final Widget body;
+
+  const _StickyLongBlockOverlay({
+    required this.scrollController,
+    required this.viewportKey,
+    required this.stickyTopInset,
+    required this.stickyHeaderBackground,
+    required this.stickyHeaderPadding,
+    required this.containerPadding,
+    required this.containerMargin,
+    this.clipBorderRadius,
+    required this.containerDecoration,
+    required this.collapseRightOffset,
+    required this.isLongBlock,
+    required this.collapseLabel,
+    required this.onCollapse,
+    this.footerRegistrationId,
+    this.reportFooterTo,
+    this.suppressFooterWhenNonEmpty,
+    required this.headerBuilder,
+    required this.body,
+  });
+
+  @override
+  State<_StickyLongBlockOverlay> createState() =>
+      _StickyLongBlockOverlayState();
+}
+
+class _StickyLongBlockOverlayState extends State<_StickyLongBlockOverlay> {
+  final GlobalKey _blockKey = GlobalKey();
+  final GlobalKey _headerKey = GlobalKey();
+  final ValueNotifier<_StickyBlockMetrics> _metrics =
+      ValueNotifier<_StickyBlockMetrics>(_StickyBlockMetrics.empty);
+  bool _recomputeScheduled = false;
+  bool _reportedFooterActive = false;
+
+  @override
+  void initState() {
+    super.initState();
+    widget.scrollController.addListener(_scheduleRecompute);
+    _scheduleRecompute();
+  }
+
+  @override
+  void didUpdateWidget(covariant _StickyLongBlockOverlay oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.scrollController != widget.scrollController) {
+      oldWidget.scrollController.removeListener(_scheduleRecompute);
+      widget.scrollController.addListener(_scheduleRecompute);
+    }
+    _scheduleRecompute();
+  }
+
+  @override
+  void dispose() {
+    widget.scrollController.removeListener(_scheduleRecompute);
+    if (_reportedFooterActive &&
+        widget.reportFooterTo != null &&
+        widget.footerRegistrationId != null) {
+      final registry = widget.reportFooterTo!;
+      final id = widget.footerRegistrationId!;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        registry.setActive(id, false);
+      });
+    }
+    _metrics.dispose();
+    super.dispose();
+  }
+
+  void _scheduleRecompute() {
+    if (_recomputeScheduled || !mounted) return;
+    _recomputeScheduled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _recomputeScheduled = false;
+      _recompute();
+    });
+  }
+
+  void _recompute() {
+    if (!mounted) return;
+    final blockBox = _blockKey.currentContext?.findRenderObject() as RenderBox?;
+    final viewportBox =
+        widget.viewportKey.currentContext?.findRenderObject() as RenderBox?;
+    if (blockBox == null ||
+        !blockBox.hasSize ||
+        viewportBox == null ||
+        !viewportBox.hasSize) {
+      return;
+    }
+
+    final headerBox =
+        _headerKey.currentContext?.findRenderObject() as RenderBox?;
+    final resolvedHeaderPad =
+        widget.stickyHeaderPadding.resolve(Directionality.of(context));
+    final rawHeaderH =
+        (headerBox != null && headerBox.hasSize) ? headerBox.size.height : 28.0;
+    final stickyHeaderH = rawHeaderH + resolvedHeaderPad.vertical;
+
+    final viewportH = viewportBox.size.height;
+    final blockTopInViewport =
+        blockBox.localToGlobal(Offset.zero, ancestor: viewportBox).dy;
+    final blockH = blockBox.size.height;
+    final blockBottomInViewport = blockTopInViewport + blockH;
+
+    double? stickyHeaderTop;
+    if (blockH >= stickyHeaderH + 56.0 &&
+        blockTopInViewport < widget.stickyTopInset - 0.5 &&
+        blockBottomInViewport > widget.stickyTopInset + stickyHeaderH + 20.0) {
+      stickyHeaderTop = (widget.stickyTopInset - blockTopInViewport).clamp(
+        0.0,
+        math.max(0.0, blockH - stickyHeaderH - 4.0),
+      );
+    }
+
+    const double collapseBtnH = 28.0;
+    const double bottomMargin = 10.0;
+    final bool qualifiesAsLong =
+        widget.isLongBlock || blockH >= math.min(320.0, viewportH * 0.55);
+    final double effectiveTop = math.max(blockTopInViewport, widget.stickyTopInset);
+    final bool hasVisibleRoom = blockBottomInViewport >
+            effectiveTop + stickyHeaderH + collapseBtnH + 18.0 &&
+        blockTopInViewport < viewportH - 52.0;
+
+    double? collapseTop;
+    if (qualifiesAsLong && hasVisibleRoom) {
+      final viewportBottomInBlock = viewportH - blockTopInViewport;
+      final desiredTop = viewportBottomInBlock - collapseBtnH - 14.0;
+      final minTop = (stickyHeaderTop ?? 0.0) + stickyHeaderH + 8.0;
+      final maxTop = math.max(minTop, blockH - collapseBtnH - bottomMargin);
+      collapseTop = desiredTop.clamp(minTop, maxTop);
+    }
+
+    final next = _StickyBlockMetrics(
+      stickyHeaderTop: stickyHeaderTop,
+      collapseTop: collapseTop,
+    );
+    if (!next.approxEquals(_metrics.value)) {
+      _metrics.value = next;
+    }
+
+    final shouldReportActive = collapseTop != null;
+    if (shouldReportActive != _reportedFooterActive &&
+        widget.reportFooterTo != null &&
+        widget.footerRegistrationId != null) {
+      _reportedFooterActive = shouldReportActive;
+      widget.reportFooterTo!.setActive(
+        widget.footerRegistrationId!,
+        shouldReportActive,
+      );
+    }
+  }
+
+  Widget _buildFloatingCollapsePositioned(BuildContext context, double top) {
+    final theme = Theme.of(context);
+    final cs = theme.colorScheme;
+    final surfaces = Gm3Surfaces.of(context);
+    final isDark = theme.brightness == Brightness.dark;
+
+    return Positioned(
+      top: top,
+      right: widget.collapseRightOffset,
+      child: Material(
+        elevation: 4,
+        shadowColor: Colors.black.withOpacity(isDark ? 0.45 : 0.16),
+        color: surfaces.inset,
+        borderRadius: BorderRadius.circular(Gm3.radiusPill),
+        child: InkWell(
+          onTap: widget.onCollapse,
+          borderRadius: BorderRadius.circular(Gm3.radiusPill),
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(Gm3.radiusPill),
+              border: Border.all(
+                color: cs.primary.withOpacity(0.35),
+              ),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(
+                  Icons.keyboard_arrow_up_rounded,
+                  size: 15,
+                  color: cs.primary,
+                ),
+                const SizedBox(width: 4),
+                Text(
+                  widget.collapseLabel,
+                  style: theme.textTheme.labelSmall?.copyWith(
+                    color: cs.primary,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final surfaces = Gm3Surfaces.of(context);
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+
+    return Padding(
+      padding: widget.containerMargin,
+      child: Container(
+        key: _blockKey,
+        decoration: widget.containerDecoration,
+        child: ClipRRect(
+          borderRadius: widget.clipBorderRadius ?? BorderRadius.zero,
+          child: Stack(
+            clipBehavior: Clip.none,
+            children: [
+              Padding(
+                padding: widget.containerPadding,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    ValueListenableBuilder<_StickyBlockMetrics>(
+                      valueListenable: _metrics,
+                      builder: (context, m, _) {
+                        final isSticky = m.stickyHeaderTop != null;
+                        return IgnorePointer(
+                          ignoring: isSticky,
+                          child: Opacity(
+                            opacity: isSticky ? 0.0 : 1.0,
+                            child: KeyedSubtree(
+                              key: _headerKey,
+                              child: widget.headerBuilder(context, false),
+                            ),
+                          ),
+                        );
+                      },
+                    ),
+                    widget.body,
+                  ],
+                ),
+              ),
+              ValueListenableBuilder<_StickyBlockMetrics>(
+                valueListenable: _metrics,
+                builder: (context, m, _) {
+                  final top = m.stickyHeaderTop;
+                  if (top == null) return const SizedBox.shrink();
+                  return Positioned(
+                    top: top,
+                    left: 0,
+                    right: 0,
+                    child: Material(
+                      color: widget.stickyHeaderBackground,
+                      elevation: 2,
+                      shadowColor:
+                          Colors.black.withOpacity(isDark ? 0.35 : 0.10),
+                      child: Container(
+                        padding: widget.stickyHeaderPadding,
+                        decoration: BoxDecoration(
+                          border: Border(
+                            bottom: BorderSide(
+                              color: surfaces.hairline.withOpacity(0.55),
+                            ),
+                          ),
+                        ),
+                        child: widget.headerBuilder(context, true),
+                      ),
+                    ),
+                  );
+                },
+              ),
+              ValueListenableBuilder<_StickyBlockMetrics>(
+                valueListenable: _metrics,
+                builder: (context, m, _) {
+                  final cTop = m.collapseTop;
+                  if (cTop == null) return const SizedBox.shrink();
+                  if (widget.suppressFooterWhenNonEmpty != null) {
+                    return ValueListenableBuilder<Set<String>>(
+                      valueListenable: widget.suppressFooterWhenNonEmpty!,
+                      builder: (context, activeChildren, __) {
+                        if (activeChildren.isNotEmpty) {
+                          return const SizedBox.shrink();
+                        }
+                        return _buildFloatingCollapsePositioned(context, cTop);
+                      },
+                    );
+                  }
+                  return _buildFloatingCollapsePositioned(context, cTop);
+                },
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class _ProcessStep {
   final _ActiveChainNode? node;
   final MessageItem? parentItem;
   final ViewBlock? block;
+  final int stepIndex;
+  final _ProcessStep? linkedCall;
+  final int? linkedCallIndex;
+  final ViewBlock? linkedCallBlock;
 
-  const _ProcessStep._({this.node, this.parentItem, this.block});
+  const _ProcessStep._({
+    this.node,
+    this.parentItem,
+    this.block,
+    this.stepIndex = 0,
+    this.linkedCall,
+    this.linkedCallIndex,
+    this.linkedCallBlock,
+  });
 
   factory _ProcessStep.item(_ActiveChainNode node) =>
       _ProcessStep._(node: node);
 
   factory _ProcessStep.block(MessageItem parentItem, ViewBlock block) =>
       _ProcessStep._(parentItem: parentItem, block: block);
+
+  _ProcessStep withLink({
+    required int stepIndex,
+    _ProcessStep? linkedCall,
+    int? linkedCallIndex,
+    ViewBlock? linkedCallBlock,
+  }) {
+    return _ProcessStep._(
+      node: node,
+      parentItem: parentItem,
+      block: block,
+      stepIndex: stepIndex,
+      linkedCall: linkedCall,
+      linkedCallIndex: linkedCallIndex,
+      linkedCallBlock: linkedCallBlock,
+    );
+  }
 }
 
 class _TimelineEntry {
@@ -2291,6 +4084,7 @@ class _TimelineEntry {
   final GlobalKey? anchorKey;
   final bool isFinalTurnReply;
   final bool hideProcessBlocks;
+  final int? fallbackTimestamp;
   final int groupId;
   final List<_ProcessStep>? processSteps;
 
@@ -2299,6 +4093,7 @@ class _TimelineEntry {
     this.anchorKey,
     this.isFinalTurnReply = false,
     this.hideProcessBlocks = false,
+    this.fallbackTimestamp,
     this.groupId = 0,
     this.processSteps,
   });
@@ -2308,12 +4103,14 @@ class _TimelineEntry {
     GlobalKey? anchorKey,
     required bool isFinalTurnReply,
     required bool hideProcessBlocks,
+    int? fallbackTimestamp,
   }) {
     return _TimelineEntry._(
       node: node,
       anchorKey: anchorKey,
       isFinalTurnReply: isFinalTurnReply,
       hideProcessBlocks: hideProcessBlocks,
+      fallbackTimestamp: fallbackTimestamp,
     );
   }
 
@@ -2346,4 +4143,452 @@ class _TurnDirectoryEntry {
     required this.isCompacted,
     required this.branchCount,
   });
+}
+
+class ConversationContextCategoryStats {
+  final int chars;
+  final int tokens;
+
+  const ConversationContextCategoryStats({
+    required this.chars,
+    required this.tokens,
+  });
+
+  double shareOf(int totalTokens) {
+    if (totalTokens <= 0 || tokens <= 0) return 0;
+    return (tokens / totalTokens) * 100.0;
+  }
+}
+
+class ConversationContextStats {
+  final int totalChars;
+  final int totalTokens;
+  final int inputChars;
+  final int outputChars;
+  final int inputTokens;
+  final int outputTokens;
+  final ConversationContextCategoryStats user;
+  final ConversationContextCategoryStats assistant;
+  final ConversationContextCategoryStats thinking;
+  final ConversationContextCategoryStats tool;
+  final ConversationContextCategoryStats system;
+
+  const ConversationContextStats({
+    required this.totalChars,
+    required this.totalTokens,
+    required this.inputChars,
+    required this.outputChars,
+    required this.inputTokens,
+    required this.outputTokens,
+    required this.user,
+    required this.assistant,
+    required this.thinking,
+    required this.tool,
+    required this.system,
+  });
+
+  double get inputPct =>
+      totalTokens > 0 ? (inputTokens / totalTokens) * 100.0 : 0;
+
+  double get outputPct =>
+      totalTokens > 0 ? (outputTokens / totalTokens) * 100.0 : 0;
+}
+
+int estimateTokenCount(String text) {
+  if (text.isEmpty) return 0;
+  var cjk = 0;
+  var nonWhitespaceOther = 0;
+  for (final rune in text.runes) {
+    if ((rune >= 0x4E00 && rune <= 0x9FFF) ||
+        (rune >= 0x3400 && rune <= 0x4DBF) ||
+        (rune >= 0xF900 && rune <= 0xFAFF) ||
+        (rune >= 0x3040 && rune <= 0x30FF) ||
+        (rune >= 0xAC00 && rune <= 0xD7AF)) {
+      cjk++;
+    } else if (rune > 32) {
+      nonWhitespaceOther++;
+    }
+  }
+  if (cjk == 0 && nonWhitespaceOther == 0) {
+    return math.max(1, (text.length / 4).ceil());
+  }
+  return cjk + (nonWhitespaceOther / 3.8).ceil();
+}
+
+ConversationContextStats computeConversationContextStats(
+  List<MessageItem> items,
+) {
+  var userChars = 0;
+  var userTokens = 0;
+  var assistantChars = 0;
+  var assistantTokens = 0;
+  var thinkingChars = 0;
+  var thinkingTokens = 0;
+  var toolCallChars = 0;
+  var toolCallTokens = 0;
+  var toolResultChars = 0;
+  var toolResultTokens = 0;
+  var systemChars = 0;
+  var systemTokens = 0;
+
+  void addUser(String text) {
+    final t = text.trim();
+    if (t.isEmpty) return;
+    userChars += t.length;
+    userTokens += estimateTokenCount(t);
+  }
+
+  void addAssistant(String text) {
+    final t = text.trim();
+    if (t.isEmpty) return;
+    assistantChars += t.length;
+    assistantTokens += estimateTokenCount(t);
+  }
+
+  void addThinking(String text) {
+    final t = text.trim();
+    if (t.isEmpty) return;
+    thinkingChars += t.length;
+    thinkingTokens += estimateTokenCount(t);
+  }
+
+  void addToolCall(String text) {
+    final t = text.trim();
+    if (t.isEmpty) return;
+    toolCallChars += t.length;
+    toolCallTokens += estimateTokenCount(t);
+  }
+
+  void addToolResult(String text) {
+    final t = text.trim();
+    if (t.isEmpty) return;
+    toolResultChars += t.length;
+    toolResultTokens += estimateTokenCount(t);
+  }
+
+  void addSystem(String text) {
+    final t = text.trim();
+    if (t.isEmpty) return;
+    systemChars += t.length;
+    systemTokens += estimateTokenCount(t);
+  }
+
+  String fallbackItemText(MessageItem item) {
+    if (item.text.trim().isNotEmpty) return item.text;
+    return item.blocks
+        .map((b) => (b.text ?? '').trim())
+        .where((s) => s.isNotEmpty)
+        .join('\n');
+  }
+
+  void splitThinkTagsAndProse(String raw) {
+    var pos = 0;
+    for (final m
+        in _BranchTreeReaderViewState._thinkTagBlockRe.allMatches(raw)) {
+      if (m.start > pos) {
+        addAssistant(raw.substring(pos, m.start));
+      }
+      final tagBody = (m.group(0) ?? '')
+          .replaceAll(
+            RegExp(r'</?(?:think|thought|thinking)>', caseSensitive: false),
+            '',
+          )
+          .trim();
+      addThinking(tagBody);
+      pos = m.end;
+    }
+    if (pos < raw.length) {
+      addAssistant(raw.substring(pos));
+    }
+  }
+
+  for (final item in items) {
+    final k = item.kind.toLowerCase();
+    if (item.role == 'system' ||
+        item.isSynthetic ||
+        (item.role == 'user' &&
+            !_BranchTreeReaderViewState._isRealUserTurn(item)) ||
+        k == 'system_note' ||
+        k == 'summary' ||
+        k == 'compaction' ||
+        k == 'turn_context' ||
+        k == 'notice') {
+      addSystem(fallbackItemText(item));
+      continue;
+    }
+
+    if (_BranchTreeReaderViewState._isRealUserTurn(item)) {
+      addUser(fallbackItemText(item));
+      continue;
+    }
+
+    if (item.role == 'tool' || k == 'tool_result') {
+      addToolResult(fallbackItemText(item));
+      continue;
+    }
+
+    if (k == 'tool_call' || k == 'file_change' || k == 'web_search') {
+      addToolCall(fallbackItemText(item));
+      continue;
+    }
+
+    if (k == 'thinking' || k == 'reasoning' || k == 'thought') {
+      addThinking(fallbackItemText(item));
+      continue;
+    }
+
+    if (item.blocks.isNotEmpty) {
+      var sawOutputBlockText = false;
+      for (final b in item.blocks) {
+        final bt = (b.text ?? '').trim();
+        final payloadText = bt.isNotEmpty ? bt : (b.toolName ?? '');
+        if (_BranchTreeReaderViewState._isThinkingBlockType(b.type)) {
+          addThinking(payloadText);
+        } else if (b.type == 'tool_result') {
+          addToolResult(payloadText);
+        } else if (b.type == 'tool_use' ||
+            b.type == 'tool_call' ||
+            b.type == 'file_diff') {
+          addToolCall(payloadText);
+        } else if (payloadText.isNotEmpty) {
+          sawOutputBlockText = true;
+          splitThinkTagsAndProse(payloadText);
+        }
+      }
+      if (!sawOutputBlockText &&
+          _BranchTreeReaderViewState._hasSubstantiveAssistantOutput(item) &&
+          item.text.trim().isNotEmpty) {
+        splitThinkTagsAndProse(item.text);
+      }
+    } else if (item.text.trim().isNotEmpty) {
+      splitThinkTagsAndProse(item.text);
+    }
+  }
+
+  final toolChars = toolCallChars + toolResultChars;
+  final toolTokens = toolCallTokens + toolResultTokens;
+  final inputChars = userChars + systemChars + toolResultChars;
+  final outputChars = assistantChars + thinkingChars + toolCallChars;
+  final inputTokens = userTokens + systemTokens + toolResultTokens;
+  final outputTokens = assistantTokens + thinkingTokens + toolCallTokens;
+  final totalChars = inputChars + outputChars;
+  final totalTokens = inputTokens + outputTokens;
+
+  return ConversationContextStats(
+    totalChars: totalChars,
+    totalTokens: totalTokens,
+    inputChars: inputChars,
+    outputChars: outputChars,
+    inputTokens: inputTokens,
+    outputTokens: outputTokens,
+    user: ConversationContextCategoryStats(chars: userChars, tokens: userTokens),
+    assistant: ConversationContextCategoryStats(
+      chars: assistantChars,
+      tokens: assistantTokens,
+    ),
+    thinking: ConversationContextCategoryStats(
+      chars: thinkingChars,
+      tokens: thinkingTokens,
+    ),
+    tool: ConversationContextCategoryStats(chars: toolChars, tokens: toolTokens),
+    system: ConversationContextCategoryStats(
+      chars: systemChars,
+      tokens: systemTokens,
+    ),
+  );
+}
+
+class _ConversationContextStatsBar extends StatelessWidget {
+  final ConversationContextStats stats;
+  final bool expanded;
+  final VoidCallback onToggle;
+
+  const _ConversationContextStatsBar({
+    required this.stats,
+    required this.expanded,
+    required this.onToggle,
+  });
+
+  static String _fmtCompact(int value) {
+    if (value < 1000) return '$value';
+    if (value < 100000) return '${(value / 1000).toStringAsFixed(1)}k';
+    return '${(value / 1000).round()}k';
+  }
+
+  static String _fmtPct(double pct) {
+    if (pct <= 0) return '0%';
+    if (pct < 1.0) return '<1%';
+    return '${pct.round()}%';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final s = AppStringsScope.of(context);
+    final theme = Theme.of(context);
+    final cs = theme.colorScheme;
+    final surfaces = Gm3Surfaces.of(context);
+    final totalTok = stats.totalTokens;
+
+    final categories = <({
+      String key,
+      String label,
+      Color color,
+      ConversationContextCategoryStats stat,
+    })>[
+      (
+        key: 'user',
+        label: s.catUserInput,
+        color: cs.primary,
+        stat: stats.user,
+      ),
+      (
+        key: 'assistant',
+        label: s.catAssistantOutput,
+        color: Colors.teal.shade500,
+        stat: stats.assistant,
+      ),
+      (
+        key: 'thinking',
+        label: s.catThinking,
+        color: Colors.deepPurple.shade400,
+        stat: stats.thinking,
+      ),
+      (
+        key: 'tool',
+        label: s.catToolCallsAndResults,
+        color: Colors.amber.shade700,
+        stat: stats.tool,
+      ),
+      (
+        key: 'system',
+        label: s.catSystemInput,
+        color: cs.outline,
+        stat: stats.system,
+      ),
+    ];
+
+    final nonZero = categories.where((c) => c.stat.tokens > 0).toList();
+
+    return Material(
+      color: surfaces.inset,
+      borderRadius: BorderRadius.circular(Gm3.radiusMd),
+      child: InkWell(
+        onTap: onToggle,
+        borderRadius: BorderRadius.circular(Gm3.radiusMd),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  Icon(
+                    Icons.analytics_outlined,
+                    size: 15,
+                    color: cs.primary,
+                  ),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Wrap(
+                      spacing: 10,
+                      runSpacing: 4,
+                      crossAxisAlignment: WrapCrossAlignment.center,
+                      children: [
+                        Text(
+                          '${s.charCountLabel} ${_fmtCompact(stats.totalChars)} · ${s.estTokensLabel} ≈ ${_fmtCompact(stats.totalTokens)}',
+                          style: theme.textTheme.labelMedium?.copyWith(
+                            color: cs.onSurface,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                        Gm3Pill(
+                          label:
+                              '${s.inputOutputRatioLabel} ${_fmtPct(stats.inputPct)} / ${_fmtPct(stats.outputPct)}',
+                          color: cs.onSecondaryContainer,
+                          background: cs.secondaryContainer.withOpacity(0.75),
+                          fontSize: Gm3.fontSizeLabelSmall,
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 7,
+                            vertical: 1.5,
+                          ),
+                        ),
+                        if (nonZero.isNotEmpty)
+                          SizedBox(
+                            width: 128,
+                            height: 6,
+                            child: ClipRRect(
+                              borderRadius: BorderRadius.circular(
+                                Gm3.radiusPill,
+                              ),
+                              child: Row(
+                                children: [
+                                  for (final cat in nonZero)
+                                    Expanded(
+                                      flex: math.max(1, cat.stat.tokens),
+                                      child: Container(color: cat.color),
+                                    ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        if (!expanded && nonZero.isNotEmpty)
+                          Text(
+                            nonZero
+                                .map(
+                                  (c) =>
+                                      '${c.label} ${_fmtPct(c.stat.shareOf(totalTok))}',
+                                )
+                                .join(' · '),
+                            style: theme.textTheme.labelSmall?.copyWith(
+                              color: cs.onSurfaceVariant,
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
+                  Icon(
+                    expanded
+                        ? Icons.expand_less_rounded
+                        : Icons.expand_more_rounded,
+                    size: 16,
+                    color: cs.onSurfaceVariant,
+                  ),
+                ],
+              ),
+              if (expanded) ...[
+                const SizedBox(height: 8),
+                Wrap(
+                  spacing: 12,
+                  runSpacing: 6,
+                  children: [
+                    for (final cat in categories)
+                      Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Container(
+                            width: 8,
+                            height: 8,
+                            decoration: BoxDecoration(
+                              shape: BoxShape.circle,
+                              color: cat.color,
+                            ),
+                          ),
+                          const SizedBox(width: 5),
+                          Text(
+                            '${cat.label}: ${cat.stat.chars} ${s.charCountLabel} · ≈${cat.stat.tokens} tok (${_fmtPct(cat.stat.shareOf(totalTok))})',
+                            style: theme.textTheme.labelSmall?.copyWith(
+                              color: cs.onSurfaceVariant,
+                            ),
+                          ),
+                        ],
+                      ),
+                  ],
+                ),
+              ],
+            ],
+          ),
+        ),
+      ),
+    );
+  }
 }

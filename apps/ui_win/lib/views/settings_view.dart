@@ -258,23 +258,20 @@ class _SettingsViewState extends State<SettingsView> {
                                 style: theme.textTheme.labelMedium,
                               ),
                               const SizedBox(height: 8),
-                              Gm3SegmentedTrack(
-                                height: 36,
-                                child: SegmentedButton<AppLocale>(
-                                  segments: const [
-                                    ButtonSegment(
-                                      value: AppLocale.zh,
-                                      label: Text('中文'),
-                                    ),
-                                    ButtonSegment(
-                                      value: AppLocale.en,
-                                      label: Text('English'),
-                                    ),
-                                  ],
-                                  selected: {cfg.locale},
-                                  onSelectionChanged: (v) =>
-                                      cfg.setLocale(v.first),
-                                ),
+                              SegmentedButton<AppLocale>(
+                                segments: const [
+                                  ButtonSegment(
+                                    value: AppLocale.zh,
+                                    label: Text('中文'),
+                                  ),
+                                  ButtonSegment(
+                                    value: AppLocale.en,
+                                    label: Text('English'),
+                                  ),
+                                ],
+                                selected: {cfg.locale},
+                                onSelectionChanged: (v) =>
+                                    cfg.setLocale(v.first),
                               ),
                             ],
                           ),
@@ -286,34 +283,31 @@ class _SettingsViewState extends State<SettingsView> {
                                 style: theme.textTheme.labelMedium,
                               ),
                               const SizedBox(height: 8),
-                              Gm3SegmentedTrack(
-                                height: 36,
-                                child: SegmentedButton<ThemeMode>(
-                                  segments: [
-                                    ButtonSegment(
-                                      value: ThemeMode.light,
-                                      label: Text(s.isZh ? '浅色' : 'Light'),
-                                      icon: const Icon(Icons.light_mode_outlined,
-                                          size: 15),
-                                    ),
-                                    ButtonSegment(
-                                      value: ThemeMode.dark,
-                                      label: Text(s.isZh ? '深色' : 'Dark'),
-                                      icon: const Icon(Icons.dark_mode_outlined,
-                                          size: 15),
-                                    ),
-                                    ButtonSegment(
-                                      value: ThemeMode.system,
-                                      label: Text(s.isZh ? '跟随系统' : 'System'),
-                                      icon: const Icon(
-                                          Icons.brightness_auto_outlined,
-                                          size: 15),
-                                    ),
-                                  ],
-                                  selected: {cfg.themeMode},
-                                  onSelectionChanged: (v) =>
-                                      cfg.setThemeMode(v.first),
-                                ),
+                              SegmentedButton<ThemeMode>(
+                                segments: [
+                                  ButtonSegment(
+                                    value: ThemeMode.light,
+                                    label: Text(s.isZh ? '浅色' : 'Light'),
+                                    icon: const Icon(Icons.light_mode_outlined,
+                                        size: 15),
+                                  ),
+                                  ButtonSegment(
+                                    value: ThemeMode.dark,
+                                    label: Text(s.isZh ? '深色' : 'Dark'),
+                                    icon: const Icon(Icons.dark_mode_outlined,
+                                        size: 15),
+                                  ),
+                                  ButtonSegment(
+                                    value: ThemeMode.system,
+                                    label: Text(s.isZh ? '跟随系统' : 'System'),
+                                    icon: const Icon(
+                                        Icons.brightness_auto_outlined,
+                                        size: 15),
+                                  ),
+                                ],
+                                selected: {cfg.themeMode},
+                                onSelectionChanged: (v) =>
+                                    cfg.setThemeMode(v.first),
                               ),
                             ],
                           ),

@@ -1,3 +1,6 @@
+import 'dart:async';
+import 'dart:math' as math;
+
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import 'package:path/path.dart' as p;
@@ -64,6 +67,7 @@ class _ProjectTreeRow extends _TreeRow {
   final bool expanded;
   final bool pinned;
   final bool starred;
+  final bool hidden;
 
   const _ProjectTreeRow({
     required this.provider,
@@ -75,6 +79,21 @@ class _ProjectTreeRow extends _TreeRow {
     required this.expanded,
     this.pinned = false,
     this.starred = false,
+    this.hidden = false,
+  });
+}
+
+class _HiddenProjectsGroupRow extends _TreeRow {
+  final String provider;
+  final int projectCount;
+  final int sessionCount;
+  final bool expanded;
+
+  const _HiddenProjectsGroupRow({
+    required this.provider,
+    required this.projectCount,
+    required this.sessionCount,
+    required this.expanded,
   });
 }
 
@@ -105,6 +124,8 @@ class _SessionListViewState extends State<SessionListView> {
   String _providerFilter = 'all';
   int? _projectIdFilter;
   bool _starredOnly = false;
+  bool _pinnedOnly = false;
+  bool _collapsedOnly = false;
   bool _shrunkOnly = false;
   SmSortBy _sortBy = SmSortBy.updatedDesc;
   final TextEditingController _searchCtrl = TextEditingController();
@@ -112,6 +133,7 @@ class _SessionListViewState extends State<SessionListView> {
 
   final Set<String> _collapsedProviders = <String>{};
   final Set<String> _collapsedProjects = <String>{};
+  final Set<String> _expandedHiddenProviders = <String>{};
   final Set<int> _expandedSubagentParents = <int>{};
 
   @override
@@ -142,7 +164,13 @@ class _SessionListViewState extends State<SessionListView> {
 
   void _onSettingsChanged() {
     if (mounted) {
-      if (_starredOnly) {
+      final parsed = _parseSearchTags(_searchCtrl.text);
+      if (_starredOnly ||
+          _pinnedOnly ||
+          _collapsedOnly ||
+          parsed.starred ||
+          parsed.pinned ||
+          parsed.collapsed) {
         _loadSessions();
       } else {
         setState(() {});
@@ -150,29 +178,110 @@ class _SessionListViewState extends State<SessionListView> {
     }
   }
 
+  static ({
+    String query,
+    bool pinned,
+    bool starred,
+    bool collapsed,
+    bool shrunk,
+  }) _parseSearchTags(String raw) {
+    var pinned = false;
+    var starred = false;
+    var collapsed = false;
+    var shrunk = false;
+    final kept = <String>[];
+
+    for (final token in raw.trim().split(RegExp(r'\s+'))) {
+      if (token.isEmpty) continue;
+      final lower = token.toLowerCase();
+      String? tagVal;
+      if (lower.startsWith('tag:')) {
+        tagVal = lower.substring(4);
+      } else if (lower.startsWith('is:')) {
+        tagVal = lower.substring(3);
+      } else if (lower.startsWith('#') && lower.length > 1) {
+        tagVal = lower.substring(1);
+      }
+
+      if (tagVal != null) {
+        if (tagVal == 'pinned' || tagVal == 'pin' || tagVal == '置顶') {
+          pinned = true;
+          continue;
+        }
+        if (tagVal == 'starred' || tagVal == 'star' || tagVal == '星标' || tagVal == '收藏') {
+          starred = true;
+          continue;
+        }
+        if (tagVal == 'collapsed' ||
+            tagVal == 'hidden' ||
+            tagVal == 'hide' ||
+            tagVal == '折叠' ||
+            tagVal == '折叠项目' ||
+            tagVal == '隐藏') {
+          collapsed = true;
+          continue;
+        }
+        if (tagVal == 'shrunk' || tagVal == '精简' || tagVal == '内容缩短') {
+          shrunk = true;
+          continue;
+        }
+      }
+      kept.add(token);
+    }
+
+    return (
+      query: kept.join(' '),
+      pinned: pinned,
+      starred: starred,
+      collapsed: collapsed,
+      shrunk: shrunk,
+    );
+  }
+
   Future<void> _loadSessions() async {
     setState(() => _loading = true);
+    final parsed = _parseSearchTags(_searchCtrl.text);
+    final effStarred = _starredOnly || parsed.starred;
+    final effPinned = _pinnedOnly || parsed.pinned;
+    final effCollapsed = _collapsedOnly || parsed.collapsed;
+    final effShrunk = _shrunkOnly || parsed.shrunk;
+
     final starredProjs = widget.settings?.starredProjects ?? const <String>{};
-    final needInMemoryStarFilter = _starredOnly && starredProjs.isNotEmpty;
+    final pinnedProjs = widget.settings?.pinnedProjects ?? const <String>{};
+    final pinnedSess = widget.settings?.pinnedSessions ?? const <int>{};
+    final hiddenProjs = widget.settings?.hiddenProjects ?? const <String>{};
+
+    final needInMemoryStarFilter = effStarred && starredProjs.isNotEmpty;
     final results = await Future.wait([
       widget.store.getConversations(
         provider: _providerFilter == 'all' ? null : _providerFilter,
         projectId: _projectIdFilter,
-        starredOnly: _starredOnly && !needInMemoryStarFilter,
-        shrunkOnly: _shrunkOnly,
-        searchFilter: _searchCtrl.text,
+        starredOnly: effStarred && !needInMemoryStarFilter,
+        shrunkOnly: effShrunk,
+        searchFilter: parsed.query,
         sortBy: _sortBy,
       ),
       widget.store.getProjects(),
     ]);
     if (!mounted) return;
     var loaded = results[0] as List<ConversationSummary>;
-    if (needInMemoryStarFilter) {
+    if (needInMemoryStarFilter || effPinned || effCollapsed) {
+      final uncategorized = AppStringsScope.of(context).uncategorizedProject;
       loaded = loaded.where((s) {
-        if (s.starred) return true;
-        final label = _projectLabelForRaw(s);
-        final gKey = _globalProjectKey(label, s.cwd);
-        return starredProjs.contains(gKey);
+        final rawLabel = _projectLabelForRaw(s);
+        final label = rawLabel.isNotEmpty ? rawLabel : uncategorized;
+        final pKey = '${s.provider}::${s.projectId?.toString() ?? label.toLowerCase()}';
+        final gKey = _globalProjectKey(rawLabel, s.cwd);
+        if (needInMemoryStarFilter && !s.starred && !starredProjs.contains(gKey)) {
+          return false;
+        }
+        if (effPinned && !pinnedSess.contains(s.id) && !pinnedProjs.contains(pKey)) {
+          return false;
+        }
+        if (effCollapsed && !hiddenProjs.contains(pKey)) {
+          return false;
+        }
+        return true;
       }).toList();
     }
     setState(() {
@@ -253,20 +362,31 @@ class _SessionListViewState extends State<SessionListView> {
       ));
       if (!provExpanded) continue;
 
+      final parsed = _parseSearchTags(_searchCtrl.text);
+      final showingCollapsedOnly = _collapsedOnly || parsed.collapsed;
+
       final projectEntries = byProject.entries.toList()
         ..sort((a, b) {
           final aPin = settings?.isProjectPinned(a.key) == true ? 1 : 0;
           final bPin = settings?.isProjectPinned(b.key) == true ? 1 : 0;
           if (aPin != bPin) return bPin.compareTo(aPin);
-          final aStar =
-              settings?.isProjectStarred(globalKeys[a.key]!) == true ? 1 : 0;
-          final bStar =
-              settings?.isProjectStarred(globalKeys[b.key]!) == true ? 1 : 0;
-          if (aStar != bStar) return bStar.compareTo(aStar);
           return 0;
         });
 
+      final visibleProjects = <MapEntry<String, List<ConversationSummary>>>[];
+      final hiddenProjects = <MapEntry<String, List<ConversationSummary>>>[];
       for (final entry in projectEntries) {
+        if (settings?.isProjectHidden(entry.key) == true) {
+          hiddenProjects.add(entry);
+        } else {
+          visibleProjects.add(entry);
+        }
+      }
+
+      void appendProjectEntry(
+        MapEntry<String, List<ConversationSummary>> entry, {
+        required bool isHiddenProject,
+      }) {
         final pKey = entry.key;
         final gKey = globalKeys[pKey]!;
         final pSessions = List<ConversationSummary>.from(entry.value)
@@ -274,9 +394,6 @@ class _SessionListViewState extends State<SessionListView> {
             final aPin = settings?.isSessionPinned(a.id) == true ? 1 : 0;
             final bPin = settings?.isSessionPinned(b.id) == true ? 1 : 0;
             if (aPin != bPin) return bPin.compareTo(aPin);
-            final aStar = a.starred ? 1 : 0;
-            final bStar = b.starred ? 1 : 0;
-            if (aStar != bStar) return bStar.compareTo(aStar);
             return 0;
           });
         final projExpanded = !_collapsedProjects.contains(pKey);
@@ -290,8 +407,9 @@ class _SessionListViewState extends State<SessionListView> {
           expanded: projExpanded,
           pinned: settings?.isProjectPinned(pKey) ?? false,
           starred: settings?.isProjectStarred(gKey) ?? false,
+          hidden: isHiddenProject,
         ));
-        if (!projExpanded) continue;
+        if (!projExpanded) return;
 
         for (final sess in pSessions) {
           final hasSubagents = sess.subagents.isNotEmpty;
@@ -306,6 +424,33 @@ class _SessionListViewState extends State<SessionListView> {
           if (subsExpanded) {
             for (final sub in sess.subagents) {
               rows.add(_SubagentLeafRow(parent: sess, subagent: sub));
+            }
+          }
+        }
+      }
+
+      if (showingCollapsedOnly) {
+        for (final entry in hiddenProjects) {
+          appendProjectEntry(entry, isHiddenProject: true);
+        }
+      } else {
+        for (final entry in visibleProjects) {
+          appendProjectEntry(entry, isHiddenProject: false);
+        }
+        if (hiddenProjects.isNotEmpty) {
+          final hiddenSessionCount = hiddenProjects.fold<int>(
+              0, (sum, e) => sum + e.value.length);
+          final hiddenGroupExpanded = _expandedHiddenProviders.contains(prov) ||
+              parsed.query.isNotEmpty;
+          rows.add(_HiddenProjectsGroupRow(
+            provider: prov,
+            projectCount: hiddenProjects.length,
+            sessionCount: hiddenSessionCount,
+            expanded: hiddenGroupExpanded,
+          ));
+          if (hiddenGroupExpanded) {
+            for (final entry in hiddenProjects) {
+              appendProjectEntry(entry, isHiddenProject: true);
             }
           }
         }
@@ -346,29 +491,35 @@ class _SessionListViewState extends State<SessionListView> {
         Padding(
           padding: const EdgeInsets.fromLTRB(16, 14, 16, 10),
           child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
             children: <Widget>[
               Row(
                 children: <Widget>[
-                  Flexible(
-                    child: Text(
-                      s.archivedSessions,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: theme.textTheme.titleMedium,
+                  Expanded(
+                    child: Row(
+                      children: <Widget>[
+                        Flexible(
+                          child: Text(
+                            s.archivedSessions,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: theme.textTheme.titleMedium,
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        Gm3Pill(
+                          label: s.sessionsCount(_sessions.length),
+                          color: cs.onSecondaryContainer,
+                          background: cs.secondaryContainer,
+                          fontSize: Gm3.fontSizeLabelSmall,
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 8, vertical: 2),
+                        ),
+                      ],
                     ),
                   ),
-                  const SizedBox(width: 8),
-                  Gm3Pill(
-                    label: s.sessionsCount(_sessions.length),
-                    color: cs.onSecondaryContainer,
-                    background: cs.secondaryContainer,
-                    fontSize: Gm3.fontSizeLabelSmall,
-                    padding:
-                        const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-                  ),
-                  const Spacer(),
-                  if (_sessions.isNotEmpty)
+                  if (_sessions.isNotEmpty) ...<Widget>[
+                    const SizedBox(width: 4),
                     Tooltip(
                       message: hasAnyCollapsed ? s.expandAll : s.collapseAll,
                       child: IconButton(
@@ -385,6 +536,7 @@ class _SessionListViewState extends State<SessionListView> {
                             : () => _collapseAll(treeRows),
                       ),
                     ),
+                  ],
                 ],
               ),
               const SizedBox(height: 10),
@@ -493,6 +645,30 @@ class _SessionListViewState extends State<SessionListView> {
                     },
                   ),
                   FilterChip(
+                    label: Text(s.pinnedOnly),
+                    selected: _pinnedOnly,
+                    materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                    labelPadding: EdgeInsets.zero,
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 12, vertical: 5),
+                    onSelected: (v) {
+                      _pinnedOnly = v;
+                      _loadSessions();
+                    },
+                  ),
+                  FilterChip(
+                    label: Text(s.collapsedProjectsOnly),
+                    selected: _collapsedOnly,
+                    materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                    labelPadding: EdgeInsets.zero,
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 12, vertical: 5),
+                    onSelected: (v) {
+                      _collapsedOnly = v;
+                      _loadSessions();
+                    },
+                  ),
+                  FilterChip(
                     label: Text(s.shrunkOnly),
                     selected: _shrunkOnly,
                     materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
@@ -571,6 +747,22 @@ class _SessionListViewState extends State<SessionListView> {
                               },
                             );
                           }
+                          if (row is _HiddenProjectsGroupRow) {
+                            return _HiddenProjectsGroupHeader(
+                              row: row,
+                              onToggle: () {
+                                setState(() {
+                                  if (_expandedHiddenProviders
+                                      .contains(row.provider)) {
+                                    _expandedHiddenProviders
+                                        .remove(row.provider);
+                                  } else {
+                                    _expandedHiddenProviders.add(row.provider);
+                                  }
+                                });
+                              },
+                            );
+                          }
                           if (row is _ProjectTreeRow) {
                             return _ProjectTreeHeader(
                               row: row,
@@ -591,6 +783,10 @@ class _SessionListViewState extends State<SessionListView> {
                                   ? null
                                   : () => widget.settings!
                                       .toggleStarProject(row.globalProjectKey),
+                              onToggleHide: widget.settings == null
+                                  ? null
+                                  : () => widget.settings!
+                                      .toggleHideProject(row.projectKey),
                             );
                           }
                           if (row is _SubagentLeafRow) {
@@ -751,17 +947,159 @@ class _ProviderTreeHeader extends StatelessWidget {
   }
 }
 
-class _ProjectTreeHeader extends StatelessWidget {
-  final _ProjectTreeRow row;
-  final VoidCallback onToggle;
-  final VoidCallback? onTogglePin;
-  final VoidCallback? onToggleStar;
+const Color _kMarkerYellow = Color(0xFFF9AB00);
 
-  const _ProjectTreeHeader({
+class _HoverPreviewWrapper extends StatefulWidget {
+  final Widget Function(BuildContext context, bool isHovered) builder;
+  final Widget Function(BuildContext context) overlayBuilder;
+
+  const _HoverPreviewWrapper({
+    required this.builder,
+    required this.overlayBuilder,
+  });
+
+  @override
+  State<_HoverPreviewWrapper> createState() => _HoverPreviewWrapperState();
+}
+
+class _HoverPreviewWrapperState extends State<_HoverPreviewWrapper> {
+  Timer? _showTimer;
+  Timer? _hideTimer;
+  OverlayEntry? _entry;
+  bool _rowHovered = false;
+  bool _cardHovered = false;
+
+  @override
+  void dispose() {
+    _cancelTimers();
+    _removeOverlay();
+    super.dispose();
+  }
+
+  @override
+  void deactivate() {
+    _cancelTimers();
+    _removeOverlay();
+    super.deactivate();
+  }
+
+  void _cancelTimers() {
+    _showTimer?.cancel();
+    _showTimer = null;
+    _hideTimer?.cancel();
+    _hideTimer = null;
+  }
+
+  void _removeOverlay() {
+    _entry?.remove();
+    _entry = null;
+    _cardHovered = false;
+  }
+
+  void _scheduleHide() {
+    _hideTimer?.cancel();
+    _hideTimer = Timer(const Duration(milliseconds: 160), () {
+      if (!_rowHovered && !_cardHovered) {
+        _removeOverlay();
+      }
+    });
+  }
+
+  void _showOverlay() {
+    _showTimer = null;
+    if (!mounted || !_rowHovered || _entry != null) return;
+    final box = context.findRenderObject() as RenderBox?;
+    final overlay = Overlay.maybeOf(context, rootOverlay: true);
+    if (box == null || !box.hasSize || overlay == null) return;
+
+    final topLeft = box.localToGlobal(Offset.zero);
+    final rowSize = box.size;
+    final screen = MediaQuery.of(context).size;
+    const cardMaxWidth = 340.0;
+    final left = math.max(
+      8.0,
+      math.min(topLeft.dx + 16.0, screen.width - cardMaxWidth - 12.0),
+    );
+    final showAbove = topLeft.dy > screen.height * 0.55;
+
+    _entry = OverlayEntry(
+      builder: (ctx) {
+        final theme = Theme.of(ctx);
+        final surfaces = Gm3Surfaces.of(ctx);
+        return Positioned(
+          left: left,
+          top: showAbove ? null : topLeft.dy + rowSize.height + 2,
+          bottom: showAbove ? (screen.height - topLeft.dy + 2) : null,
+          child: MouseRegion(
+            onEnter: (_) {
+              _cardHovered = true;
+              _hideTimer?.cancel();
+            },
+            onExit: (_) {
+              _cardHovered = false;
+              _scheduleHide();
+            },
+            child: Material(
+              color: Colors.transparent,
+              child: Container(
+                constraints: const BoxConstraints(maxWidth: cardMaxWidth),
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: surfaces.card,
+                  borderRadius: BorderRadius.circular(Gm3.radiusMd),
+                  border: Border.all(color: surfaces.hairline.withOpacity(0.75)),
+                  boxShadow: [
+                    BoxShadow(
+                      color: Colors.black.withOpacity(
+                        theme.brightness == Brightness.dark ? 0.35 : 0.12,
+                      ),
+                      blurRadius: 14,
+                      offset: const Offset(0, 4),
+                    ),
+                  ],
+                ),
+                child: widget.overlayBuilder(ctx),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+    overlay.insert(_entry!);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return MouseRegion(
+      onEnter: (_) {
+        if (!_rowHovered) {
+          setState(() => _rowHovered = true);
+        }
+        _hideTimer?.cancel();
+        if (_entry == null && _showTimer == null) {
+          _showTimer = Timer(const Duration(milliseconds: 1500), _showOverlay);
+        }
+      },
+      onExit: (_) {
+        if (_rowHovered) {
+          setState(() => _rowHovered = false);
+        }
+        _showTimer?.cancel();
+        _showTimer = null;
+        _scheduleHide();
+      },
+      child: widget.builder(context, _rowHovered),
+    );
+  }
+}
+
+class _HiddenProjectsGroupHeader extends StatelessWidget {
+  final _HiddenProjectsGroupRow row;
+  final VoidCallback onToggle;
+
+  const _HiddenProjectsGroupHeader({
     required this.row,
     required this.onToggle,
-    this.onTogglePin,
-    this.onToggleStar,
   });
 
   @override
@@ -769,61 +1107,16 @@ class _ProjectTreeHeader extends StatelessWidget {
     final s = AppStringsScope.of(context);
     final theme = Theme.of(context);
     final cs = theme.colorScheme;
-    final surfaces = Gm3Surfaces.of(context);
-    final pathLabel = row.projectPath ?? row.projectLabel;
 
-    return Tooltip(
-      waitDuration: const Duration(seconds: 2),
-      decoration: BoxDecoration(
-        color: surfaces.card,
-        borderRadius: BorderRadius.circular(Gm3.radiusMd),
-        border: Border.all(color: surfaces.hairline.withOpacity(0.75)),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withOpacity(theme.brightness == Brightness.dark ? 0.35 : 0.10),
-            blurRadius: 12,
-            offset: const Offset(0, 4),
-          ),
-        ],
-      ),
-      richMessage: WidgetSpan(
-        child: ConstrainedBox(
-          constraints: const BoxConstraints(maxWidth: 320),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                row.projectLabel,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: theme.textTheme.labelLarge?.copyWith(
-                  fontWeight: FontWeight.w700,
-                  color: cs.onSurface,
-                ),
-              ),
-              if (pathLabel != row.projectLabel) ...[
-                const SizedBox(height: 2),
-                Text(
-                  pathLabel,
-                  maxLines: 2,
-                  overflow: TextOverflow.ellipsis,
-                  style: theme.textTheme.bodySmall?.copyWith(
-                    color: cs.onSurfaceVariant,
-                  ),
-                ),
-              ],
-            ],
-          ),
-        ),
-      ),
+    return Padding(
+      padding: const EdgeInsets.only(left: 10, right: 2, top: 2, bottom: 2),
       child: InkWell(
         borderRadius: BorderRadius.circular(6),
         onTap: onToggle,
         child: SizedBox(
-          height: 30,
+          height: 28,
           child: Padding(
-            padding: const EdgeInsets.only(left: 16, right: 6),
+            padding: const EdgeInsets.symmetric(horizontal: 6),
             child: Row(
               children: <Widget>[
                 Icon(
@@ -835,60 +1128,22 @@ class _ProjectTreeHeader extends StatelessWidget {
                 ),
                 const SizedBox(width: 4),
                 Icon(
-                  Icons.folder_outlined,
-                  size: 14,
-                  color: cs.primary.withOpacity(0.85),
+                  Icons.visibility_off_outlined,
+                  size: 13.5,
+                  color: cs.onSurfaceVariant,
                 ),
                 const SizedBox(width: 6),
                 Expanded(
                   child: Text(
-                    row.projectLabel,
+                    '${s.collapsedProjectsGroup} (${row.projectCount})',
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
-                    style: theme.textTheme.bodyMedium?.copyWith(
-                      fontSize: 13.5,
+                    style: theme.textTheme.bodySmall?.copyWith(
                       fontWeight: FontWeight.w600,
-                      color: cs.onSurface,
+                      color: cs.onSurfaceVariant,
                     ),
                   ),
                 ),
-                if (onTogglePin != null)
-                  Tooltip(
-                    message: row.pinned ? s.unpinInProvider : s.pinInProvider,
-                    child: InkWell(
-                      borderRadius: BorderRadius.circular(10),
-                      onTap: onTogglePin,
-                      child: Padding(
-                        padding: const EdgeInsets.symmetric(horizontal: 3, vertical: 2),
-                        child: Icon(
-                          row.pinned ? Icons.push_pin_rounded : Icons.push_pin_outlined,
-                          size: 13,
-                          color: row.pinned
-                              ? cs.primary
-                              : cs.onSurfaceVariant.withOpacity(0.45),
-                        ),
-                      ),
-                    ),
-                  ),
-                if (onToggleStar != null)
-                  Tooltip(
-                    message: row.starred ? s.unstarProjectGlobal : s.starProjectGlobal,
-                    child: InkWell(
-                      borderRadius: BorderRadius.circular(10),
-                      onTap: onToggleStar,
-                      child: Padding(
-                        padding: const EdgeInsets.symmetric(horizontal: 3, vertical: 2),
-                        child: Icon(
-                          row.starred ? Icons.star_rounded : Icons.star_border_rounded,
-                          size: 14,
-                          color: row.starred
-                              ? const Color(0xFFF9AB00)
-                              : cs.onSurfaceVariant.withOpacity(0.45),
-                        ),
-                      ),
-                    ),
-                  ),
-                const SizedBox(width: 4),
                 Text(
                   '${row.sessionCount}',
                   style: theme.textTheme.labelSmall?.copyWith(
@@ -904,7 +1159,262 @@ class _ProjectTreeHeader extends StatelessWidget {
   }
 }
 
-class _CompactSessionRow extends StatelessWidget {
+class _ProjectTreeHeader extends StatefulWidget {
+  final _ProjectTreeRow row;
+  final VoidCallback onToggle;
+  final VoidCallback? onTogglePin;
+  final VoidCallback? onToggleStar;
+  final VoidCallback? onToggleHide;
+
+  const _ProjectTreeHeader({
+    required this.row,
+    required this.onToggle,
+    this.onTogglePin,
+    this.onToggleStar,
+    this.onToggleHide,
+  });
+
+  @override
+  State<_ProjectTreeHeader> createState() => _ProjectTreeHeaderState();
+}
+
+class _ProjectTreeHeaderState extends State<_ProjectTreeHeader> {
+  bool _menuOpen = false;
+
+  List<PopupMenuEntry<String>> _buildMenuItems(AppStrings s) {
+    return [
+      if (widget.onTogglePin != null)
+        PopupMenuItem(
+          value: 'pin',
+          child: Text(widget.row.pinned ? s.unpinInProvider : s.pinInProvider),
+        ),
+      if (widget.onToggleStar != null)
+        PopupMenuItem(
+          value: 'star',
+          child: Text(widget.row.starred
+              ? s.unstarProjectGlobal
+              : s.starProjectGlobal),
+        ),
+      if (widget.onToggleHide != null)
+        PopupMenuItem(
+          value: 'hide',
+          child: Text(widget.row.hidden
+              ? s.unhideProjectInProvider
+              : s.hideProjectInProvider),
+        ),
+    ];
+  }
+
+  void _handleMenuAction(String? v) {
+    if (v == 'pin') widget.onTogglePin?.call();
+    if (v == 'star') widget.onToggleStar?.call();
+    if (v == 'hide') widget.onToggleHide?.call();
+  }
+
+  Future<void> _showContextMenu(BuildContext context, Offset globalPos) async {
+    final s = AppStringsScope.of(context);
+    final items = _buildMenuItems(s);
+    if (items.isEmpty) return;
+    setState(() => _menuOpen = true);
+    final overlay =
+        Overlay.of(context).context.findRenderObject() as RenderBox;
+    final selected = await showMenu<String>(
+      context: context,
+      position: RelativeRect.fromRect(
+        globalPos & const Size(1, 1),
+        Offset.zero & overlay.size,
+      ),
+      items: items,
+    );
+    if (mounted) setState(() => _menuOpen = false);
+    _handleMenuAction(selected);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final s = AppStringsScope.of(context);
+    final theme = Theme.of(context);
+    final cs = theme.colorScheme;
+    final row = widget.row;
+    final pathLabel = row.projectPath ?? row.projectLabel;
+
+    return _HoverPreviewWrapper(
+      overlayBuilder: (ctx) {
+        final t = Theme.of(ctx);
+        final c = t.colorScheme;
+        return Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              row.projectLabel,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: t.textTheme.labelLarge?.copyWith(
+                fontWeight: FontWeight.w700,
+                color: c.onSurface,
+              ),
+            ),
+            if (pathLabel != row.projectLabel) ...[
+              const SizedBox(height: 2),
+              Text(
+                pathLabel,
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+                style: t.textTheme.bodySmall?.copyWith(
+                  color: c.onSurfaceVariant,
+                ),
+              ),
+            ],
+          ],
+        );
+      },
+      builder: (context, isHovered) {
+        final showActions = isHovered || _menuOpen;
+        return GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onSecondaryTapUp: (details) =>
+              _showContextMenu(context, details.globalPosition),
+          child: InkWell(
+            borderRadius: BorderRadius.circular(6),
+            onTap: widget.onToggle,
+            child: SizedBox(
+              height: 30,
+              child: Padding(
+                padding: EdgeInsets.only(left: row.hidden ? 26 : 16, right: 4),
+                child: Row(
+                  children: <Widget>[
+                    Icon(
+                      row.expanded
+                          ? Icons.keyboard_arrow_down_rounded
+                          : Icons.keyboard_arrow_right_rounded,
+                      size: 16,
+                      color: cs.onSurfaceVariant,
+                    ),
+                    const SizedBox(width: 4),
+                    Icon(
+                      Icons.folder_outlined,
+                      size: 14,
+                      color: cs.primary.withOpacity(0.85),
+                    ),
+                    const SizedBox(width: 6),
+                    if (row.pinned)
+                      const Padding(
+                        padding: EdgeInsets.only(right: 4),
+                        child: Icon(
+                          Icons.push_pin_rounded,
+                          size: 13,
+                          color: _kMarkerYellow,
+                        ),
+                      ),
+                    if (row.starred)
+                      const Padding(
+                        padding: EdgeInsets.only(right: 4),
+                        child: Icon(
+                          Icons.star_rounded,
+                          size: 14,
+                          color: _kMarkerYellow,
+                        ),
+                      ),
+                    Expanded(
+                      child: Text(
+                        row.projectLabel,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: theme.textTheme.bodyMedium?.copyWith(
+                          fontSize: 13.5,
+                          fontWeight: FontWeight.w600,
+                          color: cs.onSurface,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 4),
+                    Text(
+                      '${row.sessionCount}',
+                      style: theme.textTheme.labelSmall?.copyWith(
+                        color: cs.onSurfaceVariant,
+                      ),
+                    ),
+                    if (showActions) ...<Widget>[
+                      const SizedBox(width: 2),
+                      if (widget.onTogglePin != null)
+                        Tooltip(
+                          message:
+                              row.pinned ? s.unpinInProvider : s.pinInProvider,
+                          child: InkWell(
+                            borderRadius: BorderRadius.circular(10),
+                            onTap: widget.onTogglePin,
+                            child: Padding(
+                              padding: const EdgeInsets.all(3),
+                              child: Icon(
+                                row.pinned
+                                    ? Icons.push_pin_rounded
+                                    : Icons.push_pin_outlined,
+                                size: 13.5,
+                                color: row.pinned
+                                    ? _kMarkerYellow
+                                    : cs.onSurfaceVariant.withOpacity(0.75),
+                              ),
+                            ),
+                          ),
+                        ),
+                      if (widget.onToggleStar != null)
+                        Tooltip(
+                          message: row.starred
+                              ? s.unstarProjectGlobal
+                              : s.starProjectGlobal,
+                          child: InkWell(
+                            borderRadius: BorderRadius.circular(10),
+                            onTap: widget.onToggleStar,
+                            child: Padding(
+                              padding: const EdgeInsets.all(3),
+                              child: Icon(
+                                row.starred
+                                    ? Icons.star_rounded
+                                    : Icons.star_border_rounded,
+                                size: 14.5,
+                                color: row.starred
+                                    ? _kMarkerYellow
+                                    : cs.onSurfaceVariant.withOpacity(0.75),
+                              ),
+                            ),
+                          ),
+                        ),
+                      if (_buildMenuItems(s).isNotEmpty)
+                        SizedBox(
+                          width: 22,
+                          height: 22,
+                          child: PopupMenuButton<String>(
+                            padding: EdgeInsets.zero,
+                            iconSize: 14,
+                            tooltip: s.moreActions,
+                            icon: Icon(
+                              Icons.more_horiz,
+                              size: 14,
+                              color: cs.onSurfaceVariant.withOpacity(0.8),
+                            ),
+                            onOpened: () => setState(() => _menuOpen = true),
+                            onCanceled: () => setState(() => _menuOpen = false),
+                            onSelected: (v) {
+                              setState(() => _menuOpen = false);
+                              _handleMenuAction(v);
+                            },
+                            itemBuilder: (_) => _buildMenuItems(s),
+                          ),
+                        ),
+                    ],
+                  ],
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+class _CompactSessionRow extends StatefulWidget {
   final ConversationSummary session;
   final bool isSubagent;
   final bool isSelected;
@@ -929,63 +1439,116 @@ class _CompactSessionRow extends StatelessWidget {
     this.onSoftDelete,
   });
 
-  InlineSpan _buildHoverTooltipSpan(BuildContext context, AppStrings s) {
+  @override
+  State<_CompactSessionRow> createState() => _CompactSessionRowState();
+}
+
+class _CompactSessionRowState extends State<_CompactSessionRow> {
+  bool _menuOpen = false;
+
+  List<PopupMenuEntry<String>> _buildMenuItems(AppStrings s) {
+    final session = widget.session;
+    return [
+      if (widget.onTogglePin != null)
+        PopupMenuItem(
+          value: 'pin',
+          child: Text(widget.isPinned ? s.unpinInProvider : s.pinInProvider),
+        ),
+      if (widget.onToggleStar != null)
+        PopupMenuItem(
+          value: 'star',
+          child: Text(session.starred ? s.unstarAction : s.starAction),
+        ),
+      if (widget.onSoftDelete != null)
+        PopupMenuItem(
+          value: 'delete',
+          child: Text(s.deleteAction),
+        ),
+    ];
+  }
+
+  void _handleMenuAction(String? v) {
+    if (v == 'pin') widget.onTogglePin?.call();
+    if (v == 'star') widget.onToggleStar?.call();
+    if (v == 'delete') widget.onSoftDelete?.call();
+  }
+
+  Future<void> _showContextMenu(BuildContext context, Offset globalPos) async {
+    if (widget.isSubagent) return;
+    final s = AppStringsScope.of(context);
+    final items = _buildMenuItems(s);
+    if (items.isEmpty) return;
+    setState(() => _menuOpen = true);
+    final overlay =
+        Overlay.of(context).context.findRenderObject() as RenderBox;
+    final selected = await showMenu<String>(
+      context: context,
+      position: RelativeRect.fromRect(
+        globalPos & const Size(1, 1),
+        Offset.zero & overlay.size,
+      ),
+      items: items,
+    );
+    if (mounted) setState(() => _menuOpen = false);
+    _handleMenuAction(selected);
+  }
+
+  Widget _buildHoverPreviewContent(BuildContext context, AppStrings s) {
     final theme = Theme.of(context);
     final cs = theme.colorScheme;
+    final session = widget.session;
     final updatedStr = session.updatedAt != null
         ? DateFormat('yyyy-MM-dd HH:mm')
             .format(DateTime.fromMillisecondsSinceEpoch(session.updatedAt!))
         : '-';
     final summaryText = (session.summary ?? '').trim();
 
-    return WidgetSpan(
-      child: SizedBox(
-        width: 310,
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(
-              session.title,
-              maxLines: 2,
-              overflow: TextOverflow.ellipsis,
-              style: theme.textTheme.labelLarge?.copyWith(
-                fontWeight: FontWeight.w700,
-                fontSize: 13,
-                color: cs.onSurface,
-              ),
+    return SizedBox(
+      width: 310,
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            session.title,
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            style: theme.textTheme.labelLarge?.copyWith(
+              fontWeight: FontWeight.w700,
+              fontSize: 13,
+              color: cs.onSurface,
             ),
-            if (summaryText.isNotEmpty) ...[
-              const SizedBox(height: 4),
-              Text(
-                summaryText,
-                maxLines: 3,
-                overflow: TextOverflow.ellipsis,
-                style: theme.textTheme.bodySmall?.copyWith(
-                  fontSize: 12,
-                  color: cs.onSurface.withOpacity(0.86),
-                ),
-              ),
-            ],
-            const SizedBox(height: 6),
+          ),
+          if (summaryText.isNotEmpty) ...[
+            const SizedBox(height: 4),
             Text(
-              '${session.provider}'
-              '${session.defaultModel != null ? ' · ${session.defaultModel}' : ''}'
-              '${session.cwd != null ? '\n${session.cwd}' : ''}'
-              '\n${s.itemsLabel(session.itemCount)} · ${session.charCount} chars'
-              '${session.revisionCount > 1 ? ' · Rev x${session.revisionCount}' : ''}'
-              '${session.subagents.isNotEmpty ? ' · ${s.subagentsBadge(session.subagents.length)}' : ''}'
-              '\nUpdated: $updatedStr',
-              maxLines: 5,
+              summaryText,
+              maxLines: 3,
               overflow: TextOverflow.ellipsis,
               style: theme.textTheme.bodySmall?.copyWith(
-                fontSize: 11.5,
-                height: 1.4,
-                color: cs.onSurfaceVariant,
+                fontSize: 12,
+                color: cs.onSurface.withOpacity(0.86),
               ),
             ),
           ],
-        ),
+          const SizedBox(height: 6),
+          Text(
+            '${session.provider}'
+            '${session.defaultModel != null ? ' · ${session.defaultModel}' : ''}'
+            '${session.cwd != null ? '\n${session.cwd}' : ''}'
+            '\n${s.itemsLabel(session.itemCount)} · ${session.charCount} chars'
+            '${session.revisionCount > 1 ? ' · Rev x${session.revisionCount}' : ''}'
+            '${session.subagents.isNotEmpty ? ' · ${s.subagentsBadge(session.subagents.length)}' : ''}'
+            '\nUpdated: $updatedStr',
+            maxLines: 5,
+            overflow: TextOverflow.ellipsis,
+            style: theme.textTheme.bodySmall?.copyWith(
+              fontSize: 11.5,
+              height: 1.4,
+              color: cs.onSurfaceVariant,
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -995,7 +1558,10 @@ class _CompactSessionRow extends StatelessWidget {
     final s = AppStringsScope.of(context);
     final theme = Theme.of(context);
     final cs = theme.colorScheme;
-    final surfaces = Gm3Surfaces.of(context);
+    final session = widget.session;
+    final isSubagent = widget.isSubagent;
+    final isSelected = widget.isSelected;
+    final isPinned = widget.isPinned;
     final shrunkColor =
         Gm3.adaptiveTint(const Color(0xFFB06000), theme.brightness);
     final subColor =
@@ -1006,242 +1572,272 @@ class _CompactSessionRow extends StatelessWidget {
             .format(DateTime.fromMillisecondsSinceEpoch(session.updatedAt!))
         : '';
 
-    return Tooltip(
-      richMessage: _buildHoverTooltipSpan(context, s),
-      waitDuration: const Duration(seconds: 2),
-      preferBelow: false,
-      padding: const EdgeInsets.all(12),
-      decoration: BoxDecoration(
-        color: surfaces.card,
-        borderRadius: BorderRadius.circular(Gm3.radiusMd),
-        border: Border.all(color: surfaces.hairline.withOpacity(0.75)),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withOpacity(theme.brightness == Brightness.dark ? 0.35 : 0.10),
-            blurRadius: 12,
-            offset: const Offset(0, 4),
-          ),
-        ],
-      ),
-      child: Padding(
-        padding: EdgeInsets.only(left: isSubagent ? 42 : 26, right: 2, top: 1, bottom: 1),
-        child: Material(
-          color: isSelected
-              ? cs.secondaryContainer.withOpacity(0.75)
-              : Colors.transparent,
-          borderRadius: BorderRadius.circular(6),
-          child: InkWell(
-            borderRadius: BorderRadius.circular(6),
-            onTap: onTap,
-            child: SizedBox(
-              height: isSubagent ? 30 : 34,
-              child: LayoutBuilder(
-                builder: (context, constraints) {
-                  final showExtraBadges = constraints.maxWidth >= 340;
-                  final showDate = constraints.maxWidth >= 310;
-                  return Row(
-                children: <Widget>[
-                  Container(
-                    width: 3,
-                    height: 16,
-                    margin: const EdgeInsets.only(right: 6),
-                    decoration: BoxDecoration(
-                      color: isSelected ? cs.primary : Colors.transparent,
-                      borderRadius: BorderRadius.circular(2),
-                    ),
-                  ),
-                  if (isSubagent) ...<Widget>[
-                    Icon(
-                      Icons.subdirectory_arrow_right_rounded,
-                      size: 13,
-                      color: subColor,
-                    ),
-                    const SizedBox(width: 3),
-                    if (session.subagentName != null &&
-                        session.subagentName!.isNotEmpty) ...<Widget>[
-                      Gm3Pill(
-                        label: session.subagentName!,
-                        color: subColor,
-                        background: subColor.withOpacity(0.10),
-                        fontSize: 10,
-                        padding: const EdgeInsets.symmetric(
-                            horizontal: 5, vertical: 0),
-                      ),
-                      const SizedBox(width: 4),
-                    ],
-                  ] else ...<Widget>[
-                    if (isPinned)
-                      InkWell(
-                        borderRadius: BorderRadius.circular(10),
-                        onTap: onTogglePin,
-                        child: Padding(
-                          padding: const EdgeInsets.only(right: 4),
-                          child: Icon(
-                            Icons.push_pin_rounded,
-                            size: 13,
-                            color: cs.primary,
+    return _HoverPreviewWrapper(
+      overlayBuilder: (ctx) => _buildHoverPreviewContent(ctx, AppStringsScope.of(ctx)),
+      builder: (context, isHovered) {
+        final showActions = !isSubagent && (isHovered || _menuOpen);
+        return GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onSecondaryTapUp: isSubagent
+              ? null
+              : (details) => _showContextMenu(context, details.globalPosition),
+          child: Padding(
+            padding: EdgeInsets.only(
+                left: isSubagent ? 42 : 26, right: 2, top: 1, bottom: 1),
+            child: Material(
+              color: isSelected
+                  ? cs.secondaryContainer.withOpacity(0.75)
+                  : Colors.transparent,
+              borderRadius: BorderRadius.circular(6),
+              child: InkWell(
+                borderRadius: BorderRadius.circular(6),
+                onTap: widget.onTap,
+                child: SizedBox(
+                  height: isSubagent ? 30 : 34,
+                  child: LayoutBuilder(
+                    builder: (context, constraints) {
+                      final showExtraBadges = constraints.maxWidth >= 340;
+                      final showDate = constraints.maxWidth >= 310;
+                      return Row(
+                        children: <Widget>[
+                          Container(
+                            width: 3,
+                            height: 16,
+                            margin: const EdgeInsets.only(right: 6),
+                            decoration: BoxDecoration(
+                              color:
+                                  isSelected ? cs.primary : Colors.transparent,
+                              borderRadius: BorderRadius.circular(2),
+                            ),
                           ),
-                        ),
-                      ),
-                    if (onToggleStar != null || session.starred)
-                      InkWell(
-                        borderRadius: BorderRadius.circular(10),
-                        onTap: onToggleStar,
-                        child: Padding(
-                          padding: const EdgeInsets.only(right: 5),
-                          child: Icon(
-                            session.starred
-                                ? Icons.star_rounded
-                                : Icons.star_border_rounded,
-                            size: 14,
-                            color: session.starred
-                                ? const Color(0xFFF9AB00)
-                                : cs.onSurfaceVariant.withOpacity(0.45),
-                          ),
-                        ),
-                      ),
-                  ],
-                  Expanded(
-                    child: Text(
-                      session.title,
-                      maxLines: 1,
-                      softWrap: false,
-                      overflow: TextOverflow.ellipsis,
-                      style: theme.textTheme.bodyMedium?.copyWith(
-                        fontSize: isSubagent ? 13 : 14,
-                        fontWeight:
-                            isSelected ? FontWeight.w600 : FontWeight.w400,
-                        color: isSelected ? cs.onSecondaryContainer : cs.onSurface,
-                      ),
-                    ),
-                  ),
-                  if (!isSubagent && session.subagents.isNotEmpty) ...<Widget>[
-                    const SizedBox(width: 4),
-                    InkWell(
-                      borderRadius: BorderRadius.circular(8),
-                      onTap: onToggleSubagents,
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(
-                            horizontal: 5, vertical: 1),
-                        decoration: BoxDecoration(
-                          color: subColor.withOpacity(0.12),
-                          borderRadius: BorderRadius.circular(8),
-                        ),
-                        child: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: <Widget>[
+                          if (isSubagent) ...<Widget>[
                             Icon(
-                              subagentsExpanded
-                                  ? Icons.expand_more_rounded
-                                  : Icons.chevron_right_rounded,
-                              size: 12,
+                              Icons.subdirectory_arrow_right_rounded,
+                              size: 13,
                               color: subColor,
                             ),
-                            Text(
-                              s.subagentsBadge(session.subagents.length),
-                              style: TextStyle(
-                                fontSize: 10,
-                                fontWeight: FontWeight.w600,
+                            const SizedBox(width: 3),
+                            if (session.subagentName != null &&
+                                session.subagentName!.isNotEmpty) ...<Widget>[
+                              Gm3Pill(
+                                label: session.subagentName!,
                                 color: subColor,
+                                background: subColor.withOpacity(0.10),
+                                fontSize: 10,
+                                padding: const EdgeInsets.symmetric(
+                                    horizontal: 5, vertical: 0),
+                              ),
+                              const SizedBox(width: 4),
+                            ],
+                          ] else ...<Widget>[
+                            if (isPinned)
+                              const Padding(
+                                padding: EdgeInsets.only(right: 4),
+                                child: Icon(
+                                  Icons.push_pin_rounded,
+                                  size: 13,
+                                  color: _kMarkerYellow,
+                                ),
+                              ),
+                            if (session.starred)
+                              const Padding(
+                                padding: EdgeInsets.only(right: 5),
+                                child: Icon(
+                                  Icons.star_rounded,
+                                  size: 14,
+                                  color: _kMarkerYellow,
+                                ),
+                              ),
+                          ],
+                          Expanded(
+                            child: Text(
+                              session.title,
+                              maxLines: 1,
+                              softWrap: false,
+                              overflow: TextOverflow.ellipsis,
+                              style: theme.textTheme.bodyMedium?.copyWith(
+                                fontSize: isSubagent ? 13 : 14,
+                                fontWeight: isSelected
+                                    ? FontWeight.w600
+                                    : FontWeight.w400,
+                                color: isSelected
+                                    ? cs.onSecondaryContainer
+                                    : cs.onSurface,
+                              ),
+                            ),
+                          ),
+                          if (!isSubagent &&
+                              session.subagents.isNotEmpty) ...<Widget>[
+                            const SizedBox(width: 4),
+                            InkWell(
+                              borderRadius: BorderRadius.circular(8),
+                              onTap: widget.onToggleSubagents,
+                              child: Container(
+                                padding: const EdgeInsets.symmetric(
+                                    horizontal: 5, vertical: 1),
+                                decoration: BoxDecoration(
+                                  color: subColor.withOpacity(0.12),
+                                  borderRadius: BorderRadius.circular(8),
+                                ),
+                                child: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: <Widget>[
+                                    Icon(
+                                      widget.subagentsExpanded
+                                          ? Icons.expand_more_rounded
+                                          : Icons.chevron_right_rounded,
+                                      size: 12,
+                                      color: subColor,
+                                    ),
+                                    Text(
+                                      s.subagentsBadge(session.subagents.length),
+                                      style: TextStyle(
+                                        fontSize: 10,
+                                        fontWeight: FontWeight.w600,
+                                        color: subColor,
+                                      ),
+                                    ),
+                                  ],
+                                ),
                               ),
                             ),
                           ],
-                        ),
-                      ),
-                    ),
-                  ],
-                  if (session.isShrunk && showExtraBadges) ...<Widget>[
-                    const SizedBox(width: 4),
-                    Gm3Pill(
-                      label: s.shrunkBadge,
-                      color: shrunkColor,
-                      background: shrunkColor.withOpacity(0.12),
-                      fontSize: 9.5,
-                      padding:
-                          const EdgeInsets.symmetric(horizontal: 4, vertical: 0),
-                    ),
-                  ] else if (session.isShrunk) ...<Widget>[
-                    const SizedBox(width: 4),
-                    Container(
-                      width: 6,
-                      height: 6,
-                      decoration: BoxDecoration(
-                        color: shrunkColor,
-                        shape: BoxShape.circle,
-                      ),
-                    ),
-                  ],
-                  if (session.revisionCount > 1 && showExtraBadges) ...<Widget>[
-                    const SizedBox(width: 4),
-                    Text(
-                      'v${session.revisionCount}',
-                      style: theme.textTheme.labelSmall?.copyWith(
-                        fontSize: 10,
-                        color: cs.primary,
-                      ),
-                    ),
-                  ],
-                  const SizedBox(width: 6),
-                  Text(
-                    '${session.itemCount}',
-                    style: theme.textTheme.labelSmall?.copyWith(
-                      fontSize: 10.5,
-                      color: cs.onSurfaceVariant,
-                    ),
-                  ),
-                  if (updatedShort.isNotEmpty && showDate) ...<Widget>[
-                    const SizedBox(width: 6),
-                    Text(
-                      updatedShort,
-                      style: theme.textTheme.labelSmall?.copyWith(
-                        fontSize: 10.5,
-                        color: cs.onSurfaceVariant.withOpacity(0.75),
-                      ),
-                    ),
-                  ],
-                  if (!isSubagent && onSoftDelete != null)
-                    SizedBox(
-                      width: 24,
-                      height: 24,
-                      child: PopupMenuButton<String>(
-                        padding: EdgeInsets.zero,
-                        iconSize: 14,
-                        icon: Icon(Icons.more_horiz,
-                            size: 14,
-                            color: cs.onSurfaceVariant.withOpacity(0.6)),
-                        onSelected: (v) {
-                          if (v == 'pin') onTogglePin?.call();
-                          if (v == 'star') onToggleStar?.call();
-                          if (v == 'delete') onSoftDelete?.call();
-                        },
-                        itemBuilder: (_) => [
-                          if (onTogglePin != null)
-                            PopupMenuItem(
-                              value: 'pin',
-                              child: Text(isPinned
-                                  ? s.unpinInProvider
-                                  : s.pinInProvider),
+                          if (session.isShrunk && showExtraBadges) ...<Widget>[
+                            const SizedBox(width: 4),
+                            Gm3Pill(
+                              label: s.shrunkBadge,
+                              color: shrunkColor,
+                              background: shrunkColor.withOpacity(0.12),
+                              fontSize: 9.5,
+                              padding: const EdgeInsets.symmetric(
+                                  horizontal: 4, vertical: 0),
                             ),
-                          PopupMenuItem(
-                            value: 'star',
-                            child: Text(
-                                session.starred ? s.unstarAction : s.starAction),
+                          ] else if (session.isShrunk) ...<Widget>[
+                            const SizedBox(width: 4),
+                            Container(
+                              width: 6,
+                              height: 6,
+                              decoration: BoxDecoration(
+                                color: shrunkColor,
+                                shape: BoxShape.circle,
+                              ),
+                            ),
+                          ],
+                          if (session.revisionCount > 1 &&
+                              showExtraBadges) ...<Widget>[
+                            const SizedBox(width: 4),
+                            Text(
+                              'v${session.revisionCount}',
+                              style: theme.textTheme.labelSmall?.copyWith(
+                                fontSize: 10,
+                                color: cs.primary,
+                              ),
+                            ),
+                          ],
+                          const SizedBox(width: 6),
+                          Text(
+                            '${session.itemCount}',
+                            style: theme.textTheme.labelSmall?.copyWith(
+                              fontSize: 10.5,
+                              color: cs.onSurfaceVariant,
+                            ),
                           ),
-                          PopupMenuItem(
-                            value: 'delete',
-                            child: Text(s.deleteAction),
-                          ),
+                          if (updatedShort.isNotEmpty &&
+                              showDate &&
+                              !showActions) ...<Widget>[
+                            const SizedBox(width: 6),
+                            Text(
+                              updatedShort,
+                              style: theme.textTheme.labelSmall?.copyWith(
+                                fontSize: 10.5,
+                                color: cs.onSurfaceVariant.withOpacity(0.75),
+                              ),
+                            ),
+                          ],
+                          if (showActions) ...<Widget>[
+                            const SizedBox(width: 2),
+                            if (widget.onTogglePin != null)
+                              Tooltip(
+                                message: isPinned
+                                    ? s.unpinInProvider
+                                    : s.pinInProvider,
+                                child: InkWell(
+                                  borderRadius: BorderRadius.circular(10),
+                                  onTap: widget.onTogglePin,
+                                  child: Padding(
+                                    padding: const EdgeInsets.all(3),
+                                    child: Icon(
+                                      isPinned
+                                          ? Icons.push_pin_rounded
+                                          : Icons.push_pin_outlined,
+                                      size: 13.5,
+                                      color: isPinned
+                                          ? _kMarkerYellow
+                                          : cs.onSurfaceVariant
+                                              .withOpacity(0.75),
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            if (widget.onToggleStar != null)
+                              Tooltip(
+                                message: session.starred
+                                    ? s.unstarAction
+                                    : s.starAction,
+                                child: InkWell(
+                                  borderRadius: BorderRadius.circular(10),
+                                  onTap: widget.onToggleStar,
+                                  child: Padding(
+                                    padding: const EdgeInsets.all(3),
+                                    child: Icon(
+                                      session.starred
+                                          ? Icons.star_rounded
+                                          : Icons.star_border_rounded,
+                                      size: 14.5,
+                                      color: session.starred
+                                          ? _kMarkerYellow
+                                          : cs.onSurfaceVariant
+                                              .withOpacity(0.75),
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            if (_buildMenuItems(s).isNotEmpty)
+                              SizedBox(
+                                width: 22,
+                                height: 22,
+                                child: PopupMenuButton<String>(
+                                  padding: EdgeInsets.zero,
+                                  iconSize: 14,
+                                  tooltip: s.moreActions,
+                                  icon: Icon(
+                                    Icons.more_horiz,
+                                    size: 14,
+                                    color:
+                                        cs.onSurfaceVariant.withOpacity(0.8),
+                                  ),
+                                  onOpened: () =>
+                                      setState(() => _menuOpen = true),
+                                  onCanceled: () =>
+                                      setState(() => _menuOpen = false),
+                                  onSelected: (v) {
+                                    setState(() => _menuOpen = false);
+                                    _handleMenuAction(v);
+                                  },
+                                  itemBuilder: (_) => _buildMenuItems(s),
+                                ),
+                              ),
+                          ],
                         ],
-                      ),
-                    ),
-                ],
-                  );
-                },
+                      );
+                    },
+                  ),
+                ),
               ),
             ),
           ),
-        ),
-      ),
+        );
+      },
     );
   }
 }

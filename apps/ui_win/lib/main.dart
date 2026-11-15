@@ -1,3 +1,5 @@
+import 'dart:math' as math;
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -116,6 +118,7 @@ class _SessionManagerAppState extends State<SessionManagerApp> {
           return MaterialApp(
             title: 'Session Manager',
             debugShowCheckedModeBanner: false,
+            scrollBehavior: const SmScrollBehavior(),
             themeMode: mode,
             theme: GoogleMaterialTheme.light(),
             darkTheme: GoogleMaterialTheme.dark(),
@@ -160,7 +163,7 @@ class MainShell extends StatefulWidget {
 }
 
 class _MainShellState extends State<MainShell> {
-  static const double _wideBreakpoint = 1100;
+  static const double _wideBreakpoint = 720;
 
   late int _selectedIndex;
   late final ArchiveDirectStore _store;
@@ -486,73 +489,82 @@ class _WideSessionsPaneState extends State<_WideSessionsPane> {
   Widget build(BuildContext context) {
     final surfaces = Gm3Surfaces.of(context);
     final cs = Theme.of(context).colorScheme;
-    final paneWidth = (_dragWidth ?? widget.settings.sessionListWidth)
-        .clamp(220.0, 560.0);
 
-    return Row(
-      children: <Widget>[
-        SizedBox(
-          width: paneWidth,
-          child: SessionListView(
-            store: widget.store,
-            cliRunner: widget.cliRunner,
-            settings: widget.settings,
-            refreshTick: widget.refreshTick,
-            selectedConversationId: widget.selectedConversationId,
-            onSelectSession: widget.onSelectSession,
-            onDataChanged: widget.onDataChanged,
-            onGoToImport: widget.onGoToImport,
-          ),
-        ),
-        MouseRegion(
-          cursor: SystemMouseCursors.resizeColumn,
-          onEnter: (_) => setState(() => _hoveringSplitter = true),
-          onExit: (_) => setState(() => _hoveringSplitter = false),
-          child: GestureDetector(
-            behavior: HitTestBehavior.translucent,
-            onHorizontalDragStart: (_) {
-              setState(() => _dragWidth = widget.settings.sessionListWidth);
-            },
-            onHorizontalDragUpdate: (details) {
-              setState(() {
-                final cur = _dragWidth ?? widget.settings.sessionListWidth;
-                _dragWidth = (cur + details.delta.dx).clamp(220.0, 560.0);
-              });
-            },
-            onHorizontalDragEnd: (_) {
-              final finalW = _dragWidth;
-              if (finalW != null) {
-                widget.settings.setSessionListWidth(finalW);
-              }
-              setState(() => _dragWidth = null);
-            },
-            child: SizedBox(
-              width: 7,
-              child: Center(
-                child: AnimatedContainer(
-                  duration: const Duration(milliseconds: 120),
-                  width: _hoveringSplitter || _dragWidth != null ? 2.5 : 1,
-                  color: _hoveringSplitter || _dragWidth != null
-                      ? cs.primary.withOpacity(0.55)
-                      : surfaces.hairline.withOpacity(0.55),
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final maxPaneWidth = constraints.maxWidth.isFinite
+            ? math.max(220.0, math.min(560.0, constraints.maxWidth - 360.0))
+            : 560.0;
+        final paneWidth = (_dragWidth ?? widget.settings.sessionListWidth)
+            .clamp(220.0, maxPaneWidth);
+
+        return Row(
+          children: <Widget>[
+            SizedBox(
+              width: paneWidth,
+              child: SessionListView(
+                store: widget.store,
+                cliRunner: widget.cliRunner,
+                settings: widget.settings,
+                refreshTick: widget.refreshTick,
+                selectedConversationId: widget.selectedConversationId,
+                onSelectSession: widget.onSelectSession,
+                onDataChanged: widget.onDataChanged,
+                onGoToImport: widget.onGoToImport,
+              ),
+            ),
+            MouseRegion(
+              cursor: SystemMouseCursors.resizeColumn,
+              onEnter: (_) => setState(() => _hoveringSplitter = true),
+              onExit: (_) => setState(() => _hoveringSplitter = false),
+              child: GestureDetector(
+                behavior: HitTestBehavior.translucent,
+                onHorizontalDragStart: (_) {
+                  setState(() => _dragWidth = widget.settings.sessionListWidth);
+                },
+                onHorizontalDragUpdate: (details) {
+                  setState(() {
+                    final cur = _dragWidth ?? widget.settings.sessionListWidth;
+                    _dragWidth =
+                        (cur + details.delta.dx).clamp(220.0, maxPaneWidth);
+                  });
+                },
+                onHorizontalDragEnd: (_) {
+                  final finalW = _dragWidth;
+                  if (finalW != null) {
+                    widget.settings.setSessionListWidth(finalW);
+                  }
+                  setState(() => _dragWidth = null);
+                },
+                child: SizedBox(
+                  width: 7,
+                  child: Center(
+                    child: AnimatedContainer(
+                      duration: const Duration(milliseconds: 120),
+                      width: _hoveringSplitter || _dragWidth != null ? 2.5 : 1,
+                      color: _hoveringSplitter || _dragWidth != null
+                          ? cs.primary.withOpacity(0.55)
+                          : surfaces.hairline.withOpacity(0.55),
+                    ),
+                  ),
                 ),
               ),
             ),
-          ),
-        ),
-        Expanded(
-          child: BranchTreeReaderView(
-            store: widget.store,
-            cliRunner: widget.cliRunner,
-            settings: widget.settings,
-            refreshTick: widget.refreshTick,
-            conversationId:
-                widget.isActiveTab ? widget.selectedConversationId : null,
-            onSelectOtherSession: widget.onSelectSession,
-            onDataChanged: widget.onDataChanged,
-          ),
-        ),
-      ],
+            Expanded(
+              child: BranchTreeReaderView(
+                store: widget.store,
+                cliRunner: widget.cliRunner,
+                settings: widget.settings,
+                refreshTick: widget.refreshTick,
+                conversationId:
+                    widget.isActiveTab ? widget.selectedConversationId : null,
+                onSelectOtherSession: widget.onSelectSession,
+                onDataChanged: widget.onDataChanged,
+              ),
+            ),
+          ],
+        );
+      },
     );
   }
 }

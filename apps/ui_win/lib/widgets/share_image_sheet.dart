@@ -52,18 +52,161 @@ class ShareSlice {
 
 bool _isToolLikeBlock(ViewBlock b) {
   return b.type == 'thinking' ||
+      b.type == 'reasoning' ||
+      b.type == 'thought' ||
       b.type == 'tool_use' ||
       b.type == 'tool_call' ||
       b.type == 'tool_result' ||
       b.type == 'file_diff';
 }
 
+final RegExp _shareSyntheticUserPrefixRe = RegExp(
+  r'^(?:<(?:goal_round|goal_complete|system-reminder|system_reminder|system-notification|system_notification|system-time|time_reminder|permission_hint|permission-hint|subagent_reply|subagent-reply|agent_reply|task-notification|inbox|environment_context|permissions instructions|collaboration_mode|skills_instructions|turn_aborted|subagent_notification|local-command-[a-z-]+)\b|\[(?:model\s+changed:|system\b|system\s+time|current\s+time|time\s+hint|permission\b|user-approval|approval\b|inbox\b|subagent\b|agent\s+reply|inter-agent)|(?:system\s+time|current\s+time|permission\s+(?:hint|notice|prompt|mode)|subagent\s+(?:reply|response|report)|reply\s+from\s+(?:sub)?agent|browser\s+time\s+zone\s+for\s+this\s+request|elapsed\s+since\s+the\s+preceding\s+step\s+context)\s*[:：]|time\s+sampled\s+while\b|background\s+job\s+\S+|(?:background\s+)?subagent\s+\S+\s+(?:finished|completed|failed|stopped|canceled|cancelled)\b|background\s+subagent\b|agent\s+\S+\s+sent\s+a\s+message:|current\s+runtime\s+context\.\s+this\s+snapshot\s+supersedes|this\s+is\s+an\s+automatically\s+generated\s+checkpoint\s+condensing|the\s+(?:user\s+changed\s+the\s+)?approval\s+policy\s+(?:changed|was\s+changed)\b|the\s+working\s+directory\s+changed\s+from\b|#\s*AGENTS\.md\b|INSTRUCTIONS:|(?:系统时间|当前时间|系统权限|权限提示|子代理回复|来自子代理)\s*[:：]?)',
+  caseSensitive: false,
+);
+
+final RegExp _inlineThinkTagRe = RegExp(
+  r'<(?:think|thought|thinking)\b[^>]*>[\s\S]*?</(?:think|thought|thinking)>',
+  caseSensitive: false,
+);
+
+bool _isRealShareUserPrompt(MessageItem item) {
+  if (item.role != 'user' || item.isSynthetic) return false;
+  final trimmed = item.text.trimLeft();
+  if (trimmed.isNotEmpty && _shareSyntheticUserPrefixRe.hasMatch(trimmed)) {
+    return false;
+  }
+  return true;
+}
+
 bool _isToolLikeItem(MessageItem item) {
-  return item.role == 'tool' ||
+  if (item.role == 'tool' ||
+      item.role == 'system' ||
+      item.role == 'developer' ||
       item.kind == 'tool_call' ||
       item.kind == 'tool_result' ||
       item.kind == 'thinking' ||
-      item.isSynthetic;
+      item.kind == 'reasoning' ||
+      item.kind == 'thought' ||
+      item.kind == 'system_note' ||
+      item.kind == 'summary' ||
+      item.kind == 'compaction' ||
+      item.kind == 'turn_context' ||
+      item.kind == 'notice' ||
+      item.kind == 'file_change' ||
+      item.kind == 'web_search' ||
+      item.isSynthetic) {
+    return true;
+  }
+  if (item.role == 'user' && !_isRealShareUserPrompt(item)) {
+    return true;
+  }
+  if (item.role == 'assistant' && item.blocks.isNotEmpty) {
+    final hasNonToolBlock = item.blocks.any((b) =>
+        !_isToolLikeBlock(b) &&
+        (b.type == 'image' ||
+            b.type == 'code' ||
+            (b.text ?? '').trim().isNotEmpty));
+    if (!hasNonToolBlock && item.blocks.every(_isToolLikeBlock)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+MessageItem? _sanitizeShareItem(
+  MessageItem item, {
+  required bool includeToolDetails,
+}) {
+  if (item.isHidden) return null;
+  if (!includeToolDetails && _isToolLikeItem(item)) return null;
+
+  if (includeToolDetails) {
+    final hasVisibleText = item.text.trim().isNotEmpty;
+    if (!hasVisibleText && item.blocks.isEmpty) return null;
+    return item;
+  }
+
+  final filteredBlocks = item.blocks
+      .where((b) =>
+          !_isToolLikeBlock(b) &&
+          (b.type == 'image' ||
+              b.type == 'code' ||
+              b.type == 'file' ||
+              b.type == 'link' ||
+              (b.text ?? '').trim().isNotEmpty))
+      .toList(growable: false);
+
+  if (item.blocks.isNotEmpty) {
+    if (filteredBlocks.isEmpty) return null;
+    final cleanBlocks = <ViewBlock>[];
+    for (final b in filteredBlocks) {
+      if (b.type == 'text' && b.text != null) {
+        final cleaned = b.text!.replaceAll(_inlineThinkTagRe, '').trim();
+        if (cleaned.isEmpty) continue;
+        cleanBlocks.add(ViewBlock(
+          idx: b.idx,
+          type: b.type,
+          text: cleaned,
+          lang: b.lang,
+          toolName: b.toolName,
+          toolCallId: b.toolCallId,
+          toolInput: b.toolInput,
+          status: b.status,
+          blobSha256: b.blobSha256,
+          availability: b.availability,
+          meta: b.meta,
+        ));
+      } else {
+        cleanBlocks.add(b);
+      }
+    }
+    if (cleanBlocks.isEmpty) return null;
+    final recomputedText = cleanBlocks
+        .map((b) => b.type == 'code'
+            ? '```${b.lang ?? ''}\n${b.text ?? ''}\n```'
+            : (b.text ?? ''))
+        .where((t) => t.trim().isNotEmpty)
+        .join('\n\n');
+    return MessageItem(
+      id: item.id,
+      parentId: item.parentId,
+      ordinal: item.ordinal,
+      depth: item.depth,
+      role: item.role,
+      kind: item.kind,
+      model: item.model,
+      toolName: item.toolName,
+      createdAt: item.createdAt,
+      text: recomputedText,
+      payloadRef: item.payloadRef,
+      blocks: cleanBlocks,
+      isActiveBranch: item.isActiveBranch,
+      isSynthetic: item.isSynthetic,
+      supersededBy: item.supersededBy,
+    );
+  }
+
+  final cleanedText = item.text.replaceAll(_inlineThinkTagRe, '').trim();
+  if (cleanedText.isEmpty) return null;
+  if (cleanedText == item.text) return item;
+  return MessageItem(
+    id: item.id,
+    parentId: item.parentId,
+    ordinal: item.ordinal,
+    depth: item.depth,
+    role: item.role,
+    kind: item.kind,
+    model: item.model,
+    toolName: item.toolName,
+    createdAt: item.createdAt,
+    text: cleanedText,
+    payloadRef: item.payloadRef,
+    blocks: const [],
+    isActiveBranch: item.isActiveBranch,
+    isSynthetic: item.isSynthetic,
+    supersededBy: item.supersededBy,
+  );
 }
 
 /// Filters active branch items by share scope (`fullConversation` vs `singleTurn`)
@@ -74,56 +217,100 @@ List<MessageItem> filterShareMessages(
   int? targetAssistantId,
   required bool includeToolDetails,
 }) {
-  final candidates = <MessageItem>[];
-  for (final item in activeItems) {
-    if (item.isHidden) continue;
-    if (!includeToolDetails && _isToolLikeItem(item)) continue;
-    final filteredBlocks = includeToolDetails
-        ? item.blocks
-        : item.blocks.where((b) => !_isToolLikeBlock(b)).toList();
+  final visible = activeItems.where((m) => !m.isHidden).toList(growable: false);
+  if (visible.isEmpty) return const [];
 
-    final hasVisibleText = item.text.trim().isNotEmpty;
-    if (!hasVisibleText && filteredBlocks.isEmpty) continue;
-
-    candidates.add(MessageItem(
-      id: item.id,
-      parentId: item.parentId,
-      ordinal: item.ordinal,
-      depth: item.depth,
-      role: item.role,
-      kind: item.kind,
-      model: item.model,
-      toolName: item.toolName,
-      createdAt: item.createdAt,
-      text: item.text,
-      payloadRef: item.payloadRef,
-      blocks: filteredBlocks,
-      isActiveBranch: item.isActiveBranch,
-      isSynthetic: item.isSynthetic,
-      supersededBy: item.supersededBy,
-    ));
-  }
-
-  if (scope == ShareScopeMode.fullConversation || targetAssistantId == null) {
-    return candidates;
-  }
-
-  final targetIdx = candidates.indexWhere((m) => m.id == targetAssistantId);
-  if (targetIdx < 0) return candidates;
-
-  final startIdx =
-      (targetIdx > 0 && candidates[targetIdx - 1].role == 'user')
-          ? targetIdx - 1
-          : targetIdx;
-
-  var endIdx = targetIdx;
-  if (includeToolDetails) {
-    while (endIdx + 1 < candidates.length &&
-        candidates[endIdx + 1].role != 'user') {
-      endIdx++;
+  // Partition into real user turns (matching BranchTreeReaderView turn slices)
+  final slices = <List<MessageItem>>[];
+  var current = <MessageItem>[];
+  for (final item in visible) {
+    if (_isRealShareUserPrompt(item)) {
+      if (current.isNotEmpty) slices.add(current);
+      current = [item];
+    } else {
+      current.add(item);
     }
   }
-  return candidates.sublist(startIdx, endIdx + 1);
+  if (current.isNotEmpty) slices.add(current);
+
+  if (scope == ShareScopeMode.singleTurn && targetAssistantId != null) {
+    for (final slice in slices) {
+      final pos = slice.indexWhere((m) => m.id == targetAssistantId);
+      if (pos < 0) continue;
+
+      final hasLeadingUser =
+          slice.isNotEmpty && _isRealShareUserPrompt(slice.first);
+      if (!includeToolDetails) {
+        final out = <MessageItem>[];
+        if (hasLeadingUser && slice.first.id != slice[pos].id) {
+          final cleanUser =
+              _sanitizeShareItem(slice.first, includeToolDetails: false);
+          if (cleanUser != null) out.add(cleanUser);
+        }
+        final cleanTarget =
+            _sanitizeShareItem(slice[pos], includeToolDetails: false);
+        if (cleanTarget != null) {
+          out.add(cleanTarget);
+        } else {
+          // If the user explicitly picked a non-standard item, still preserve it
+          // alongside the prompt so singleTurn isn't blank.
+          out.add(slice[pos]);
+        }
+        return out;
+      }
+
+      // includeToolDetails == true: include prompt + turn process up through target
+      // (and trailing tool/process items if target is the final assistant reply)
+      final lastAsstIdx =
+          slice.lastIndexWhere((m) => _sanitizeShareItem(m, includeToolDetails: false)?.role == 'assistant');
+      final endIdx = (pos == lastAsstIdx || lastAsstIdx < 0)
+          ? slice.length - 1
+          : pos;
+      final out = <MessageItem>[];
+      for (var i = 0; i <= endIdx; i++) {
+        final clean = _sanitizeShareItem(slice[i], includeToolDetails: true);
+        if (clean != null) out.add(clean);
+      }
+      return out;
+    }
+  }
+
+  // Full conversation
+  final out = <MessageItem>[];
+  for (final slice in slices) {
+    if (includeToolDetails) {
+      for (final m in slice) {
+        final clean = _sanitizeShareItem(m, includeToolDetails: true);
+        if (clean != null) out.add(clean);
+      }
+      continue;
+    }
+
+    // When excluding thinking & tool details, match the main reader view:
+    // emit the real user prompt + ONLY the final substantive assistant reply of the turn.
+    final startIdx =
+        slice.isNotEmpty && _isRealShareUserPrompt(slice.first) ? 1 : 0;
+    if (startIdx == 1) {
+      final cleanUser =
+          _sanitizeShareItem(slice.first, includeToolDetails: false);
+      if (cleanUser != null) out.add(cleanUser);
+    }
+
+    MessageItem? finalReply;
+    for (var i = slice.length - 1; i >= startIdx; i--) {
+      final candidate = slice[i];
+      if (candidate.role != 'assistant') continue;
+      final clean = _sanitizeShareItem(candidate, includeToolDetails: false);
+      if (clean != null) {
+        finalReply = clean;
+        break;
+      }
+    }
+    if (finalReply != null) {
+      out.add(finalReply);
+    }
+  }
+  return out;
 }
 
 double _estimateTextHeight(String text,
@@ -150,13 +337,17 @@ double _estimateBlockHeight(ViewBlock b) {
 }
 
 List<ShareSegment> _splitMessageIfOversized(
-    MessageItem item, double maxBodyHeight) {
+  MessageItem item,
+  double maxBodyHeight, {
+  double? firstChunkMaxHeight,
+}) {
   final singleHeight = 46 +
       (item.blocks.isNotEmpty
           ? item.blocks.fold<double>(0, (s, b) => s + _estimateBlockHeight(b))
           : _estimateTextHeight(item.text));
 
-  if (singleHeight <= maxBodyHeight) {
+  final firstBudget = firstChunkMaxHeight ?? maxBodyHeight;
+  if (singleHeight <= firstBudget) {
     return [
       ShareSegment(
         role: item.role,
@@ -175,7 +366,8 @@ List<ShareSegment> _splitMessageIfOversized(
     var accHeight = 40.0;
     for (final b in item.blocks) {
       final bh = _estimateBlockHeight(b);
-      if (accBlocks.isNotEmpty && accHeight + bh > maxBodyHeight) {
+      final budget = out.isEmpty ? firstBudget : maxBodyHeight;
+      if (accBlocks.isNotEmpty && accHeight + bh > budget) {
         out.add(ShareSegment(
           role: item.role,
           model: item.model,
@@ -226,12 +418,14 @@ List<ShareSegment> _splitMessageIfOversized(
 
   for (final para in paragraphs) {
     final ph = _estimateTextHeight(para);
-    if (ph > maxBodyHeight) {
+    final budget = out.isEmpty ? firstBudget : maxBodyHeight;
+    if (ph > budget) {
       flushChunk();
       final lines = para.split('\n');
       for (final line in lines) {
         final lh = _estimateTextHeight(line);
-        if (buf.isNotEmpty && accHeight + lh > maxBodyHeight) {
+        final lineBudget = out.isEmpty ? firstBudget : maxBodyHeight;
+        if (buf.isNotEmpty && accHeight + lh > lineBudget) {
           flushChunk();
         }
         buf.add(line);
@@ -240,7 +434,7 @@ List<ShareSegment> _splitMessageIfOversized(
       flushChunk();
       continue;
     }
-    if (buf.isNotEmpty && accHeight + ph > maxBodyHeight) {
+    if (buf.isNotEmpty && accHeight + ph > budget) {
       flushChunk();
     }
     buf.add(para);
@@ -264,11 +458,28 @@ List<ShareSegment> _splitMessageIfOversized(
 /// Splits [messages] into ordered slices whose rendered heights stay below GPU limits.
 List<ShareSlice> buildShareSlices(
   List<MessageItem> messages, {
-  double maxBodyHeight = 6400.0,
+  double maxBodyHeight = 3600.0,
 }) {
   final allSegments = <ShareSegment>[];
+  var pendingHeight = 0.0;
   for (final m in messages) {
-    allSegments.addAll(_splitMessageIfOversized(m, maxBodyHeight));
+    final firstBudget =
+        pendingHeight > 0 && pendingHeight < maxBodyHeight * 0.6
+            ? (maxBodyHeight - pendingHeight).clamp(400.0, maxBodyHeight)
+            : maxBodyHeight;
+    final segs = _splitMessageIfOversized(
+      m,
+      maxBodyHeight,
+      firstChunkMaxHeight: firstBudget,
+    );
+    for (final s in segs) {
+      allSegments.add(s);
+      if (pendingHeight + s.estimatedHeight > maxBodyHeight) {
+        pendingHeight = s.estimatedHeight;
+      } else {
+        pendingHeight += s.estimatedHeight;
+      }
+    }
   }
   if (allSegments.isEmpty) return const [];
 
@@ -336,6 +547,8 @@ class _ShareImageDialogState extends State<ShareImageDialog> {
   late bool _showAuthor;
   late bool _enableWatermark;
   late bool _showBrandText;
+  bool _mobileLayout = false;
+  bool _showShareDate = true;
   late final TextEditingController _authorCtrl;
   late final TextEditingController _watermarkCtrl;
   late final TextEditingController _brandTextCtrl;
@@ -353,10 +566,7 @@ class _ShareImageDialogState extends State<ShareImageDialog> {
         if (m.role != 'assistant' || m.isHidden || _isToolLikeItem(m)) {
           return false;
         }
-        if (m.blocks.isNotEmpty) {
-          return m.blocks.any((b) => !_isToolLikeBlock(b));
-        }
-        return m.text.trim().isNotEmpty;
+        return _sanitizeShareItem(m, includeToolDetails: false) != null;
       })
       .toList();
 
@@ -463,6 +673,8 @@ if (\$dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Outp
       watermarkText: _watermarkCtrl.text.trim(),
       showBrandText: _showBrandText,
       brandText: _brandTextCtrl.text.trim(),
+      mobileLayout: _mobileLayout,
+      showShareDate: _showShareDate,
     );
   }
 
@@ -527,17 +739,15 @@ if (\$dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Outp
     final strings = AppStringsScope.of(context);
     final overlay = Overlay.of(context, rootOverlay: true);
 
+    final canvasWidth = renderOptions.mobileLayout ? 430.0 : 780.0;
     final entry = OverlayEntry(
       builder: (_) => Positioned(
         left: -12000,
         top: 0,
-        width: 780,
-        child: OverflowBox(
-          alignment: Alignment.topLeft,
-          minWidth: 780,
-          maxWidth: 780,
-          minHeight: 0,
-          maxHeight: double.infinity,
+        width: canvasWidth,
+        height: 1200,
+        child: SingleChildScrollView(
+          physics: const NeverScrollableScrollPhysics(),
           child: Material(
             color: Colors.transparent,
             child: Theme(
@@ -545,14 +755,17 @@ if (\$dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Outp
               child: AppStringsScope(
                 notifier: AppStringsScope.notifierOf(context) ??
                     ValueNotifier<AppLocale>(strings.locale),
-                child: RepaintBoundary(
-                  key: key,
-                  child: _ShareCardCanvas(
-                    detail: widget.detail,
-                    slice: slice,
-                    includeToolDetails: _includeToolDetails,
-                    options: renderOptions,
-                    resolveBlobFile: widget.store.resolveBlobFile,
+                child: Align(
+                  alignment: Alignment.topLeft,
+                  child: RepaintBoundary(
+                    key: key,
+                    child: _ShareCardCanvas(
+                      detail: widget.detail,
+                      slice: slice,
+                      includeToolDetails: _includeToolDetails,
+                      options: renderOptions,
+                      resolveBlobFile: widget.store.resolveBlobFile,
+                    ),
                   ),
                 ),
               ),
@@ -565,13 +778,16 @@ if (\$dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Outp
     overlay.insert(entry);
     try {
       await SchedulerBinding.instance.endOfFrame;
-      await Future<void>.delayed(const Duration(milliseconds: 24));
+      await Future<void>.delayed(const Duration(milliseconds: 32));
+      await SchedulerBinding.instance.endOfFrame;
       final ro = key.currentContext?.findRenderObject();
       if (ro is! RenderRepaintBoundary) {
         throw StateError(
             'RepaintBoundary failed to mount for slice ${slice.index + 1}');
       }
-      final image = await ro.toImage(pixelRatio: 2.0);
+      final logicalHeight = math.max(1.0, ro.size.height);
+      final pixelRatio = math.min(2.0, 8000.0 / logicalHeight);
+      final image = await ro.toImage(pixelRatio: pixelRatio);
       try {
         final byteData =
             await image.toByteData(format: ui.ImageByteFormat.png);
@@ -847,6 +1063,24 @@ if (\$dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Outp
     );
   }
 
+  Widget _buildRoundedSwitch({
+    required bool value,
+    required String title,
+    required ValueChanged<bool>? onChanged,
+    bool dense = false,
+  }) {
+    return SwitchListTile.adaptive(
+      value: value,
+      dense: dense,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(Gm3.radiusMd),
+      ),
+      contentPadding: const EdgeInsets.symmetric(horizontal: 8),
+      title: Text(title, style: Theme.of(context).textTheme.bodyMedium),
+      onChanged: onChanged,
+    );
+  }
+
   Widget _buildControlsPane(
     BuildContext context, {
     required AppStrings s,
@@ -862,37 +1096,31 @@ if (\$dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Outp
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          // Scope Mode Selector
-          SizedBox(
-            width: double.infinity,
-            child: Gm3SegmentedTrack(
-              height: 36,
-              child: SegmentedButton<ShareScopeMode>(
-                segments: [
-                  ButtonSegment(
-                    value: ShareScopeMode.fullConversation,
-                    label: Text(s.shareModeFull),
-                    icon: const Icon(Icons.forum_outlined, size: 15),
-                  ),
-                  ButtonSegment(
-                    value: ShareScopeMode.singleTurn,
-                    label: Text(s.shareModeSingleTurn),
-                    icon: const Icon(Icons.chat_bubble_outline, size: 15),
-                  ),
-                ],
-                selected: {_scopeMode},
-                onSelectionChanged: _generating
-                    ? null
-                    : (val) => setState(() {
-                          _scopeMode = val.first;
-                          _previewSliceIdx = 0;
-                          if (_selectedAssistantId == null &&
-                              assistants.isNotEmpty) {
-                            _selectedAssistantId = assistants.last.id;
-                          }
-                        }),
+          // Scope Mode Selector (no full-row wrapper)
+          SegmentedButton<ShareScopeMode>(
+            segments: [
+              ButtonSegment(
+                value: ShareScopeMode.fullConversation,
+                label: Text(s.shareModeFull),
+                icon: const Icon(Icons.forum_outlined, size: 15),
               ),
-            ),
+              ButtonSegment(
+                value: ShareScopeMode.singleTurn,
+                label: Text(s.shareModeSingleTurn),
+                icon: const Icon(Icons.chat_bubble_outline, size: 15),
+              ),
+            ],
+            selected: {_scopeMode},
+            onSelectionChanged: _generating
+                ? null
+                : (val) => setState(() {
+                      _scopeMode = val.first;
+                      _previewSliceIdx = 0;
+                      if (_selectedAssistantId == null &&
+                          assistants.isNotEmpty) {
+                        _selectedAssistantId = assistants.last.id;
+                      }
+                    }),
           ),
 
           if (_scopeMode == ShareScopeMode.singleTurn &&
@@ -956,17 +1184,23 @@ if (\$dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Outp
           ],
 
           const SizedBox(height: 8),
-          SwitchListTile.adaptive(
+          _buildRoundedSwitch(
             value: _includeToolDetails,
-            contentPadding: EdgeInsets.zero,
-            title: Text(s.shareIncludeToolDetails,
-                style: theme.textTheme.bodyMedium),
+            title: s.shareIncludeToolDetails,
             onChanged: _generating
                 ? null
                 : (v) => setState(() {
                       _includeToolDetails = v;
                       _previewSliceIdx = 0;
                     }),
+          ),
+          _buildRoundedSwitch(
+            value: _mobileLayout,
+            dense: true,
+            title: s.shareMobileLayout,
+            onChanged: _generating
+                ? null
+                : (v) => setState(() => _mobileLayout = v),
           ),
 
           const Divider(height: 16),
@@ -1037,12 +1271,10 @@ if (\$dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Outp
           const SizedBox(height: 12),
 
           // Signature Toggle & Text
-          SwitchListTile.adaptive(
+          _buildRoundedSwitch(
             value: _showAuthor,
             dense: true,
-            contentPadding: EdgeInsets.zero,
-            title: Text(s.shareShowAuthorLabel,
-                style: theme.textTheme.bodyMedium),
+            title: s.shareShowAuthorLabel,
             onChanged: _generating
                 ? null
                 : (v) => setState(() => _showAuthor = v),
@@ -1061,11 +1293,10 @@ if (\$dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Outp
           ],
 
           // "由 SessionManager 分享" Brand Text Toggle & Input
-          SwitchListTile.adaptive(
+          _buildRoundedSwitch(
             value: _showBrandText,
             dense: true,
-            contentPadding: EdgeInsets.zero,
-            title: Text(s.shareBrandToggle, style: theme.textTheme.bodyMedium),
+            title: s.shareBrandToggle,
             onChanged: _generating
                 ? null
                 : (v) => setState(() => _showBrandText = v),
@@ -1082,13 +1313,21 @@ if (\$dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Outp
             const SizedBox(height: 8),
           ],
 
+          // Share Date Toggle
+          _buildRoundedSwitch(
+            value: _showShareDate,
+            dense: true,
+            title: s.shareShowDate,
+            onChanged: _generating
+                ? null
+                : (v) => setState(() => _showShareDate = v),
+          ),
+
           // Diagonal Watermark Toggle & Input
-          SwitchListTile.adaptive(
+          _buildRoundedSwitch(
             value: _enableWatermark,
             dense: true,
-            contentPadding: EdgeInsets.zero,
-            title: Text(s.shareWatermarkToggle,
-                style: theme.textTheme.bodyMedium),
+            title: s.shareWatermarkToggle,
             onChanged: _generating
                 ? null
                 : (v) => setState(() => _enableWatermark = v),
@@ -1196,6 +1435,8 @@ class ShareRenderOptions {
   final String watermarkText;
   final bool showBrandText;
   final String brandText;
+  final bool mobileLayout;
+  final bool showShareDate;
 
   const ShareRenderOptions({
     required this.style,
@@ -1205,6 +1446,8 @@ class ShareRenderOptions {
     required this.watermarkText,
     required this.showBrandText,
     required this.brandText,
+    this.mobileLayout = false,
+    this.showShareDate = false,
   });
 }
 
@@ -1229,11 +1472,24 @@ class _ShareCardCanvas extends StatelessWidget {
     final watermark = options.watermarkText;
     final hasWatermark =
         options.enableWatermark && watermark.trim().isNotEmpty;
+    final isMobile = options.mobileLayout;
+    final canvasWidth = isMobile ? 430.0 : 780.0;
+    final outerPad = isMobile ? 12.0 : 24.0;
+    final hPad = isMobile ? 18.0 : 32.0;
+
+    final hasBrand = options.showBrandText && options.brandText.trim().isNotEmpty;
+    final hasAuthor = options.showAuthor && options.authorName.trim().isNotEmpty;
+    final hasDate = options.showShareDate;
+    final hasPaging = slice.total > 1;
+    final showFooter = hasBrand || hasAuthor || hasDate || hasPaging;
+    final shareDateStr = hasDate
+        ? DateFormat('yyyy-MM-dd HH:mm').format(DateTime.now())
+        : '';
 
     return Container(
-      width: 780,
+      width: canvasWidth,
       color: palette.canvasBg,
-      padding: const EdgeInsets.all(24),
+      padding: EdgeInsets.all(outerPad),
       child: CustomPaint(
         foregroundPainter: hasWatermark
             ? _DiagonalWatermarkPainter(
@@ -1255,7 +1511,8 @@ class _ShareCardCanvas extends StatelessWidget {
               // Styled Header Band
               Container(
                 color: palette.headerBg,
-                padding: const EdgeInsets.fromLTRB(32, 24, 32, 20),
+                padding: EdgeInsets.fromLTRB(
+                    hPad, isMobile ? 18 : 24, hPad, isMobile ? 14 : 20),
                 child: Row(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
@@ -1268,7 +1525,7 @@ class _ShareCardCanvas extends StatelessWidget {
                             style: TextStyle(
                               fontFamily: Gm3.uiFontFamily,
                               fontFamilyFallback: Gm3.uiFontFallback,
-                              fontSize: 20,
+                              fontSize: isMobile ? 18 : 20,
                               fontWeight: FontWeight.w700,
                               color: palette.assistantText,
                             ),
@@ -1286,7 +1543,7 @@ class _ShareCardCanvas extends StatelessWidget {
                         ],
                       ),
                     ),
-                    if (slice.total > 1)
+                    if (hasPaging)
                       Gm3Pill(
                         label: '${slice.index + 1} / ${slice.total}',
                         color: palette.accent,
@@ -1298,7 +1555,8 @@ class _ShareCardCanvas extends StatelessWidget {
 
               // Conversation Body
               Padding(
-                padding: const EdgeInsets.fromLTRB(32, 24, 32, 16),
+                padding: EdgeInsets.fromLTRB(
+                    hPad, isMobile ? 18 : 24, hPad, isMobile ? 12 : 16),
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
@@ -1308,57 +1566,65 @@ class _ShareCardCanvas extends StatelessWidget {
                 ),
               ),
 
-              // Attribution Footer (Signature + "由 SessionManager 分享")
-              Container(
-                color: palette.headerBg.withOpacity(0.65),
-                padding: const EdgeInsets.fromLTRB(32, 14, 32, 16),
-                child: Row(
-                  children: [
-                    if (options.showBrandText &&
-                        options.brandText.isNotEmpty) ...[
-                      Icon(Icons.auto_awesome, size: 14, color: palette.accent),
-                      const SizedBox(width: 6),
-                      Text(
-                        options.brandText,
-                        style: TextStyle(
-                          fontFamily: Gm3.uiFontFamily,
-                          fontFamilyFallback: Gm3.uiFontFallback,
-                          fontSize: 12,
-                          fontWeight: FontWeight.w600,
-                          color: palette.accent,
+              // Attribution Footer (only shown when at least one item is enabled)
+              if (showFooter)
+                Container(
+                  color: palette.headerBg.withOpacity(0.65),
+                  padding: EdgeInsets.fromLTRB(hPad, 14, hPad, 16),
+                  child: Row(
+                    children: [
+                      if (hasBrand) ...[
+                        Icon(Icons.auto_awesome,
+                            size: 14, color: palette.accent),
+                        const SizedBox(width: 6),
+                        Flexible(
+                          child: Text(
+                            options.brandText,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              fontFamily: Gm3.uiFontFamily,
+                              fontFamilyFallback: Gm3.uiFontFallback,
+                              fontSize: 12,
+                              fontWeight: FontWeight.w600,
+                              color: palette.accent,
+                            ),
+                          ),
                         ),
-                      ),
-                    ] else
-                      Text(
-                        'SessionManager',
-                        style: GoogleMaterialTheme.monoTextStyle(
-                          fontSize: Gm3.monoSm,
-                          color: palette.metaText,
+                      ],
+                      if (hasDate) ...[
+                        if (hasBrand) const SizedBox(width: 10),
+                        Text(
+                          shareDateStr,
+                          style: GoogleMaterialTheme.monoTextStyle(
+                            fontSize: Gm3.monoSm,
+                            color: palette.metaText,
+                          ),
                         ),
-                      ),
-                    const Spacer(),
-                    if (options.showAuthor && options.authorName.isNotEmpty)
-                      Text(
-                        '@${options.authorName}',
-                        style: GoogleMaterialTheme.monoTextStyle(
-                          fontSize: Gm3.monoSm,
-                          fontWeight: FontWeight.w600,
-                          color: palette.assistantText,
+                      ],
+                      const Spacer(),
+                      if (hasAuthor)
+                        Text(
+                          '@${options.authorName}',
+                          style: GoogleMaterialTheme.monoTextStyle(
+                            fontSize: Gm3.monoSm,
+                            fontWeight: FontWeight.w600,
+                            color: palette.assistantText,
+                          ),
                         ),
-                      ),
-                    if (slice.total > 1) ...[
-                      const SizedBox(width: 12),
-                      Text(
-                        '${slice.index + 1}/${slice.total}',
-                        style: GoogleMaterialTheme.monoTextStyle(
-                          fontSize: Gm3.monoSm,
-                          color: palette.metaText,
+                      if (hasPaging) ...[
+                        const SizedBox(width: 12),
+                        Text(
+                          '${slice.index + 1}/${slice.total}',
+                          style: GoogleMaterialTheme.monoTextStyle(
+                            fontSize: Gm3.monoSm,
+                            color: palette.metaText,
+                          ),
                         ),
-                      ),
+                      ],
                     ],
-                  ],
+                  ),
                 ),
-              ),
             ],
           ),
         ),
@@ -1371,13 +1637,15 @@ class _ShareCardCanvas extends StatelessWidget {
     ShareSegment seg,
     SharePalette palette,
   ) {
+    final proseFontSize = options.mobileLayout ? 15.5 : null;
     if (seg.role == 'user') {
       return Padding(
         padding: const EdgeInsets.only(bottom: 22),
         child: Align(
           alignment: Alignment.centerRight,
           child: ConstrainedBox(
-            constraints: const BoxConstraints(maxWidth: 500),
+            constraints:
+                BoxConstraints(maxWidth: options.mobileLayout ? 310 : 500),
             child: Container(
               padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 12),
               decoration: BoxDecoration(
@@ -1392,6 +1660,7 @@ class _ShareCardCanvas extends StatelessWidget {
                       : seg.blocks.map((b) => b.text ?? '').join('\n'),
                   selectable: false,
                   showCopyButtons: false,
+                  fontSize: proseFontSize,
                 ),
               ),
             ),
@@ -1427,8 +1696,9 @@ class _ShareCardCanvas extends StatelessWidget {
               ),
             ),
             const SizedBox(height: 6),
-            Text(
-              preview,
+            SyntaxHighlightedCodeText(
+              text: preview,
+              selectable: false,
               style: GoogleMaterialTheme.monoTextStyle(
                 fontSize: Gm3.monoSm,
                 color: palette.metaText,
@@ -1455,6 +1725,7 @@ class _ShareCardCanvas extends StatelessWidget {
                 text: seg.text,
                 selectable: false,
                 showCopyButtons: false,
+                fontSize: proseFontSize,
               ),
           ],
         ),
@@ -1518,8 +1789,9 @@ class _ShareCardCanvas extends StatelessWidget {
             ),
             if (capped.isNotEmpty) ...[
               const SizedBox(height: 4),
-              Text(
-                capped,
+              SyntaxHighlightedCodeText(
+                text: capped,
+                selectable: false,
                 style: GoogleMaterialTheme.monoTextStyle(
                   fontSize: Gm3.monoSm,
                   color: palette.metaText,
@@ -1536,6 +1808,7 @@ class _ShareCardCanvas extends StatelessWidget {
         text: block.text ?? '',
         selectable: false,
         showCopyButtons: false,
+        fontSize: options.mobileLayout ? 15.5 : null,
       ),
     );
   }

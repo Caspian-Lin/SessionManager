@@ -62,10 +62,14 @@ class AppStrings {
   // Session List
   String get archivedSessions => isZh ? '归档会话' : 'Archived Sessions';
   String sessionsCount(int n) => isZh ? '$n 条' : '$n items';
-  String get filterHint => isZh ? '筛选标题或摘要...' : 'Filter title or summary...';
+  String get filterHint => isZh
+      ? '筛选标题、摘要或 tag:pinned / tag:starred / tag:collapsed...'
+      : 'Filter title, summary, or tag:pinned / tag:starred / tag:collapsed...';
   String get allProviders => isZh ? '全部来源' : 'All Providers';
   String get allProjects => isZh ? '全部项目' : 'All Projects';
   String get starredOnly => isZh ? '仅星标' : 'Starred';
+  String get pinnedOnly => isZh ? '仅置顶' : 'Pinned';
+  String get collapsedProjectsOnly => isZh ? '折叠项目' : 'Collapsed';
   String get shrunkOnly => isZh ? '内容缩短' : 'Shrunk';
   String get sortUpdated => isZh ? '最近更新' : 'Recently Updated';
   String get sortItems => isZh ? '消息最多' : 'Most Messages';
@@ -146,6 +150,8 @@ class AppStrings {
   String get shareWatermarkToggle => isZh ? '添加斜向水印' : 'Add Watermark Overlay';
   String get shareWatermarkTextLabel => isZh ? '自定义水印文案' : 'Watermark Text';
   String get shareBrandToggle => isZh ? '显示“由 SessionManager 分享”标识' : 'Show "Shared by SessionManager" Badge';
+  String get shareMobileLayout => isZh ? '适配移动端视图' : 'Mobile-friendly layout';
+  String get shareShowDate => isZh ? '展示分享日期' : 'Show share date';
   String get shareBrandTextLabel => isZh ? '品牌分享文案' : 'Brand Attribution Text';
   String get shareOutputDirLabel => isZh ? '保存目录' : 'Output Directory';
   String get shareGenerateBtn => isZh ? '生成 PNG 长图' : 'Generate PNG';
@@ -323,7 +329,27 @@ class AppStrings {
   String get unpinInProvider => isZh ? '取消来源置顶' : 'Unpin in provider';
   String get starProjectGlobal => isZh ? '全局星标项目' : 'Star project globally';
   String get unstarProjectGlobal => isZh ? '取消项目星标' : 'Unstar project';
+  String get collapsedProjectsGroup => isZh ? '折叠项目' : 'Collapsed Projects';
+  String get hideProjectInProvider => isZh ? '移入折叠项目' : 'Move to Collapsed';
+  String get unhideProjectInProvider => isZh ? '移出折叠项目' : 'Restore from Collapsed';
+  String get moreActions => isZh ? '更多操作' : 'More';
   String get sentAtLabel => isZh ? '发送时间' : 'Sent at';
+  String get invokedAtLabel => isZh ? '调用时间' : 'Invoked at';
+  String get linkedToolCallLabel => isZh ? '关联调用' : 'Linked call';
   String expandAllSubagents(int n) => isZh ? '展开全部 ($n)' : 'Show all ($n)';
   String get collapseSubagents => isZh ? '收起子代理' : 'Collapse';
+
+  // Markdown source toggle & context stats
+  String get showRawMarkdown => isZh ? '显示源码 (纯文本)' : 'Show raw Markdown';
+  String get showRenderedMarkdown => isZh ? '显示渲染视图' : 'Show rendered view';
+  String get copyRawMarkdown => isZh ? '复制原始 Markdown' : 'Copy raw Markdown';
+  String get contextStatsTitle => isZh ? '上下文统计' : 'Context Stats';
+  String get charCountLabel => isZh ? '字数' : 'Chars';
+  String get estTokensLabel => isZh ? '估计 Token' : 'Est. tokens';
+  String get inputOutputRatioLabel => isZh ? '输入/输出' : 'In/Out';
+  String get catUserInput => isZh ? '用户输入' : 'User input';
+  String get catAssistantOutput => isZh ? '模型回复' : 'Assistant output';
+  String get catThinking => isZh ? '思考过程' : 'Thinking';
+  String get catToolCallsAndResults => isZh ? '工具调用与回执' : 'Tool calls & results';
+  String get catSystemInput => isZh ? '系统输入' : 'System input';
 }

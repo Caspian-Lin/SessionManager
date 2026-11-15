@@ -499,19 +499,16 @@ class _ImportViewState extends State<ImportView> {
                         ],
                       ),
                       const SizedBox(height: 16),
-                      Gm3SegmentedTrack(
-                        height: 36,
-                        child: SegmentedButton<String>(
-                          segments: [
-                            ButtonSegment(value: 'openai-web', label: Text(s.sourceOpenAi)),
-                            ButtonSegment(value: 'anthropic-web', label: Text(s.sourceAnthropic)),
-                            ButtonSegment(value: 'deepseek-web', label: Text(s.sourceDeepSeek)),
-                            ButtonSegment(value: 'sm-native', label: Text(s.sourceSmNative)),
-                            ButtonSegment(value: 'generic', label: Text(s.sourceGeneric)),
-                          ],
-                          selected: {_selectedGuideKind},
-                          onSelectionChanged: (val) => setState(() => _selectedGuideKind = val.first),
-                        ),
+                      SegmentedButton<String>(
+                        segments: [
+                          ButtonSegment(value: 'openai-web', label: Text(s.sourceOpenAi)),
+                          ButtonSegment(value: 'anthropic-web', label: Text(s.sourceAnthropic)),
+                          ButtonSegment(value: 'deepseek-web', label: Text(s.sourceDeepSeek)),
+                          ButtonSegment(value: 'sm-native', label: Text(s.sourceSmNative)),
+                          ButtonSegment(value: 'generic', label: Text(s.sourceGeneric)),
+                        ],
+                        selected: {_selectedGuideKind},
+                        onSelectionChanged: (val) => setState(() => _selectedGuideKind = val.first),
                       ),
                       const SizedBox(height: 14),
                       Container(

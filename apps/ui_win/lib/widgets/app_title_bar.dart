@@ -1,9 +1,10 @@
+import 'dart:math' as math;
+
 import 'package:flutter/material.dart';
 
 import '../l10n/app_strings.dart';
 import '../platform/window_chrome.dart';
 import '../theme.dart';
-import 'gm3_surface.dart';
 
 /// The unified window header.
 ///
@@ -76,7 +77,6 @@ class _AppTitleBarState extends State<AppTitleBar> {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final scheme = theme.colorScheme;
     final surfaces = Gm3Surfaces.of(context);
     final strings = AppStringsScope.of(context);
 
@@ -92,7 +92,7 @@ class _AppTitleBarState extends State<AppTitleBar> {
           child: Row(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: <Widget>[
-              // ---- passive / draggable: brand + title + status ---------------
+              // ---- passive / draggable: brand + title ----------------------
               Container(
                 key: _leadingAnchorKey,
                 padding: const EdgeInsets.only(left: 14, right: 10),
@@ -105,29 +105,47 @@ class _AppTitleBarState extends State<AppTitleBar> {
                       widget.appTitle,
                       style: theme.textTheme.titleMedium,
                     ),
-                    const SizedBox(width: 10),
-                    _StatusPill(
-                      label: widget.statusLabel,
-                      connected: widget.statusConnected,
-                    ),
                   ],
                 ),
               ),
 
-              // ---- database path chip (hover tooltip => client area) ---------
-              Flexible(
-                child: Align(
-                  alignment: Alignment.centerLeft,
-                  child: ConstrainedBox(
-                    constraints: const BoxConstraints(maxWidth: 360),
-                    child: _PathChip(path: widget.dbPath),
-                  ),
-                ),
-              ),
-
-              // ---- passive / draggable: the grab area ------------------------
+              // ---- middle: dbPath + draggable grab area + trailing CLI badge -
               Expanded(
-                child: Container(key: _grabAnchorKey),
+                child: LayoutBuilder(
+                  builder: (context, middleConstraints) {
+                    final maxW = middleConstraints.maxWidth;
+                    final hasPath = widget.dbPath.isNotEmpty;
+                    final hasBadge = widget.trailingBadge != null;
+                    final pathMaxW = hasPath
+                        ? (hasBadge
+                            ? math.min(260.0, maxW * 0.42)
+                            : math.min(360.0, maxW))
+                        : 0.0;
+                    final badgeMaxW = hasBadge
+                        ? math.max(0.0, maxW - pathMaxW - 8.0)
+                        : 0.0;
+                    return Row(
+                      children: <Widget>[
+                        if (hasPath)
+                          ConstrainedBox(
+                            constraints: BoxConstraints(maxWidth: pathMaxW),
+                            child: _PathChip(path: widget.dbPath),
+                          ),
+                        Expanded(
+                          child: Container(key: _grabAnchorKey),
+                        ),
+                        if (hasBadge && badgeMaxW > 12.0)
+                          Padding(
+                            padding: const EdgeInsets.only(right: 8),
+                            child: ConstrainedBox(
+                              constraints: BoxConstraints(maxWidth: badgeMaxW),
+                              child: widget.trailingBadge!,
+                            ),
+                          ),
+                      ],
+                    );
+                  },
+                ),
               ),
 
               // ---- actions ---------------------------------------------------
@@ -135,10 +153,6 @@ class _AppTitleBarState extends State<AppTitleBar> {
                 child: Row(
                   mainAxisSize: MainAxisSize.min,
                   children: <Widget>[
-                    if (widget.trailingBadge != null) ...<Widget>[
-                      widget.trailingBadge!,
-                      const SizedBox(width: 8),
-                    ],
                     IconButton(
                       tooltip: strings.reloadTooltip,
                       onPressed: widget.onReload,
@@ -190,52 +204,6 @@ class _AppMark extends StatelessWidget {
         Icons.inventory_2_outlined,
         size: 18,
         color: Colors.white,
-      ),
-    );
-  }
-}
-
-class _StatusPill extends StatelessWidget {
-  const _StatusPill({required this.label, required this.connected});
-
-  final String label;
-  final bool connected;
-
-  @override
-  Widget build(BuildContext context) {
-    final isDark = Theme.of(context).brightness == Brightness.dark;
-    final accent = connected
-        ? (isDark ? const Color(0xFF81C995) : const Color(0xFF137333))
-        : (isDark ? const Color(0xFFFDD663) : const Color(0xFFB06000));
-    final fill = connected
-        ? (isDark ? const Color(0xFF1E3226) : const Color(0xFFE6F4EA))
-        : (isDark ? const Color(0xFF382F1B) : const Color(0xFFFEF7E0));
-
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 4),
-      decoration: BoxDecoration(
-        color: fill,
-        borderRadius: BorderRadius.circular(Gm3.radiusPill),
-      ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: <Widget>[
-          Container(
-            width: 6,
-            height: 6,
-            decoration: BoxDecoration(color: accent, shape: BoxShape.circle),
-          ),
-          const SizedBox(width: 6),
-          Text(
-            label,
-            style: Gm3.text(
-              fontSize: Gm3.fontSizeLabelMedium,
-              fontWeight: FontWeight.w600,
-              color: accent,
-              height: 1.25,
-            ),
-          ),
-        ],
       ),
     );
   }
@@ -500,12 +468,27 @@ class HeaderBadge extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
-    return Gm3Pill(
-      label: label,
-      color: emphasized ? scheme.onErrorContainer : scheme.onSurfaceVariant,
-      background:
-          emphasized ? scheme.errorContainer : scheme.surfaceContainerHigh,
-      fontSize: Gm3.fontSizeLabelSmall,
+    return Tooltip(
+      message: label,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+        decoration: BoxDecoration(
+          color:
+              emphasized ? scheme.errorContainer : scheme.surfaceContainerHigh,
+          borderRadius: BorderRadius.circular(Gm3.radiusPill),
+        ),
+        child: Text(
+          label,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          softWrap: false,
+          style: TextStyle(
+            fontSize: Gm3.fontSizeLabelSmall,
+            fontWeight: FontWeight.w600,
+            color: emphasized ? scheme.onErrorContainer : scheme.onSurfaceVariant,
+          ),
+        ),
+      ),
     );
   }
 }

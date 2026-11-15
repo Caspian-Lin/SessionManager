@@ -1,3 +1,7 @@
+import 'dart:async';
+import 'dart:math' as math;
+
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 
 import '../theme.dart';
@@ -394,6 +398,269 @@ class Gm3Select<T> extends StatelessWidget {
           ],
         ),
       ),
+    );
+  }
+}
+
+/// Global scroll behavior enabling middle-mouse-button press & drag fast
+/// scrolling across every [Scrollable] in the app.
+class SmScrollBehavior extends MaterialScrollBehavior {
+  const SmScrollBehavior();
+
+  @override
+  Widget buildOverscrollIndicator(
+    BuildContext context,
+    Widget child,
+    ScrollableDetails details,
+  ) {
+    final base = super.buildOverscrollIndicator(context, child, details);
+    return MiddleMouseAutoScrollWrapper(
+      details: details,
+      scrollableContext: context,
+      child: base,
+    );
+  }
+}
+
+/// Wraps a scrollable viewport to support pressing the middle mouse button and
+/// dragging to fast-scroll vertically or horizontally.
+class MiddleMouseAutoScrollWrapper extends StatefulWidget {
+  const MiddleMouseAutoScrollWrapper({
+    super.key,
+    required this.details,
+    required this.scrollableContext,
+    required this.child,
+  });
+
+  final ScrollableDetails details;
+  final BuildContext scrollableContext;
+  final Widget child;
+
+  @override
+  State<MiddleMouseAutoScrollWrapper> createState() =>
+      _MiddleMouseAutoScrollWrapperState();
+}
+
+class _MiddleMouseAutoScrollWrapperState
+    extends State<MiddleMouseAutoScrollWrapper> {
+  static final Map<int, Set<Axis>> _claimedAxes = <int, Set<Axis>>{};
+  static final Set<int> _indicatorClaimedPointers = <int>{};
+
+  int? _activePointer;
+  Axis? _claimedAxis;
+  bool _claimedIndicator = false;
+  Offset? _anchorGlobal;
+  Offset? _anchorLocal;
+  Offset? _currentGlobal;
+  Offset? _lastMoveGlobal;
+  Timer? _autoScrollTimer;
+
+  Axis get _axis => axisDirectionToAxis(widget.details.direction);
+  bool get _reversed => axisDirectionIsReversed(widget.details.direction);
+
+  ScrollPosition? _resolvePosition() {
+    final controller = widget.details.controller;
+    if (controller != null && controller.positions.length == 1) {
+      return controller.position;
+    }
+    final ctx = widget.scrollableContext;
+    if (ctx.mounted && ctx is StatefulElement && ctx.state is ScrollableState) {
+      return (ctx.state as ScrollableState).position;
+    }
+    if (controller != null && controller.hasClients) {
+      return controller.positions.last;
+    }
+    return null;
+  }
+
+  double _projectAxis(Offset delta) {
+    final raw = _axis == Axis.vertical ? delta.dy : delta.dx;
+    return _reversed ? -raw : raw;
+  }
+
+  void _applyScrollDelta(double delta) {
+    if (delta == 0 || !mounted) return;
+    final position = _resolvePosition();
+    if (position == null || !position.hasPixels || !position.hasContentDimensions) {
+      return;
+    }
+    final next = (position.pixels + delta).clamp(
+      position.minScrollExtent,
+      position.maxScrollExtent,
+    );
+    if ((next - position.pixels).abs() > 0.01) {
+      position.jumpTo(next);
+    }
+  }
+
+  void _handlePointerDown(PointerDownEvent event) {
+    if ((event.buttons & kMiddleMouseButton) == 0) return;
+    final position = _resolvePosition();
+    if (position == null ||
+        !position.hasContentDimensions ||
+        position.maxScrollExtent <= position.minScrollExtent) {
+      return;
+    }
+    final pointerAxes = _claimedAxes.putIfAbsent(event.pointer, () => <Axis>{});
+    if (pointerAxes.contains(_axis)) return;
+    pointerAxes.add(_axis);
+
+    final showIndicator = _indicatorClaimedPointers.add(event.pointer);
+    _autoScrollTimer?.cancel();
+    setState(() {
+      _activePointer = event.pointer;
+      _claimedAxis = _axis;
+      _claimedIndicator = showIndicator;
+      _anchorGlobal = event.position;
+      _anchorLocal = event.localPosition;
+      _currentGlobal = event.position;
+      _lastMoveGlobal = event.position;
+    });
+    _autoScrollTimer = Timer.periodic(
+      const Duration(milliseconds: 16),
+      _onAutoScrollTick,
+    );
+  }
+
+  void _handlePointerMove(PointerMoveEvent event) {
+    if (_activePointer != event.pointer) return;
+    if ((event.buttons & kMiddleMouseButton) == 0) {
+      _stopAutoScroll();
+      return;
+    }
+    final prev = _lastMoveGlobal ?? event.position;
+    final stepDelta = _projectAxis(event.position - prev);
+    _lastMoveGlobal = event.position;
+    _currentGlobal = event.position;
+    if (stepDelta.abs() > 0.01) {
+      _applyScrollDelta(stepDelta * 2.5);
+    }
+  }
+
+  void _handlePointerEnd(PointerEvent event) {
+    if (_activePointer != event.pointer) return;
+    _stopAutoScroll();
+  }
+
+  void _onAutoScrollTick(Timer timer) {
+    if (!mounted ||
+        _activePointer == null ||
+        _anchorGlobal == null ||
+        _currentGlobal == null) {
+      _stopAutoScroll();
+      return;
+    }
+    final offsetAxis = _projectAxis(_currentGlobal! - _anchorGlobal!);
+    if (offsetAxis.abs() <= 6.0) return;
+    final magnitude = (offsetAxis.abs() - 6.0) / 14.0;
+    final step = offsetAxis.sign * math.pow(magnitude, 1.35) * 4.5;
+    _applyScrollDelta(step.toDouble());
+  }
+
+  void _releaseClaims() {
+    final pointer = _activePointer;
+    final axis = _claimedAxis;
+    if (pointer != null) {
+      final axes = _claimedAxes[pointer];
+      if (axes != null && axis != null) {
+        axes.remove(axis);
+        if (axes.isEmpty) {
+          _claimedAxes.remove(pointer);
+        }
+      }
+      if (_claimedIndicator) {
+        _indicatorClaimedPointers.remove(pointer);
+      }
+    }
+  }
+
+  void _stopAutoScroll() {
+    _autoScrollTimer?.cancel();
+    _autoScrollTimer = null;
+    _releaseClaims();
+    if (!mounted) {
+      _activePointer = null;
+      _claimedAxis = null;
+      _claimedIndicator = false;
+      _anchorGlobal = null;
+      _anchorLocal = null;
+      _currentGlobal = null;
+      _lastMoveGlobal = null;
+      return;
+    }
+    if (_activePointer != null) {
+      setState(() {
+        _activePointer = null;
+        _claimedAxis = null;
+        _claimedIndicator = false;
+        _anchorGlobal = null;
+        _anchorLocal = null;
+        _currentGlobal = null;
+        _lastMoveGlobal = null;
+      });
+    }
+  }
+
+  @override
+  void dispose() {
+    _autoScrollTimer?.cancel();
+    _releaseClaims();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    Widget content = widget.child;
+    if (_claimedIndicator && _anchorLocal != null && _activePointer != null) {
+      final cs = Theme.of(context).colorScheme;
+      content = Stack(
+        fit: StackFit.passthrough,
+        clipBehavior: Clip.none,
+        children: <Widget>[
+          content,
+          Positioned(
+            left: _anchorLocal!.dx - 13,
+            top: _anchorLocal!.dy - 13,
+            child: IgnorePointer(
+              child: Container(
+                width: 26,
+                height: 26,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  color: cs.surface.withOpacity(0.92),
+                  border: Border.all(
+                    color: cs.primary.withOpacity(0.85),
+                    width: 1.5,
+                  ),
+                  boxShadow: <BoxShadow>[
+                    BoxShadow(
+                      color: Colors.black.withOpacity(0.18),
+                      blurRadius: 6,
+                      offset: const Offset(0, 2),
+                    ),
+                  ],
+                ),
+                child: Icon(
+                  _axis == Axis.vertical
+                      ? Icons.unfold_more_rounded
+                      : Icons.code_rounded,
+                  size: 15,
+                  color: cs.primary,
+                ),
+              ),
+            ),
+          ),
+        ],
+      );
+    }
+
+    return Listener(
+      behavior: HitTestBehavior.translucent,
+      onPointerDown: _handlePointerDown,
+      onPointerMove: _handlePointerMove,
+      onPointerUp: _handlePointerEnd,
+      onPointerCancel: _handlePointerEnd,
+      child: content,
     );
   }
 }

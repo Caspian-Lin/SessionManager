@@ -759,18 +759,37 @@ class ArchiveDirectStore {
         );
         trace.markPhase('sql_items');
 
-        final items = itemRows.map((r) {
+        final rawItems = itemRows.map((r) {
           String? itemSupersededBy;
+          String? dshSourceKind;
           final rawItemFlags = r['flags_json'] as String?;
           if (rawItemFlags != null && rawItemFlags.isNotEmpty) {
-            if (rawItemFlags.contains('superseded_by')) {
+            if (rawItemFlags.contains('superseded_by') || rawItemFlags.contains('dsh_source_kind')) {
               try {
                 final decoded = jsonDecode(rawItemFlags);
                 if (decoded is Map<String, dynamic>) {
                   itemSupersededBy = decoded['superseded_by']?.toString();
+                  dshSourceKind = decoded['dsh_source_kind']?.toString();
                 }
               } catch (_) {}
             }
+          }
+
+          var role = (r['role'] as String?) ?? 'user';
+          var kind = (r['kind'] as String?) ?? 'message';
+          final text = (r['text'] as String?) ?? '';
+          final rawBlocksJson = r['blocks_json'] as String?;
+          var isSynthetic = ((r['is_synthetic'] as int?) ?? 0) == 1;
+
+          final hasNonUserDshKind = dshSourceKind != null &&
+              dshSourceKind.isNotEmpty &&
+              dshSourceKind.toLowerCase() != 'user' &&
+              dshSourceKind.toLowerCase() != 'human';
+          if (role == 'user' &&
+              (hasNonUserDshKind || _isSyntheticSystemUserText(text))) {
+            role = 'system';
+            kind = 'system_note';
+            isSynthetic = true;
           }
 
           return MessageItem(
@@ -778,21 +797,79 @@ class ArchiveDirectStore {
             parentId: r['parent_id'] as int?,
             ordinal: (r['ordinal'] as int?) ?? 0,
             depth: (r['depth'] as int?) ?? 0,
-            role: (r['role'] as String?) ?? 'user',
-            kind: (r['kind'] as String?) ?? 'message',
+            role: role,
+            kind: kind,
             model: r['model'] as String?,
             toolName: r['tool_name'] as String?,
-            text: (r['text'] as String?) ?? '',
-            rawBlocksJson: r['blocks_json'] as String?,
+            text: text,
+            rawBlocksJson: rawBlocksJson,
             payloadRef: r['payload_ref'] as String?,
             createdAt: r['created_at'] as int?,
             isActiveBranch: ((r['is_active_branch'] as int?) ?? 1) == 1,
             isHidden: ((r['is_hidden'] as int?) ?? 0) == 1,
-            isSynthetic: ((r['is_synthetic'] as int?) ?? 0) == 1,
+            isSynthetic: isSynthetic,
             status: r['status'] as String?,
             supersededBy: itemSupersededBy,
           );
         }).toList();
+
+        // Backfill missing tool_name on legacy tool_result items using tool_call_id.
+        final toolNameByCallId = <String, String>{};
+        final items = <MessageItem>[];
+        for (final item in rawItems) {
+          final isCall = item.kind == 'tool_call' || item.blocks.any((b) => b.type == 'tool_use');
+          if (isCall) {
+            for (final b in item.blocks) {
+              if (b.type == 'tool_use' &&
+                  b.toolCallId != null &&
+                  b.toolCallId!.isNotEmpty) {
+                final tName = (b.toolName != null && b.toolName!.isNotEmpty)
+                    ? b.toolName!
+                    : (item.toolName ?? '');
+                if (tName.isNotEmpty) {
+                  toolNameByCallId[b.toolCallId!] = tName;
+                }
+              }
+            }
+          }
+          if ((item.kind == 'tool_result' || item.role == 'tool') &&
+              (item.toolName == null || item.toolName!.isEmpty)) {
+            String? resolvedName;
+            for (final b in item.blocks) {
+              if (b.toolName != null && b.toolName!.isNotEmpty) {
+                resolvedName = b.toolName;
+                break;
+              }
+              if (b.toolCallId != null && toolNameByCallId.containsKey(b.toolCallId)) {
+                resolvedName = toolNameByCallId[b.toolCallId!];
+                break;
+              }
+            }
+            if (resolvedName != null && resolvedName.isNotEmpty) {
+              items.add(MessageItem(
+                id: item.id,
+                parentId: item.parentId,
+                ordinal: item.ordinal,
+                depth: item.depth,
+                role: item.role,
+                kind: item.kind,
+                model: item.model,
+                toolName: resolvedName,
+                text: item.text,
+                rawBlocksJson: item.rawBlocksJson,
+                payloadRef: item.payloadRef,
+                createdAt: item.createdAt,
+                isActiveBranch: item.isActiveBranch,
+                isHidden: item.isHidden,
+                isSynthetic: item.isSynthetic,
+                status: item.status,
+                supersededBy: item.supersededBy,
+              ));
+              continue;
+            }
+          }
+          items.add(item);
+        }
         trace.markPhase('row_mapping');
         trace.finish(extraMeta: {'item_count': items.length});
 
@@ -831,6 +908,16 @@ class ArchiveDirectStore {
     r'[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af]+',
   );
   static final RegExp _asciiTokenRe = RegExp(r'[a-zA-Z0-9_.-]+');
+  static final RegExp _syntheticSystemUserTextRe = RegExp(
+    r'^(?:<(?:goal_round|goal_complete|system-reminder|system_reminder|system-notification|system_notification|system-time|time_reminder|permission_hint|permission-hint|subagent_reply|subagent-reply|agent_reply|task-notification|inbox|environment_context|permissions instructions|collaboration_mode|skills_instructions|turn_aborted|subagent_notification|local-command-[a-z-]+)\b|\[(?:model\s+changed:|system\b|system\s+time|current\s+time|time\s+hint|permission\b|user-approval|approval\b|inbox\b|subagent\b|agent\s+reply|inter-agent)|(?:system\s+time|current\s+time|permission\s+(?:hint|notice|prompt|mode)|subagent\s+(?:reply|response|report)|reply\s+from\s+(?:sub)?agent|browser\s+time\s+zone\s+for\s+this\s+request|elapsed\s+since\s+the\s+preceding\s+step\s+context)\s*[:：]|time\s+sampled\s+while\b|background\s+job\s+\S+|(?:background\s+)?subagent\s+\S+\s+(?:finished|completed|failed|stopped|canceled|cancelled)\b|background\s+subagent\b|agent\s+\S+\s+sent\s+a\s+message:|current\s+runtime\s+context\.\s+this\s+snapshot\s+supersedes|this\s+is\s+an\s+automatically\s+generated\s+checkpoint\s+condensing|the\s+(?:user\s+changed\s+the\s+)?approval\s+policy\s+(?:changed|was\s+changed)\b|the\s+working\s+directory\s+changed\s+from\b|#\s*AGENTS\.md\b|INSTRUCTIONS:|(?:系统时间|当前时间|系统权限|权限提示|子代理回复|来自子代理)\s*[:：]?)',
+    caseSensitive: false,
+  );
+
+  static bool _isSyntheticSystemUserText(String text) {
+    final trimmed = text.trimLeft();
+    if (trimmed.isEmpty) return false;
+    return _syntheticSystemUserTextRe.hasMatch(trimmed);
+  }
 
   String _quoteFtsPhrase(String term) => '"${term.replaceAll('"', '""')}"';
 
