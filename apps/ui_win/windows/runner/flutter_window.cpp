@@ -2,6 +2,7 @@
 
 #include <commctrl.h>
 #include <flutter/standard_method_codec.h>
+#include <shellapi.h>
 #include <windowsx.h>
 
 #include <optional>
@@ -228,6 +229,30 @@ void FlutterWindow::HandleWindowMethodCall(
   }
   if (method == "isMaximized") {
     result->Success(flutter::EncodableValue(IsWindowMaximized()));
+    return;
+  }
+  if (method == "openLocalFile") {
+    const auto* path = call.arguments()
+                           ? std::get_if<std::string>(call.arguments())
+                           : nullptr;
+    if (!path || path->empty()) {
+      result->Success(flutter::EncodableValue(false));
+      return;
+    }
+    const int length =
+        MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path->c_str(), -1,
+                            nullptr, 0);
+    if (length == 0) {
+      result->Success(flutter::EncodableValue(false));
+      return;
+    }
+    std::wstring wide_path(length, L'\0');
+    MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path->c_str(), -1,
+                        wide_path.data(), length);
+    const auto launched = ShellExecuteW(GetHandle(), L"open", wide_path.c_str(),
+                                        nullptr, nullptr, SW_SHOWNORMAL);
+    result->Success(
+        flutter::EncodableValue(reinterpret_cast<INT_PTR>(launched) > 32));
     return;
   }
   if (method == "setCaptionDragAreas") {

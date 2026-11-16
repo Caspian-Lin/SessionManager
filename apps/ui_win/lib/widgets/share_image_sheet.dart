@@ -15,6 +15,7 @@ import '../models.dart';
 import '../theme.dart';
 import 'gm3_surface.dart';
 import 'markdown_prose.dart';
+import 'media_attachment.dart';
 
 enum ShareScopeMode { fullConversation, singleTurn }
 
@@ -105,6 +106,7 @@ bool _isToolLikeItem(MessageItem item) {
     final hasNonToolBlock = item.blocks.any((b) =>
         !_isToolLikeBlock(b) &&
         (b.type == 'image' ||
+            b.isAttachment ||
             b.type == 'code' ||
             (b.text ?? '').trim().isNotEmpty));
     if (!hasNonToolBlock && item.blocks.every(_isToolLikeBlock)) {
@@ -132,8 +134,7 @@ MessageItem? _sanitizeShareItem(
           !_isToolLikeBlock(b) &&
           (b.type == 'image' ||
               b.type == 'code' ||
-              b.type == 'file' ||
-              b.type == 'link' ||
+              b.isAttachment ||
               (b.text ?? '').trim().isNotEmpty))
       .toList(growable: false);
 
@@ -764,7 +765,7 @@ if (\$dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Outp
                       slice: slice,
                       includeToolDetails: _includeToolDetails,
                       options: renderOptions,
-                      resolveBlobFile: widget.store.resolveBlobFile,
+                      store: widget.store,
                     ),
                   ),
                 ),
@@ -778,7 +779,20 @@ if (\$dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Outp
     overlay.insert(entry);
     try {
       await SchedulerBinding.instance.endOfFrame;
-      await Future<void>.delayed(const Duration(milliseconds: 32));
+      final captureContext = key.currentContext;
+      if (captureContext is Element && captureContext.mounted) {
+        final images = <ImageProvider>{};
+        void collectImages(Element element) {
+          final child = element.widget;
+          if (child is Image) images.add(child.image);
+          element.visitChildElements(collectImages);
+        }
+        captureContext.visitChildElements(collectImages);
+        await Future.wait([
+          for (final image in images)
+            precacheImage(image, captureContext, onError: (_, __) {}),
+        ]);
+      }
       await SchedulerBinding.instance.endOfFrame;
       final ro = key.currentContext?.findRenderObject();
       if (ro is! RenderRepaintBoundary) {
@@ -1049,7 +1063,7 @@ if (\$dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Outp
                                 slice: slices[activeIdx],
                                 includeToolDetails: _includeToolDetails,
                                 options: renderOpts,
-                                resolveBlobFile: widget.store.resolveBlobFile,
+                                store: widget.store,
                               ),
                             ),
                           ),
@@ -1456,15 +1470,35 @@ class _ShareCardCanvas extends StatelessWidget {
   final ShareSlice slice;
   final bool includeToolDetails;
   final ShareRenderOptions options;
-  final File? Function(String sha) resolveBlobFile;
+  final ArchiveDirectStore store;
 
   const _ShareCardCanvas({
     required this.detail,
     required this.slice,
     required this.includeToolDetails,
     required this.options,
-    required this.resolveBlobFile,
+    required this.store,
   });
+
+  File? _resolveLocalFile(String reference) =>
+      store.resolveLocalFile(reference, cwd: detail.cwd);
+
+  Widget _buildShareAttachment(ViewBlock block) {
+    if (block.type == 'image') {
+      return Padding(
+        padding: const EdgeInsets.only(bottom: 8),
+        child: MediaImage(
+          file: store.resolveMediaFile(block, cwd: detail.cwd),
+          label: attachmentName(block),
+          maxHeight: 280,
+        ),
+      );
+    }
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 6),
+      child: Text(attachmentName(block), style: GoogleMaterialTheme.monoTextStyle()),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -1654,13 +1688,24 @@ class _ShareCardCanvas extends StatelessWidget {
               ),
               child: DefaultTextStyle.merge(
                 style: TextStyle(color: palette.userBubbleText),
-                child: MarkdownProse(
-                  text: seg.text.isNotEmpty
-                      ? seg.text
-                      : seg.blocks.map((b) => b.text ?? '').join('\n'),
-                  selectable: false,
-                  showCopyButtons: false,
-                  fontSize: proseFontSize,
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    MarkdownProse(
+                      text: seg.text.isNotEmpty
+                          ? seg.text
+                          : seg.blocks.where((b) => !b.isAttachment && b.type != 'image')
+                              .map((b) => b.text ?? '').join('\n'),
+                      selectable: false,
+                      showCopyButtons: false,
+                      fontSize: proseFontSize,
+                      resolveLocalFile: _resolveLocalFile,
+                    ),
+                    for (final block in seg.blocks)
+                      if (block.type == 'image' || block.isAttachment)
+                        _buildShareAttachment(block),
+                  ],
                 ),
               ),
             ),
@@ -1704,6 +1749,9 @@ class _ShareCardCanvas extends StatelessWidget {
                 color: palette.metaText,
               ),
             ),
+            for (final block in seg.blocks)
+              if (block.type == 'image' || block.isAttachment)
+                _buildShareAttachment(block),
           ],
         ),
       );
@@ -1726,6 +1774,7 @@ class _ShareCardCanvas extends StatelessWidget {
                 selectable: false,
                 showCopyButtons: false,
                 fontSize: proseFontSize,
+                resolveLocalFile: _resolveLocalFile,
               ),
           ],
         ),
@@ -1746,22 +1795,8 @@ class _ShareCardCanvas extends StatelessWidget {
         showCopyButton: false,
       );
     }
-    if (block.type == 'image') {
-      final file =
-          block.blobSha256 != null ? resolveBlobFile(block.blobSha256!) : null;
-      if (file != null && file.existsSync()) {
-        return Padding(
-          padding: const EdgeInsets.only(bottom: 10),
-          child: ClipRRect(
-            borderRadius: BorderRadius.circular(Gm3.radiusMd),
-            child: ConstrainedBox(
-              constraints: const BoxConstraints(maxHeight: 280),
-              child: Image.file(file, fit: BoxFit.contain),
-            ),
-          ),
-        );
-      }
-      return const SizedBox.shrink();
+    if (block.type == 'image' || block.isAttachment) {
+      return _buildShareAttachment(block);
     }
     if (_isToolLikeBlock(block)) {
       if (!includeToolDetails) return const SizedBox.shrink();
@@ -1809,6 +1844,7 @@ class _ShareCardCanvas extends StatelessWidget {
         selectable: false,
         showCopyButtons: false,
         fontSize: options.mobileLayout ? 15.5 : null,
+        resolveLocalFile: _resolveLocalFile,
       ),
     );
   }

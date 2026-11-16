@@ -156,6 +156,9 @@ class ViewBlock {
     this.meta,
   });
 
+  bool get isAttachment =>
+      type == 'file' || type == 'link' || type == 'audio' || type == 'video';
+
   factory ViewBlock.fromJson(Map<String, dynamic> m, {int fallbackIdx = 0}) {
     return ViewBlock(
       idx: (m['idx'] as int?) ?? fallbackIdx,

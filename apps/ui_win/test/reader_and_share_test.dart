@@ -1,9 +1,12 @@
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_math_fork/flutter_math.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:path/path.dart' as p;
 import 'package:ui_win/l10n/app_strings.dart';
 import 'package:ui_win/models.dart';
 import 'package:ui_win/theme.dart';
@@ -49,6 +52,103 @@ class _FakeReaderStore extends ArchiveDirectStore {
 }
 
 void main() {
+  testWidgets('Reader and share render blob and linked images and open attachments',
+      (tester) async {
+    await tester.binding.setSurfaceSize(const Size(1200, 900));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    final dir = Directory.systemTemp.createTempSync('sm-media-');
+    final workspace = Directory(p.join(dir.path, 'workspace'))..createSync();
+    final sha = List.filled(64, 'a').join();
+    final blob = File(p.join(dir.path, 'blobs', 'aa', '$sha.png'))
+      ..createSync(recursive: true);
+    final png = base64Decode(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC',
+    );
+    blob.writeAsBytesSync(png);
+    addTearDown(() => dir.deleteSync(recursive: true));
+    File(p.join(workspace.path, '截图 example.png')).writeAsBytesSync(png);
+    final audio = File(p.join(workspace.path, 'clip example.wav'))..writeAsBytesSync([0]);
+    final notes = File(p.join(workspace.path, 'notes.csv'))..writeAsStringSync('one,two');
+
+    final detail = ConversationDetail(
+      id: 1,
+      provider: 'codex-local',
+      title: 'Media session',
+      cwd: workspace.path,
+      items: [
+        MessageItem(
+          id: 1, ordinal: 0, role: 'user', kind: 'message', text: '',
+          isActiveBranch: true, isSynthetic: false,
+          blocks: [
+            ViewBlock(idx: 0, type: 'image', blobSha256: sha, text: 'Archived image'),
+            const ViewBlock(idx: 1, type: 'image', meta: {'url': '截图%20example.png', 'name': 'Linked image'}),
+            ViewBlock(idx: 2, type: 'audio', meta: {'url': audio.uri.toString(), 'name': 'Audio clip'}),
+          ],
+        ),
+        MessageItem(
+          id: 2, parentId: 1, ordinal: 1, role: 'assistant', kind: 'message',
+          text: '![Markdown image](<截图 example.png>)\n[打开 CSV](notes.csv)',
+          isActiveBranch: true, isSynthetic: false,
+        ),
+      ],
+    );
+    final store = _FakeReaderStore(dir.path, detail);
+    addTearDown(store.dispose);
+    expect(store.resolveBlobFile(sha).path, blob.path);
+    expect(store.resolveLocalFile('截图%20example.png', cwd: workspace.path)?.path,
+        p.join(workspace.path, '截图 example.png'));
+    expect(store.resolveLocalFile('https://example.com/notes.csv', cwd: workspace.path), isNull);
+
+    final openCalls = <MethodCall>[];
+    const channel = MethodChannel('session_manager/window');
+    final messenger = TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+    messenger.setMockMethodCallHandler(channel, (call) async {
+      openCalls.add(call);
+      return true;
+    });
+    addTearDown(() => messenger.setMockMethodCallHandler(channel, null));
+
+    Future<void> show(Widget body) async {
+      await tester.pumpWidget(AppStringsScope(
+        notifier: ValueNotifier<AppLocale>(AppLocale.zh),
+        child: MaterialApp(theme: GoogleMaterialTheme.light(), home: Scaffold(body: body)),
+      ));
+      await tester.pumpAndSettle();
+    }
+
+    Finder imageWithLabel(String label) => find.byWidgetPredicate(
+      (widget) => widget is Image && widget.semanticLabel == label,
+    );
+
+    await show(BranchTreeReaderView(
+      store: store,
+      refreshTick: ValueNotifier(0),
+      conversationId: detail.id,
+      onSelectOtherSession: (_) {},
+    ));
+    expect(imageWithLabel('Archived image'), findsOneWidget);
+    expect(imageWithLabel('Linked image'), findsOneWidget);
+    expect(imageWithLabel('Markdown image'), findsOneWidget);
+    await tester.tap(find.text('打开 CSV'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Audio clip'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('打开本地文件'));
+    await tester.pumpAndSettle();
+    expect(openCalls.where((call) => call.method == 'openLocalFile').map((call) => call.arguments),
+        [notes.path, audio.path]);
+
+    await show(ShareImageDialog(
+      detail: detail,
+      activeItems: detail.items,
+      store: store,
+      initialOutputDir: dir.path,
+    ));
+    expect(imageWithLabel('Archived image'), findsOneWidget);
+    expect(imageWithLabel('Linked image'), findsOneWidget);
+    expect(imageWithLabel('Markdown image'), findsOneWidget);
+  });
+
   group('filterShareMessages', () {
     final items = <MessageItem>[
       MessageItem(

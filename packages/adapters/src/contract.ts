@@ -8,6 +8,7 @@ import {
   estimateMinHashSimilarity,
   projectBlocksText,
   type BlobAsset,
+  type BlobOriginKind,
   type ConversationViewModel,
   type IntegrityIssue,
   type ItemStatus,
@@ -49,7 +50,7 @@ export interface ImportTask {
 export interface ParseCtx {
   persistRaw(entry: string, bytes: Buffer | NodeJS.ReadableStream): Promise<{ sha256: string; path: string }>;
   streamArray<T>(src: NodeJS.ReadableStream): AsyncIterable<T>;
-  spill(payload: unknown): Promise<string>;
+  spill(payload: unknown, binary?: { mime: string; ext: string; originKind: BlobOriginKind }): Promise<string>;
   log(level: 'info' | 'warn' | 'error', msg: string, extra?: unknown): void;
   recordUnrecognizedField?(key: string): void;
   skipIfUnchanged?(filePath: string): boolean;

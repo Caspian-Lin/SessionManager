@@ -74,6 +74,11 @@ function sanitizeFilenameSegment(raw: string): string {
   return cleaned || 'session';
 }
 
+function openAiAssetStem(ref: string): string {
+  const cleaned = ref.replace(/^(file-service|sediment):\/\//i, '').trim();
+  return path.posix.basename(cleaned.replace(/\\/g, '/')).replace(/\.[^.]+$/, '');
+}
+
 function extractOpenAiPointerKeys(nativeConv: Record<string, unknown>): Map<string, string> {
   // Maps asset pointer stem / normalized key -> original pointer stem filename
   const stems = new Map<string, string>();
@@ -84,7 +89,7 @@ function extractOpenAiPointerKeys(nativeConv: Record<string, unknown>): Map<stri
     const cleaned = rawRef.replace(/^(file-service|sediment):\/\//i, '').trim();
     if (!cleaned) return;
     const base = path.posix.basename(cleaned);
-    stems.set(base.toLowerCase(), base.replace(/\.[^.]+$/, ''));
+    stems.set(base.toLowerCase(), openAiAssetStem(rawRef));
   };
 
   for (const node of Object.values(mapping)) {
@@ -164,16 +169,19 @@ export class OpenAiRawExporter implements ProviderRawExporter {
       );
       let missingAsset = false;
 
-      // Also inspect blocks for meta.asset_pointer -> blob_sha256 binding
-      const shaToStem = new Map<string, string>();
+      const stemsBySha = new Map<string, Set<string>>();
       for (const node of ctx.view.nodes) {
         for (const block of node.blocks) {
           if (!block.blob_sha256) continue;
-          const ptr = block.meta?.['asset_pointer'];
-          if (typeof ptr === 'string' && ptr.trim()) {
-            const stripped = ptr.replace(/^(file-service|sediment):\/\//i, '').trim();
-            shaToStem.set(block.blob_sha256, path.posix.basename(stripped).replace(/\.[^.]+$/, ''));
-          }
+          const ref = ['asset_pointer', 'attachment_id', 'url', 'name']
+            .map((key) => block.meta?.[key])
+            .find((value): value is string => typeof value === 'string' && value.trim() !== '');
+          if (!ref) continue;
+          const stem = openAiAssetStem(ref);
+          if (!stem) continue;
+          const stems = stemsBySha.get(block.blob_sha256) ?? new Set<string>();
+          stems.add(stem);
+          stemsBySha.set(block.blob_sha256, stems);
         }
       }
 
@@ -185,16 +193,17 @@ export class OpenAiRawExporter implements ProviderRawExporter {
           continue;
         }
         const ext = blob.ext ?? blobRow?.ext ?? '.bin';
-        const stem =
-          shaToStem.get(blob.sha256) ??
-          pointerStems.values().next().value ??
-          blob.sha256;
-        const assetRel = `openai-web/${sanitizeFilenameSegment(stem)}${ext}`;
-        if (!emittedAssetPaths.has(assetRel)) {
-          emittedAssetPaths.add(assetRel);
-          files.push({ relPath: assetRel, content: fs.readFileSync(absPath) });
+        const stems = stemsBySha.get(blob.sha256) ?? [pointerStems.values().next().value ?? blob.sha256];
+        const bytes = fs.readFileSync(absPath);
+        for (const stem of stems) {
+          const filename = stem.replace(/[<>:"/\\|?*\x00-\x1f]/g, '_');
+          const assetRel = `openai-web/${filename}${ext}`;
+          if (!emittedAssetPaths.has(assetRel)) {
+            emittedAssetPaths.add(assetRel);
+            files.push({ relPath: assetRel, content: bytes });
+          }
+          itemFiles.push(assetRel);
         }
-        itemFiles.push(assetRel);
       }
 
       items.push({

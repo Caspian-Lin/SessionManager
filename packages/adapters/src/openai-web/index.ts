@@ -188,6 +188,7 @@ interface AssetSourceEntry {
 
 class AssetLocator {
   private readonly allAssets: AssetSourceEntry[] = [];
+  private readonly byPathLower = new Map<string, AssetSourceEntry>();
   private readonly byBasenameLower = new Map<string, AssetSourceEntry>();
   private readonly byStemLower = new Map<string, AssetSourceEntry>();
 
@@ -195,6 +196,7 @@ class AssetLocator {
     const normalized = entryName.replace(/\\/g, '/');
     const item: AssetSourceEntry = { entryName: normalized, readBytes };
     this.allAssets.push(item);
+    this.byPathLower.set(normalized.toLowerCase(), item);
 
     const baseLower = path.posix.basename(normalized).toLowerCase();
     if (!this.byBasenameLower.has(baseLower)) {
@@ -209,6 +211,10 @@ class AssetLocator {
   find(pointerOrName: string): AssetSourceEntry | undefined {
     const candidates = normalizePointerKey(pointerOrName);
     for (const c of candidates) {
+      const exactPath = this.byPathLower.get(c.replace(/\\/g, '/').toLowerCase());
+      if (exactPath) return exactPath;
+    }
+    for (const c of candidates) {
       const lower = c.toLowerCase();
       const exactBase = this.byBasenameLower.get(lower);
       if (exactBase) return exactBase;
@@ -216,17 +222,16 @@ class AssetLocator {
       if (exactStem) return exactStem;
     }
 
-    // Prefix / substring match (e.g. file-abc123-sanitized.png or dalle-generations/file-abc123.dat)
+    // Exported asset names can include a provider file ID followed by a suffix.
     for (const c of candidates) {
       const lower = c.toLowerCase();
-      if (lower.length < 4) continue;
+      if (!/^file[-_].{4}/.test(lower)) continue;
       for (const item of this.allAssets) {
         const base = path.posix.basename(item.entryName).toLowerCase();
         if (
           base.startsWith(`${lower}.`) ||
           base.startsWith(`${lower}-`) ||
-          base.startsWith(`${lower}_`) ||
-          base.includes(lower)
+          base.startsWith(`${lower}_`)
         ) {
           return item;
         }
@@ -250,7 +255,7 @@ function collectDirAssets(rootDir: string, locator: AssetLocator, maxDepth = 4):
       const full = path.join(dir, item.name);
       if (item.isDirectory()) {
         walk(full, depth + 1);
-      } else if (ASSET_EXT_RE.test(item.name)) {
+      } else if (item.isFile() && !CONV_SHARD_RE.test(item.name)) {
         const rel = path.relative(rootDir, full).replace(/\\/g, '/');
         locator.add(rel, () => fs.readFileSync(full));
       }
@@ -589,15 +594,16 @@ export class OpenAiSessionDocument extends BaseSessionDocument<OpenAiNativeConve
         const attUrl = typeof aObj['url'] === 'string' ? aObj['url'] : null;
         const attName = typeof aObj['name'] === 'string' ? aObj['name'] : null;
         const attFileId = typeof aObj['file_id'] === 'string' ? aObj['file_id'] : null;
+        const attToken = typeof aObj['file_token'] === 'string' ? aObj['file_token'] : null;
 
-        const keyHits = [attId, attUrl, attFileId, attName]
+        const keyHits = [attId, attUrl, attFileId, attToken, attName]
           .filter((v): v is string => Boolean(v))
           .flatMap((v) => normalizePointerKey(v));
         if (keyHits.some((k) => emittedAssetKeys.has(k.toLowerCase()))) {
           continue;
         }
 
-        const matchedBlob = this.resolveBlobForKeys([attUrl, attId, attFileId, attName]);
+        const matchedBlob = this.resolveBlobForKeys([attUrl, attId, attFileId, attToken, attName]);
         if (matchedBlob && emittedAssetShas.has(matchedBlob.sha256)) {
           continue;
         }
@@ -605,22 +611,25 @@ export class OpenAiSessionDocument extends BaseSessionDocument<OpenAiNativeConve
           emittedAssetShas.add(matchedBlob.sha256);
         }
 
-        const isImg =
-          matchedBlob?.mime.startsWith('image/') ||
-          (typeof aObj['mimeType'] === 'string' && aObj['mimeType'].startsWith('image/')) ||
-          (typeof aObj['mime_type'] === 'string' && aObj['mime_type'].startsWith('image/'));
+        const declaredMime = aObj['mimeType'] ?? aObj['mime_type'];
+        const mime = matchedBlob?.mime === 'application/octet-stream' || !matchedBlob
+          ? typeof declaredMime === 'string' ? declaredMime : null
+          : matchedBlob.mime;
+        const type: ViewBlockType = mime?.startsWith('image/') ? 'image'
+          : mime?.startsWith('audio/') ? 'audio'
+          : mime?.startsWith('video/') ? 'video' : 'file';
 
         blocks.push({
           idx: blockIdx++,
-          type: isImg ? 'image' : 'file',
+          type,
           text: attName,
           blob_sha256: matchedBlob?.sha256 ?? null,
           availability: matchedBlob ? 'full' : 'missing_ref',
           meta: {
-            attachment_id: attId ?? attFileId ?? null,
+            attachment_id: attId ?? attFileId ?? attToken,
             url: attUrl,
             name: attName,
-            mime: matchedBlob?.mime ?? aObj['mimeType'] ?? aObj['mime_type'] ?? null,
+            mime,
           },
         });
       }
@@ -898,7 +907,7 @@ export class OpenAiWebAdapter implements Adapter<OpenAiNativeConversation> {
 
         // Index all asset entries in the ZIP Central Directory
         for (const entryInfo of zip.listEntries()) {
-          if (!entryInfo.isDirectory && ASSET_EXT_RE.test(entryInfo.name)) {
+          if (!entryInfo.isDirectory && !CONV_SHARD_RE.test(entryInfo.name)) {
             const z = zip;
             assetLocator.add(entryInfo.name, () => z.readEntry(entryInfo.name));
           }
@@ -964,22 +973,24 @@ export class OpenAiWebAdapter implements Adapter<OpenAiNativeConversation> {
                 sniffed.mime !== 'application/octet-stream'
                   ? sniffed.mime
                   : itemRef.preferredMime ?? sniffed.mime;
-              const ext =
+              const sourceExt = path.posix.extname(matchedEntry.entryName);
+              const ext = /^\.[a-z0-9_-]+$/i.test(sourceExt) && sourceExt.toLowerCase() !== '.dat'
+                ? sourceExt.toLowerCase()
+                : (
                 sniffed.mime !== 'application/octet-stream'
                   ? sniffed.ext
                   : itemRef.preferredMime
                     ? extForMime(itemRef.preferredMime)
-                    : sniffed.ext;
+                    : sniffed.ext
+                );
 
               const persisted = await ctx.persistRaw(matchedEntry.entryName, buf);
               const sha256 = persisted.sha256 || sha256Hex(buf);
-              const relPath =
-                persisted.path && persisted.path !== matchedEntry.entryName
-                  ? persisted.path
-                  : `blobs/${sha256.slice(0, 2)}/${sha256}${ext}`;
               const originKind: BlobOriginKind = matchedEntry.entryName.toLowerCase().endsWith('.dat')
                 ? 'export_dat'
                 : 'attachment';
+              const relPath = `blobs/${sha256.slice(0, 2)}/${sha256}${ext}`;
+              await ctx.spill(buf, { mime, ext, originKind });
 
               blobAsset = {
                 sha256,
