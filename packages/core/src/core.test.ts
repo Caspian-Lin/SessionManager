@@ -264,6 +264,8 @@ describe('@sm/core persistent ImportPipeline & ArchiveService (Issues #16, #17, 
     try {
       // 1. OpenAI ZIP export with an embedded PNG asset -> exercises ctx.persistRaw + native_session blob
       const pngBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x01, 0x02, 0x03]);
+      const csvBytes = Buffer.from('name,total\nexample,12\n');
+      const pdfBytes = Buffer.from('%PDF-1.7\n');
       const zipPath = path.join(dir, 'openai-export.zip');
       const convWithAsset = {
         id: 'oa-asset-conv',
@@ -288,6 +290,12 @@ describe('@sm/core persistent ImportPipeline & ArchiveService (Issues #16, #17, 
                   { content_type: 'image_asset_pointer', asset_pointer: 'file-service://file-png-1', width: 320, height: 240 },
                 ],
               },
+              metadata: {
+                attachments: [
+                  { file_token: 'file-table-1', name: 'table.csv', mimeType: 'text/csv' },
+                  { id: 'file-document-1', name: 'document.pdf', mimeType: 'application/pdf' },
+                ],
+              },
             },
           },
         },
@@ -296,6 +304,8 @@ describe('@sm/core persistent ImportPipeline & ArchiveService (Issues #16, #17, 
       const zipBuf = createZipBuffer([
         { name: 'conversations.json', data: Buffer.from(JSON.stringify([convWithAsset]), 'utf8') },
         { name: 'file-png-1.png', data: pngBytes },
+        { name: 'files/file-table-1-table.csv', data: csvBytes },
+        { name: 'files/file-document-1.dat', data: pdfBytes },
       ]);
       fs.writeFileSync(zipPath, zipBuf);
 
@@ -311,6 +321,21 @@ describe('@sm/core persistent ImportPipeline & ArchiveService (Issues #16, #17, 
       expect(rawStore.hasRaw(`raw/openai-web/${sha256Hex(pngBytes).slice(0, 2)}/file-png-1.png`)).toBe(true);
 
       const storedConv = repo.getConversationByExternalId('openai-web', 'oa-asset-conv')!;
+      const [mediaItem] = repo.getConversationItems(storedConv.id);
+      const blocks = JSON.parse(mediaItem!.blocks_json!);
+      for (const [bytes, type, ext] of [
+        [pngBytes, 'image', '.png'],
+        [csvBytes, 'file', '.csv'],
+        [pdfBytes, 'file', '.pdf'],
+      ] as const) {
+        const sha = sha256Hex(bytes);
+        expect(blocks).toContainEqual(expect.objectContaining({
+          type, blob_sha256: sha, availability: 'full',
+        }));
+        const asset = repo.getBlobBySha256(sha)!;
+        expect(asset.ext).toBe(ext);
+        expect(blobStore.readBlobSync(asset.rel_path)).toEqual(bytes);
+      }
       expect(storedConv.raw_format).toBe('openai-web/v2');
       expect(storedConv.raw_blob_sha256).toBeTruthy();
 
@@ -345,6 +370,30 @@ describe('@sm/core persistent ImportPipeline & ArchiveService (Issues #16, #17, 
             type: 'response_item',
             payload: { type: 'function_call_output', call_id: 'call-1', output: oversizedOutput },
           }),
+          JSON.stringify({
+            timestamp: '2026-01-02T10:00:03Z',
+            type: 'response_item',
+            payload: {
+              id: 'linked-image',
+              type: 'message',
+              role: 'user',
+              content: [
+                { type: 'local_image', path: './preview.png' },
+                { type: 'input_file', filename: 'table.csv', file_url: 'file:///C:/Project/table.csv' },
+              ],
+            },
+          }),
+          JSON.stringify({
+            timestamp: '2026-01-02T10:00:04Z',
+            type: 'response_item',
+            payload: {
+              id: 'generated-image',
+              type: 'image_generation_call',
+              status: 'completed',
+              result: pngBytes.toString('base64'),
+              saved_path: 'C:/Project/output.png',
+            },
+          }),
         ].join('\n') + '\n',
         'utf8'
       );
@@ -358,6 +407,18 @@ describe('@sm/core persistent ImportPipeline & ArchiveService (Issues #16, #17, 
       const spilledBlob = repo.getBlobBySha256(spilledSha);
       expect(spilledBlob).toBeTruthy();
       expect(blobStore.hasBlob(spilledBlob!.rel_path)).toBe(true);
+      const codexNodes = codexRes.sessions[0]!.toViewModel().nodes;
+      expect(codexNodes.find((node) => node.external_id === 'linked-image')?.blocks).toEqual([
+        expect.objectContaining({ type: 'image', meta: { url: './preview.png' } }),
+        expect.objectContaining({ type: 'file', text: 'table.csv', meta: { url: 'file:///C:/Project/table.csv' } }),
+      ]);
+      expect(codexNodes.find((node) => node.external_id === 'generated-image')?.blocks).toEqual([
+        expect.objectContaining({
+          type: 'image',
+          blob_sha256: sha256Hex(pngBytes),
+          meta: expect.objectContaining({ url: 'C:/Project/output.png' }),
+        }),
+      ]);
 
       // 3. Verify ctx.streamArray uses streamTopLevelJsonArray
       const customRegistry = new AdapterRegistry();
@@ -969,14 +1030,24 @@ describe('@sm/core Issues #15, #21, #33, #34 (Incremental Sync, Governance, sm-n
   it('Issues #33 & #34: provider-raw round-trip export (openai-web + codex-local) preserves content_hash', async () => {
     const dir = makeTempDir('sm-roundtrip-');
     const openaiFile = path.join(dir, 'chatgpt-conversations.json');
+    const openAiConversation = makeOpenAiConv('oa-rt-01', 'OpenAI Round-Trip', [
+      { id: 'u1', role: 'user', text: 'Hello ChatGPT' },
+      { id: 'a1', role: 'assistant', text: 'Hello user' },
+    ]);
+    const attachmentA = Buffer.from('first,value\n');
+    const attachmentB = Buffer.from('second,value\n');
+    const userNode = openAiConversation.mapping['u1'] as { message: Record<string, unknown> };
+    userNode.message['metadata'] = {
+      attachments: [
+        { id: 'file-table-a', name: 'first.csv', mimeType: 'text/csv' },
+        { id: 'file-table-b', name: 'second.csv', mimeType: 'text/csv' },
+      ],
+    };
+    fs.writeFileSync(path.join(dir, 'file-table-a.csv'), attachmentA);
+    fs.writeFileSync(path.join(dir, 'file-table-b.csv'), attachmentB);
     fs.writeFileSync(
       openaiFile,
-      JSON.stringify([
-        makeOpenAiConv('oa-rt-01', 'OpenAI Round-Trip', [
-          { id: 'u1', role: 'user', text: 'Hello ChatGPT' },
-          { id: 'a1', role: 'assistant', text: 'Hello user' },
-        ]),
-      ])
+      JSON.stringify([openAiConversation])
     );
 
     const codexRollout = path.join(dir, 'rollout-codex-rt.jsonl');
@@ -1016,6 +1087,8 @@ describe('@sm/core Issues #15, #21, #33, #34 (Incremental Sync, Governance, sm-n
       expect(report.exported).toBe(2);
       expect(report.skipped).toBe(0);
       expect(fs.existsSync(path.join(rawOutDir, 'openai-web', 'conversations.json'))).toBe(true);
+      expect(fs.readFileSync(path.join(rawOutDir, 'openai-web', 'file-table-a.csv'))).toEqual(attachmentA);
+      expect(fs.readFileSync(path.join(rawOutDir, 'openai-web', 'file-table-b.csv'))).toEqual(attachmentB);
       expect(fs.existsSync(path.join(rawOutDir, 'codex-local', 'sessions', 'rollout-codex-rt-01.jsonl'))).toBe(true);
 
       // Re-import exported provider-raw directories into a brand-new archive and verify identical content_hash

@@ -175,19 +175,10 @@ class ArchiveDirectStore {
     return shrunkIds;
   }
 
-  /// Resolves `<archiveRoot>/blobs/<2-char>/<sha256><ext>` for zero-copy
-  /// local media rendering (`Image.file(store.resolveBlobFile(...))`).
+  /// Look up the recorded location first, including older assets kept in raw/.
   File resolveBlobFile(String sha256, {String? ext, String? relPath}) {
-    if (relPath != null && relPath.isNotEmpty) {
-      final direct = File(p.join(_archiveRoot, relPath));
-      if (direct.existsSync()) return direct;
-      final underBlobs = File(p.join(_archiveRoot, 'blobs', relPath));
-      if (underBlobs.existsSync()) return underBlobs;
-      return direct;
-    }
-
     String resolvedExt = ext ?? '';
-    if (resolvedExt.isEmpty) {
+    if (relPath == null || ext == null) {
       final db = _getReadDb();
       if (db != null) {
         try {
@@ -196,13 +187,19 @@ class ArchiveDirectStore {
             [sha256],
           );
           if (rows.isNotEmpty) {
-            final rowRel = rows.first['rel_path'] as String?;
-            if (rowRel != null && rowRel.isNotEmpty) {
-              return File(p.join(_archiveRoot, rowRel));
-            }
-            resolvedExt = (rows.first['ext'] as String?) ?? '';
+            relPath ??= rows.first['rel_path'] as String?;
+            resolvedExt = ext ?? (rows.first['ext'] as String?) ?? '';
           }
         } catch (_) {}
+      }
+    }
+
+    if (relPath != null && relPath.isNotEmpty) {
+      final direct = File(p.join(_archiveRoot, relPath));
+      if (direct.existsSync()) return direct;
+      if (p.isRelative(relPath)) {
+        final underBlobs = File(p.join(_archiveRoot, 'blobs', relPath));
+        if (underBlobs.existsSync()) return underBlobs;
       }
     }
 
@@ -211,20 +208,117 @@ class ArchiveDirectStore {
     }
     final prefix = sha256.length >= 2 ? sha256.substring(0, 2) : '00';
     final candidate = File(p.join(_archiveRoot, 'blobs', prefix, '$sha256$resolvedExt'));
-    if (candidate.existsSync() || resolvedExt.isNotEmpty) {
-      return candidate;
-    }
+    if (candidate.existsSync()) return candidate;
 
     final bucketDir = Directory(p.join(_archiveRoot, 'blobs', prefix));
-    if (bucketDir.existsSync()) {
-      for (final entity in bucketDir.listSync()) {
-        if (entity is File && p.basename(entity.path).startsWith(sha256)) {
-          return entity;
+    try {
+      if (bucketDir.existsSync()) {
+        for (final entity in bucketDir.listSync()) {
+          final name = p.basename(entity.path);
+          if (entity is File &&
+              (name == sha256 || p.basenameWithoutExtension(name) == sha256)) {
+            return entity;
+          }
         }
       }
+    } on FileSystemException {
+      return candidate;
     }
     return candidate;
   }
+
+  File? resolveMediaFile(ViewBlock block, {String? cwd}) {
+    final sha = extractPayloadSha256(block.blobSha256);
+    if (sha != null) {
+      final file = resolveBlobFile(sha);
+      if (file.existsSync()) return file;
+    }
+
+    for (final reference in [
+      block.meta?['local_path'],
+      block.meta?['path'],
+      block.meta?['url'],
+      block.meta?['asset_pointer'],
+    ]) {
+      if (reference is String) {
+        final file = resolveLocalFile(reference, cwd: cwd);
+        if (file != null) return file;
+      }
+    }
+    // Older projections may store the only path in the block text.
+    final text = block.text?.trim();
+    if (text != null &&
+        !text.contains(RegExp(r'[\r\n]')) &&
+        (p.isAbsolute(text) || p.extension(text).isNotEmpty ||
+            text.startsWith('file:'))) {
+      return resolveLocalFile(text, cwd: cwd);
+    }
+    return null;
+  }
+
+  File? resolveLocalFile(String reference, {String? cwd}) {
+    var path = reference.trim();
+    if (path.isEmpty || path.contains(RegExp(r'[\x00-\x1f]'))) return null;
+    final sha = extractPayloadSha256(path);
+    if (path.startsWith('blob:') && sha != null) {
+      final file = resolveBlobFile(sha);
+      return file.existsSync() ? file : null;
+    }
+
+    final windowsDrive = RegExp(r'^/?[a-zA-Z]:[/\\]');
+    if (Platform.isWindows && windowsDrive.hasMatch(path)) {
+      if (path.startsWith('/')) path = path.substring(1);
+    } else {
+      final uri = Uri.tryParse(path);
+      if (uri?.hasScheme ?? false) {
+        if (uri!.scheme != 'file') return null;
+        try {
+          path = uri.toFilePath();
+        } on UnsupportedError {
+          return null;
+        } on ArgumentError {
+          return null;
+        } on FormatException {
+          return null;
+        }
+      }
+    }
+
+    final roots = [
+      if (cwd != null && p.isAbsolute(cwd)) cwd,
+      _archiveRoot,
+    ];
+    for (final candidate in {
+      path,
+      if (path.contains('%')) _decodeFilePath(path),
+    }) {
+      if (candidate.contains(RegExp(r'[\x00-\x1f]'))) continue;
+      if (p.isAbsolute(candidate)) {
+        final file = File(p.normalize(candidate));
+        if (file.existsSync()) return file;
+      } else {
+        for (final root in roots) {
+          final file = File(p.normalize(p.join(root, candidate)));
+          if (file.existsSync()) return file;
+        }
+      }
+    }
+    return null;
+  }
+
+  static String _decodeFilePath(String path) => path.replaceAllMapped(
+        RegExp(r'(?:%[0-9a-fA-F]{2})+'),
+        (match) {
+          final encoded = match[0]!;
+          try {
+            return Uri.decodeComponent(encoded);
+          } on FormatException {
+            return encoded;
+          } on ArgumentError {
+            return encoded;
+          }
+        },
+      );
 
   static final RegExp _sha256Re = RegExp(r'^[0-9a-fA-F]{64}$');
 

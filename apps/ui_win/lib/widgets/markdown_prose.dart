@@ -3,12 +3,11 @@ import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_math_fork/flutter_math.dart';
-import 'package:path/path.dart' as p;
 
 import '../l10n/app_strings.dart';
-import '../models.dart';
 import '../theme.dart';
 import 'gm3_surface.dart';
+import 'media_attachment.dart';
 
 /// Clean editorial Markdown renderer modeled after Gemini's reading typography:
 /// - Headings (`#`, `##`, `###`)
@@ -21,6 +20,7 @@ class MarkdownProse extends StatefulWidget {
   final bool showCopyButtons;
   final Color? textColor;
   final double? fontSize;
+  final File? Function(String reference)? resolveLocalFile;
 
   const MarkdownProse({
     super.key,
@@ -29,6 +29,7 @@ class MarkdownProse extends StatefulWidget {
     this.showCopyButtons = true,
     this.textColor,
     this.fontSize,
+    this.resolveLocalFile,
   });
 
   @override
@@ -288,6 +289,7 @@ class _MarkdownProseState extends State<MarkdownProse> {
           textColor: widget.textColor,
           fontSize: widget.fontSize,
           trimTrailingMargin: isLast,
+          resolveLocalFile: widget.resolveLocalFile,
         );
     }
   }
@@ -308,6 +310,7 @@ class _ProseLines extends StatelessWidget {
   final Color? textColor;
   final double? fontSize;
   final bool trimTrailingMargin;
+  final File? Function(String reference)? resolveLocalFile;
 
   const _ProseLines({
     required this.markdown,
@@ -315,6 +318,7 @@ class _ProseLines extends StatelessWidget {
     this.textColor,
     this.fontSize,
     this.trimTrailingMargin = true,
+    this.resolveLocalFile,
   });
 
   static final RegExp _headingRe = RegExp(r'^(#{1,4})\s+(.+)$');
@@ -600,7 +604,8 @@ class _ProseLines extends StatelessWidget {
     final cs = Theme.of(context).colorScheme;
     final surfaces = Gm3Surfaces.of(context);
     final tokenRe = RegExp(
-      r'\*\*\*(.+?)\*\*\*|\*\*(.+?)\*\*|`([^`]+?)`|\\\((.+?)\\\)|\$([^\s$][^$\r\n]*?[^\s$]|[^\s$])\$|\*([^\s*][^*]*?[^\s*]|[^\s*])\*',
+      r'\*\*\*(.+?)\*\*\*|\*\*(.+?)\*\*|`([^`]+?)`|\\\((.+?)\\\)|\$([^\s$][^$\r\n]*?[^\s$]|[^\s$])\$|\*([^\s*][^*]*?[^\s*]|[^\s*])\*'
+      r'|(!?)\[([^\]\r\n]*)\]\((?:<([^>\r\n]+)>|([^\s()]+))\)',
     );
     final spans = <InlineSpan>[];
     var pos = 0;
@@ -654,6 +659,28 @@ class _ProseLines extends StatelessWidget {
           text: m.group(6),
           style: const TextStyle(fontStyle: FontStyle.italic),
         ));
+      } else {
+        final target = (m.group(9) ?? m.group(10))!;
+        final file = resolveLocalFile?.call(target);
+        if (file == null) {
+          spans.add(TextSpan(text: m.group(0)));
+        } else {
+          final label = m.group(8)!.isNotEmpty ? m.group(8)! : Uri.file(file.path).pathSegments.last;
+          final isImage = m.group(7) == '!';
+          spans.add(WidgetSpan(
+            alignment: PlaceholderAlignment.middle,
+            child: isImage
+                ? MediaImage(file: file, label: label)
+                : InkWell(
+                    onTap: () => openLocalAttachment(context, file),
+                    child: Text(label,
+                        style: baseStyle.copyWith(
+                          color: cs.primary,
+                          decoration: TextDecoration.underline,
+                        )),
+                  ),
+          ));
+        }
       }
       pos = m.end;
     }
@@ -1028,183 +1055,6 @@ class _MathBlock extends StatelessWidget {
           onErrorFallback: (_) => (selectable && SelectionContainer.maybeOf(context) == null)
               ? SelectableText(latex, style: fallbackStyle)
               : Text(latex, style: fallbackStyle),
-        ),
-      ),
-    );
-  }
-}
-
-/// Compact rounded attachment/source capsule inspired by Gemini's inline chips
-/// (e.g. `Lecture01.pdf` or `Lecture08.pdf + 3`) with a click popover card.
-class AttachmentChipGroup extends StatelessWidget {
-  final List<ViewBlock> attachmentBlocks;
-  final File? Function(String sha) resolveBlobFile;
-
-  const AttachmentChipGroup({
-    super.key,
-    required this.attachmentBlocks,
-    required this.resolveBlobFile,
-  });
-
-  String _blockDisplayName(ViewBlock block) {
-    final raw = (block.text ?? '').trim();
-    if (raw.isNotEmpty) {
-      final base = p.basename(raw);
-      if (base.isNotEmpty && base.length <= 44) return base;
-      if (raw.length <= 44) return raw;
-      return '${raw.substring(0, 41)}...';
-    }
-    if (block.blobSha256 != null) {
-      final shortSha = block.blobSha256!.length > 10
-          ? block.blobSha256!.substring(0, 10)
-          : block.blobSha256!;
-      return '${block.type}_$shortSha';
-    }
-    return block.type;
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    if (attachmentBlocks.isEmpty) return const SizedBox.shrink();
-    final primary = attachmentBlocks.first;
-    final extraCount = attachmentBlocks.length - 1;
-    final label = extraCount > 0
-        ? '${_blockDisplayName(primary)} + $extraCount'
-        : _blockDisplayName(primary);
-    final surfaces = Gm3Surfaces.of(context);
-    final cs = Theme.of(context).colorScheme;
-    final theme = Theme.of(context);
-
-    return MenuAnchor(
-      style: MenuStyle(
-        backgroundColor: WidgetStatePropertyAll(surfaces.card),
-        elevation: const WidgetStatePropertyAll(4),
-        shape: WidgetStatePropertyAll(
-          RoundedRectangleBorder(borderRadius: BorderRadius.circular(Gm3.radiusMd)),
-        ),
-        padding: const WidgetStatePropertyAll(EdgeInsets.symmetric(vertical: 8)),
-      ),
-      menuChildren: [
-        for (final block in attachmentBlocks)
-          _AttachmentMenuEntry(
-            block: block,
-            title: _blockDisplayName(block),
-            file: block.blobSha256 != null ? resolveBlobFile(block.blobSha256!) : null,
-          ),
-      ],
-      builder: (context, controller, child) {
-        return InkWell(
-          borderRadius: BorderRadius.circular(8),
-          onTap: () {
-            if (controller.isOpen) {
-              controller.close();
-            } else {
-              controller.open();
-            }
-          },
-          child: Container(
-            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-            decoration: BoxDecoration(
-              color: surfaces.card,
-              borderRadius: BorderRadius.circular(8),
-            ),
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Icon(
-                  primary.type == 'image' ? Icons.image_outlined : Icons.description_outlined,
-                  size: 13,
-                  color: cs.onSurfaceVariant,
-                ),
-                const SizedBox(width: 5),
-                Text(
-                  label,
-                  style: theme.textTheme.labelSmall?.copyWith(
-                    color: cs.onSurfaceVariant,
-                    fontWeight: FontWeight.w500,
-                  ),
-                ),
-              ],
-            ),
-          ),
-        );
-      },
-    );
-  }
-}
-
-class _AttachmentMenuEntry extends StatelessWidget {
-  final ViewBlock block;
-  final String title;
-  final File? file;
-
-  const _AttachmentMenuEntry({
-    required this.block,
-    required this.title,
-    required this.file,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final cs = theme.colorScheme;
-    final exists = file != null && file!.existsSync();
-    final isPdf = title.toLowerCase().endsWith('.pdf');
-    final badgeText = isPdf ? 'PDF' : block.type.toUpperCase();
-
-    return InkWell(
-      onTap: exists && Platform.isWindows
-          ? () {
-              Process.run('explorer.exe', ['/select,', file!.path]);
-              Navigator.maybePop(context);
-            }
-          : null,
-      child: ConstrainedBox(
-        constraints: const BoxConstraints(minWidth: 230, maxWidth: 320),
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Row(
-                children: [
-                  Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
-                    decoration: BoxDecoration(
-                      color: isPdf ? const Color(0xFFD93025) : cs.primary,
-                      borderRadius: BorderRadius.circular(4),
-                    ),
-                    child: Text(
-                      badgeText,
-                      style: theme.textTheme.labelSmall?.copyWith(
-                        color: Colors.white,
-                        fontSize: 10,
-                        fontWeight: FontWeight.w700,
-                      ),
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: Text(
-                      exists
-                          ? AppStringsScope.of(context).openMediaFile
-                          : AppStringsScope.of(context).mediaFileMissing,
-                      style: theme.textTheme.labelSmall?.copyWith(color: cs.onSurfaceVariant),
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 6),
-              Text(
-                title,
-                style: theme.textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w600),
-                maxLines: 2,
-                overflow: TextOverflow.ellipsis,
-              ),
-            ],
-          ),
         ),
       ),
     );

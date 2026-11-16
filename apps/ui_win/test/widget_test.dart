@@ -329,6 +329,17 @@ void main() {
       final payloadPrefixed = await store.readSpilledPayload('blob:$payloadRef');
       expect(payloadPrefixed, contains('spilled payload ok'));
 
+      final writableDb = sq.sqlite3.open(store.dbPath);
+      try {
+        writableDb.execute(
+          "UPDATE blob SET rel_path = 'raw/moved.dat', ext = '.dat' WHERE sha256 = ?",
+          [payloadRef],
+        );
+      } finally {
+        writableDb.dispose();
+      }
+      expect(await store.readSpilledPayload(payloadRef), payloadBare);
+
       final batches = await store.getBatches();
       expect(batches.length, 1);
       expect(batches.first.shrunkConversations, 1);

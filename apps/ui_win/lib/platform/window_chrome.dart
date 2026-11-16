@@ -1,6 +1,5 @@
 import 'dart:async';
 
-import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 
@@ -139,6 +138,16 @@ class WindowChrome {
   static void toggleMaximize() => unawaited(_invoke('toggleMaximize'));
 
   static void close() => unawaited(_invoke('close'));
+
+  static Future<bool> openLocalFile(String path) async {
+    try {
+      return await _channel.invokeMethod<bool>('openLocalFile', path) ?? false;
+    } on PlatformException {
+      return false;
+    } on MissingPluginException {
+      return false;
+    }
+  }
 
   static Future<void> _invoke(String method, [Object? arguments]) async {
     if (!_supported) return;

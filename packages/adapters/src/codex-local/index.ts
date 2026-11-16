@@ -168,6 +168,27 @@ function findDataUrisInValue(val: unknown, out: string[] = []): string[] {
   return out;
 }
 
+function generatedImageDataUris(data: Record<string, unknown>): string[] {
+  const uris = findDataUrisInValue(data);
+  const result = data['result'];
+  if (uris.length === 0 && typeof result === 'string' && result.trim() !== '') {
+    uris.push(`data:image/png;base64,${result.trim()}`);
+  }
+  return uris;
+}
+
+function mediaPath(data: Record<string, unknown>): string | null {
+  const image = data['image_url'];
+  const imageUrl = image && typeof image === 'object'
+    ? (image as Record<string, unknown>)['url']
+    : image;
+  const candidates = [
+    data['saved_path'], data['savedPath'], data['path'], data['file_path'],
+    imageUrl, data['audio_url'], data['file_url'], data['url'],
+  ];
+  return candidates.find((value): value is string => typeof value === 'string' && value.trim().length > 0) ?? null;
+}
+
 const KNOWN_META_KEYS = [
   'session_id',
   'id',
@@ -265,6 +286,29 @@ export class CodexSessionDocument extends BaseSessionDocument<CodexNativeSession
       };
     }
     return { tool_input: rawJson, blob_sha256: null, payload_ref: null };
+  }
+
+  private projectImageResult(data: Record<string, unknown>, status: ItemStatus | null): ViewBlock[] {
+    const prompt = typeof data['prompt'] === 'string' ? data['prompt'] : null;
+    const reference = mediaPath(data);
+    const revisedPrompt = data['revised_prompt'] ?? data['revisedPrompt'];
+    const meta = { url: reference, prompt, revised_prompt: revisedPrompt };
+    const blocks: ViewBlock[] = [];
+    for (const uri of generatedImageDataUris(data)) {
+      const asset = this.lookupSpill(uri);
+      if (!asset) continue;
+      blocks.push({
+        idx: blocks.length,
+        type: 'image',
+        text: prompt,
+        blob_sha256: asset.sha256,
+        availability: 'full',
+        status,
+        meta: { ...meta, mime: asset.mime, bytes: asset.bytes },
+      });
+    }
+    if (blocks.length > 0) return blocks;
+    return [{ idx: 0, type: 'image', text: prompt ?? reference, availability: 'missing_ref', status, meta }];
   }
 
   protected projectTurns(): RawTurnProjection[] {
@@ -608,51 +652,8 @@ export class CodexSessionDocument extends BaseSessionDocument<CodexNativeSession
     } else if (itemType === 'imageGeneration' || itemType === 'imageView') {
       role = 'assistant';
       kind = 'image';
-      const prompt = typeof data['prompt'] === 'string' ? data['prompt'] : null;
-      const revisedPrompt = typeof data['revised_prompt'] === 'string' ? data['revised_prompt'] : null;
-      const dataUris = findDataUrisInValue(data);
-
-      if (dataUris.length > 0) {
-        for (const uri of dataUris) {
-          const spilled = this.lookupSpill(uri);
-          if (spilled) {
-            payloadRef = payloadRef ?? spilled.sha256;
-            blocks.push({
-              idx: bIdx++,
-              type: 'image',
-              text: prompt,
-              blob_sha256: spilled.sha256,
-              availability: 'full',
-              status: itemStatus,
-              meta: {
-                mime: spilled.mime,
-                bytes: spilled.bytes,
-                prompt,
-                revised_prompt: revisedPrompt,
-              },
-            });
-          }
-        }
-      }
-
-      if (blocks.length === 0) {
-        const imgUrl =
-          typeof data['image_url'] === 'string'
-            ? data['image_url']
-            : typeof data['url'] === 'string'
-              ? data['url']
-              : typeof data['path'] === 'string'
-                ? data['path']
-                : null;
-        blocks.push({
-          idx: bIdx++,
-          type: 'image',
-          text: prompt ?? imgUrl,
-          availability: 'missing_ref',
-          status: itemStatus,
-          meta: { url: imgUrl, prompt, revised_prompt: revisedPrompt },
-        });
-      }
+      blocks.push(...this.projectImageResult(data, itemStatus));
+      payloadRef = blocks[0]?.blob_sha256 ?? null;
     } else if (itemType === 'contextCompaction') {
       role = 'system';
       kind = 'compaction';
@@ -762,6 +763,26 @@ export class CodexSessionDocument extends BaseSessionDocument<CodexNativeSession
             ? `${pType}-${payload['call_id']}-${ordinal}`
             : `item-${this.nativeData.session_id}-${ordinal}`;
 
+      if (pType === 'image_generation_call') {
+        const status = mapCodexStatus(payload['status']);
+        const blocks = this.projectImageResult(payload, status);
+        return {
+          external_id: itemId,
+          parent_external_id: prevItemId,
+          ordinal,
+          role: 'assistant',
+          kind: 'image',
+          created_at: ts,
+          text: blocks[0]?.text ?? '',
+          is_active_branch: true,
+          is_hidden: false,
+          is_synthetic: false,
+          status,
+          payload_ref: blocks[0]?.blob_sha256 ?? null,
+          blocks,
+        };
+      }
+
       if (pType === 'reasoning') {
         const parts = [...extractTextFromParts(payload['summary']), ...extractTextFromParts(payload['content'])];
         const rawText = parts.join('\n');
@@ -860,14 +881,13 @@ export class CodexSessionDocument extends BaseSessionDocument<CodexNativeSession
       for (const c of contentArr) {
         if (!c || typeof c !== 'object') continue;
         const cObj = c as Record<string, unknown>;
-        const imageUri =
-          typeof cObj['image_url'] === 'string'
-            ? cObj['image_url']
-            : typeof cObj['url'] === 'string'
-              ? cObj['url']
-              : null;
-        if (imageUri && imageUri.startsWith('data:image/') && imageUri.includes(';base64,')) {
-          const imgSpill = this.lookupSpill(imageUri);
+        const reference = mediaPath(cObj);
+        const mediaType = cObj['type'] === 'input_audio' ? 'audio'
+          : cObj['type'] === 'input_file' ? 'file'
+          : cObj['type'] === 'input_image' || cObj['type'] === 'local_image' || cObj['image_url'] != null
+            ? 'image' : null;
+        if (reference && (mediaType || reference.startsWith('data:image/'))) {
+          const imgSpill = this.lookupSpill(reference.trim());
           if (imgSpill) {
             payloadRef = payloadRef ?? imgSpill.sha256;
             blocks.push({
@@ -878,8 +898,16 @@ export class CodexSessionDocument extends BaseSessionDocument<CodexNativeSession
               availability: 'full',
               meta: { mime: imgSpill.mime, bytes: imgSpill.bytes },
             });
-            continue;
+          } else {
+            blocks.push({
+              idx: bIdx++,
+              type: mediaType ?? 'image',
+              text: typeof cObj['filename'] === 'string' ? cObj['filename'] : null,
+              availability: 'missing_ref',
+              meta: { url: reference },
+            });
           }
+          continue;
         }
 
         const text = typeof cObj['text'] === 'string' ? cObj['text'] : '';
@@ -1248,7 +1276,12 @@ async function prepareSpillsAndBlobs(
     const parsed = parseBase64DataUri(uri);
     if (!parsed) return;
 
-    const sha256 = await ctx.spill(parsed.buffer);
+    if (!parsed.mime.startsWith('image/')) return;
+    const sha256 = await ctx.spill(parsed.buffer, {
+      mime: parsed.mime,
+      ext: parsed.ext,
+      originKind: 'inline_base64',
+    });
     const relPath = `blobs/${sha256.slice(0, 2)}/${sha256}${parsed.ext}`;
     if (!blobsBySha.has(sha256)) {
       blobsBySha.set(sha256, {
@@ -1273,7 +1306,9 @@ async function prepareSpillsAndBlobs(
     const data = safeJsonParse(item.item_json);
     const itemType = item.item_type ?? 'agentMessage';
 
-    for (const uri of findDataUrisInValue(data)) {
+    const imageUris = itemType === 'imageGeneration'
+      ? generatedImageDataUris(data) : findDataUrisInValue(data);
+    for (const uri of imageUris) {
       await registerDataUriSpill(uri);
     }
 
@@ -1360,7 +1395,9 @@ async function prepareSpillsAndBlobs(
     const payload = (record.payload ?? {}) as Record<string, unknown>;
     const pType = typeof payload['type'] === 'string' ? payload['type'] : 'message';
 
-    for (const uri of findDataUrisInValue(payload)) {
+    const imageUris = pType === 'image_generation_call'
+      ? generatedImageDataUris(payload) : findDataUrisInValue(payload);
+    for (const uri of imageUris) {
       await registerDataUriSpill(uri);
     }
 

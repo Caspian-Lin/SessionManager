@@ -136,6 +136,8 @@ class AppStrings {
   String get syntheticBadge => isZh ? '合成节点' : 'Synthetic';
   String get altBranchBadge => isZh ? '旁支' : 'Alt Branch';
   String get mediaFileMissing => isZh ? '本地媒体文件未找到' : 'Local media file not found on disk';
+  String get mediaFileUnreadable => isZh ? '无法显示此图片' : 'Cannot display this image';
+  String get mediaOpenFailed => isZh ? '无法打开本地文件' : 'Could not open the local file';
   String revisionsCount(int n) => isZh ? '$n 个修订版本' : '$n revision(s)';
   String get shareLongImage => isZh ? '生成分享长图' : 'Share Long Image';
   String get shareSheetTitle => isZh ? '生成会话分享长图 (PNG)' : 'Export Shareable Long Image (PNG)';

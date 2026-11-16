@@ -331,16 +331,17 @@ export class SmNativeAdapter implements Adapter<SmNativeDocumentPayload> {
             continue;
           }
 
-          const isPlainTextBlob =
-            asset.mime === 'text/plain' && (asset.ext === '.txt' || asset.rel_path.endsWith('.txt'));
-          const spilledSha = isPlainTextBlob
-            ? await ctx.spill(bytes.toString('utf8'))
-            : await ctx.spill(bytes);
-
-          const ext = asset.ext ?? (isPlainTextBlob ? '.txt' : path.posix.extname(asset.rel_path) || '.bin');
+          const sourceExt = asset.ext ?? path.posix.extname(asset.rel_path);
+          const ext = /^\.[a-z0-9_-]+$/i.test(sourceExt) ? sourceExt : '.bin';
+          const spilledSha = await ctx.spill(bytes, {
+            mime: asset.mime,
+            ext,
+            originKind: asset.origin_kind,
+          });
           restoredBlobs.push({
             ...asset,
             sha256: spilledSha,
+            ext,
             rel_path: `blobs/${spilledSha.slice(0, 2)}/${spilledSha}${ext}`,
           });
         }

@@ -846,8 +846,10 @@ export class ImportPipeline {
             yield item;
           }
         },
-        async spill(payload: unknown): Promise<string> {
-          const asset = await blobStore.spillPayload(payload, 'oversized_payload');
+        async spill(payload, binary): Promise<string> {
+          const asset = binary && Buffer.isBuffer(payload)
+            ? await blobStore.putBlob(payload, binary.originKind, binary.mime, binary.ext)
+            : await blobStore.spillPayload(payload, 'oversized_payload');
           repo.upsertBlob(asset);
           return asset.sha256;
         },

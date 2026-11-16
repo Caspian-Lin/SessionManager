@@ -15,6 +15,7 @@ import '../models.dart';
 import '../theme.dart';
 import '../widgets/gm3_surface.dart';
 import '../widgets/markdown_prose.dart';
+import '../widgets/media_attachment.dart';
 import '../widgets/share_image_sheet.dart';
 
 class BranchTreeReaderView extends StatefulWidget {
@@ -522,16 +523,16 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
       for (var i = startIdx; i < slice.length; i++) {
         final node = slice[i];
         final isFinal = lastFinalIdx != null && i == lastFinalIdx;
+        final hasMediaOutput = node.item.role == 'assistant' &&
+            !_isProcessOnlyItem(node.item) &&
+            node.item.blocks.any((b) => b.type == 'image' || b.isAttachment);
 
-        if (!isFinal) {
-          // Everything before the final reply (or trailing tool/system calls after it)
-          // collapses into the 1-line process group.
+        if (!isFinal && !hasMediaOutput) {
           processBuf.add(_ProcessStep.item(node));
           continue;
         }
 
-        // Split process blocks (`thinking`, `tool_use`, etc.) out of the final reply
-        // into the preceding 1-line process group so only the final clean answer renders below.
+        // Keep process blocks in the preceding group when the reply is visible.
         final processBlocks =
             node.item.blocks.where((b) => _isProcessBlockType(b.type)).toList();
         for (final b in processBlocks) {
@@ -541,7 +542,7 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
         flushProcessSteps(processBuf);
 
         final replyEntryIdx = entries.length;
-        if (startIdx == 0 && pendingTurnDir != null) {
+        if (isFinal && startIdx == 0 && pendingTurnDir != null) {
           pendingTurnDir = _TurnDirectoryEntry(
             turnIndex: pendingTurnDir.turnIndex,
             entryIndex: replyEntryIdx,
@@ -556,8 +557,8 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
         entries.add(
           _TimelineEntry.message(
             node: node,
-            anchorKey: startIdx == 0 ? turnKey : null,
-            isFinalTurnReply: true,
+            anchorKey: isFinal && startIdx == 0 ? turnKey : null,
+            isFinalTurnReply: isFinal,
             hideProcessBlocks: true,
             fallbackTimestamp:
                 positiveTs(node.item.createdAt) ?? sliceFallbackTs,
@@ -2477,6 +2478,13 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
   }
 
   Widget _buildProcessBlockContent(BuildContext context, ViewBlock block) {
+    if (block.type == 'image') return _buildMediaImage(block);
+    if (block.isAttachment) {
+      return AttachmentChipGroup(
+        attachmentBlocks: [block],
+        resolveMediaFile: _resolveMediaFile,
+      );
+    }
     final cs = Theme.of(context).colorScheme;
     final body = (block.toolInput ?? block.text ?? '').trim();
     if (body.isEmpty) return const SizedBox.shrink();
@@ -2529,12 +2537,11 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
 
     final blocks = item.blocks;
     final attachmentBlocks = blocks
-        .where((b) => b.type == 'file' || b.type == 'link')
+        .where((b) => b.isAttachment)
         .toList();
     final contentBlocks = blocks
         .where((b) =>
-            b.type != 'file' &&
-            b.type != 'link' &&
+            !b.isAttachment &&
             (!hideProcessBlocks || !_isProcessBlockType(b.type)))
         .toList();
 
@@ -2573,12 +2580,12 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
                                   attachmentBlocks.isEmpty,
                             )
                         else
-                          MarkdownProse(text: item.text),
+                          MarkdownProse(text: item.text, resolveLocalFile: _resolveLocalFile),
                         if (attachmentBlocks.isNotEmpty) ...[
                           const SizedBox(height: 8),
                           AttachmentChipGroup(
                             attachmentBlocks: attachmentBlocks,
-                            resolveBlobFile: widget.store.resolveBlobFile,
+                            resolveMediaFile: _resolveMediaFile,
                           ),
                         ],
                       ],
@@ -2677,7 +2684,7 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
                           ),
                       ],
                     )
-                  : MarkdownProse(text: item.text),
+                  : MarkdownProse(text: item.text, resolveLocalFile: _resolveLocalFile),
               fallbackTimestamp: fallbackTimestamp,
               placement: _HoverTimePlacement.bottomRightOutside,
             ),
@@ -2692,7 +2699,7 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
               const SizedBox(height: 6),
               AttachmentChipGroup(
                 attachmentBlocks: attachmentBlocks,
-                resolveBlobFile: widget.store.resolveBlobFile,
+                resolveMediaFile: _resolveMediaFile,
               ),
             ],
 
@@ -2789,7 +2796,7 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
     // Fallback (should generally be folded in process groups, kept for safety)
     return Padding(
       padding: const EdgeInsets.only(bottom: 12),
-      child: MarkdownProse(text: item.text),
+      child: MarkdownProse(text: item.text, resolveLocalFile: _resolveLocalFile),
     );
   }
 
@@ -2801,6 +2808,15 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
         .where((t) => t.trim().isNotEmpty)
         .join('\n\n');
   }
+
+  File? _resolveMediaFile(ViewBlock block) =>
+      widget.store.resolveMediaFile(block, cwd: _detail?.cwd);
+
+  File? _resolveLocalFile(String reference) =>
+      widget.store.resolveLocalFile(reference, cwd: _detail?.cwd);
+
+  Widget _buildMediaImage(ViewBlock block) =>
+      MediaImage(file: _resolveMediaFile(block), label: attachmentName(block));
 
   Widget _buildViewBlock(
     MessageItem item,
@@ -2934,46 +2950,15 @@ class _BranchTreeReaderViewState extends State<BranchTreeReaderView> {
     }
 
     if (block.type == 'image') {
-      final sha = block.blobSha256;
-      final File? imgFile =
-          sha != null ? widget.store.resolveBlobFile(sha) : null;
-      if (imgFile != null && imgFile.existsSync()) {
-        return Padding(
-          padding: EdgeInsets.only(bottom: isLast ? 0 : 8),
-          child: ClipRRect(
-            borderRadius: BorderRadius.circular(Gm3.radiusMd),
-            child: ConstrainedBox(
-              constraints: const BoxConstraints(maxHeight: 340),
-              child: Image.file(imgFile, fit: BoxFit.contain),
-            ),
-          ),
-        );
-      }
       return Padding(
         padding: EdgeInsets.only(bottom: isLast ? 0 : 8),
-        child: Container(
-          padding: const EdgeInsets.all(10),
-          decoration: BoxDecoration(
-            color: surfaces.inset,
-            borderRadius: BorderRadius.circular(Gm3.radiusMd),
-          ),
-          child: Row(
-            children: [
-              const Icon(Icons.broken_image_outlined, size: 16),
-              const SizedBox(width: 8),
-              Text(
-                '${s.mediaFileMissing}: ${block.text ?? sha ?? ""}',
-                style: theme.textTheme.bodySmall,
-              ),
-            ],
-          ),
-        ),
+        child: _buildMediaImage(block),
       );
     }
 
     return Padding(
       padding: EdgeInsets.only(bottom: isLast ? 0 : 6),
-      child: MarkdownProse(text: block.text ?? ''),
+      child: MarkdownProse(text: block.text ?? '', resolveLocalFile: _resolveLocalFile),
     );
   }
 
